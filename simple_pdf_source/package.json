@@ -1,0 +1,69 @@
+{
+  "name": "simple",
+  "version": "1.4.3",
+  "description": "A private, local-first PDF reader and editor for Windows.",
+  "author": "simple",
+  "license": "MIT",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "test:page-transfer": "node scripts/test-page-transfer.mjs",
+    "test:page-transfer:ui": "npm run build:web && node scripts/run-page-transfer-regression.mjs",
+    "build:web": "vite build",
+    "build": "npm run build:web && node scripts/prepare-portable-build.cjs && electron-builder --win portable --x64",
+    "build:dir": "npm run build:web && electron-builder --win dir --x64",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
+    "mammoth": "^1.8.0",
+    "pdf-lib": "^1.17.1",
+    "word-extractor": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
+    "lucide-react": "^0.468.0",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.simple.reader",
+    "productName": "simple",
+    "asar": true,
+    "electronLanguages": ["en-US"],
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/icon.ico",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "portable": {
+      "useZip": false
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "simple-${version}-portable.${ext}"
+    }
+  }
+}

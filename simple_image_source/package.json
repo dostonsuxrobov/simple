@@ -1,0 +1,87 @@
+{
+  "name": "simple-image",
+  "version": "1.0.0",
+  "description": "A private, local-first image viewer and editor for Windows.",
+  "author": "simple",
+  "license": "MIT",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build:web": "vite build",
+    "build": "npm run test && npm run build:web && electron-builder --win portable --x64",
+    "build:dir": "npm run test && npm run build:web && electron-builder --win dir --x64",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node --test tests/*.test.cjs",
+    "smoke": "electron qa/smoke.cjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "pdf-lib": "^1.17.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.simple.image",
+    "productName": "Simple Image",
+    "asar": true,
+    "electronLanguages": [
+      "en-US"
+    ],
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/icon.ico",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "portable": {
+      "useZip": false
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Simple-Image-${version}-portable.${ext}"
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "png",
+          "jpg",
+          "jpeg",
+          "webp",
+          "gif",
+          "bmp",
+          "svg",
+          "avif"
+        ],
+        "name": "Image",
+        "description": "Image file",
+        "role": "Editor",
+        "icon": "build/icon.ico"
+      }
+    ]
+  }
+}

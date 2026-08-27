@@ -1,0 +1,1107 @@
+import type {
+  CellData,
+  DefinedName,
+  SheetData,
+  WorkbookModel,
+} from '../spreadsheet-types'
+import {
+  columnLabelToNumber,
+  columnNumberToLabel,
+  formatA1Address,
+  parseA1Address,
+} from './formulas'
+
+export const MAX_SHEET_ROWS = 1_048_576
+export const MAX_SHEET_COLUMNS = 16_384
+
+export type SheetAxis = 'row' | 'column'
+export type SheetStructureKind = 'insert' | 'delete'
+
+/** Zero-based structural edit coordinates, matching the grid selection model. */
+export interface SheetStructureOperation {
+  axis: SheetAxis
+  kind: SheetStructureKind
+  index: number
+  count: number
+}
+
+export interface GridCoordinate {
+  row: number
+  col: number
+}
+
+export interface GridSelection {
+  anchor: GridCoordinate
+  focus: GridCoordinate
+}
+
+export type SelectionStructureCommand =
+  | 'insert-rows-above'
+  | 'insert-rows-below'
+  | 'delete-rows'
+  | 'insert-columns-left'
+  | 'insert-columns-right'
+  | 'delete-columns'
+
+export interface SelectionStructureResult {
+  workbook: WorkbookModel
+  selection: GridSelection
+  operation: SheetStructureOperation
+}
+
+export interface InsertBlankSheetOptions {
+  /** Insert after this sheet. When omitted, append to the workbook. */
+  afterSheetId?: string
+  /** Optional explicit name. The default is the first unused `SheetN`. */
+  name?: string
+  /** Optional explicit id. The default is a deterministic unused `sheet-N`. */
+  id?: string
+  rowCount?: number
+  colCount?: number
+  activate?: boolean
+}
+
+export interface InsertBlankSheetResult {
+  workbook: WorkbookModel
+  sheetId: string
+}
+
+type Bounds = { top: number; bottom: number; left: number; right: number }
+type Interval = { start: number; end: number }
+
+interface ParsedReference {
+  kind: 'cell' | 'cell-range' | 'column-range' | 'row-range'
+  first: string
+  second?: string
+}
+
+interface FormulaReferenceMatch {
+  length: number
+  prefix: string
+  reference: ParsedReference
+}
+
+export class SheetStructureError extends Error {
+  constructor(
+    message: string,
+    readonly code:
+      | 'INVALID_OPERATION'
+      | 'SHEET_NOT_FOUND'
+      | 'LIMIT_EXCEEDED'
+      | 'ARRAY_RANGE_CONFLICT',
+  ) {
+    super(message)
+    this.name = 'SheetStructureError'
+  }
+}
+
+function clone<T>(value: T): T {
+  return structuredClone(value) as T
+}
+
+function maxForAxis(axis: SheetAxis): number {
+  return axis === 'row' ? MAX_SHEET_ROWS : MAX_SHEET_COLUMNS
+}
+
+function validateOperation(operation: SheetStructureOperation): void {
+  const { axis, kind, index, count } = operation
+  if (axis !== 'row' && axis !== 'column') {
+    throw new SheetStructureError('The structural edit axis must be a row or column.', 'INVALID_OPERATION')
+  }
+  if (kind !== 'insert' && kind !== 'delete') {
+    throw new SheetStructureError('The structural edit must insert or delete.', 'INVALID_OPERATION')
+  }
+  if (!Number.isSafeInteger(index) || index < 0 || index >= maxForAxis(axis)) {
+    throw new SheetStructureError('The structural edit starts outside the worksheet.', 'INVALID_OPERATION')
+  }
+  if (!Number.isSafeInteger(count) || count <= 0) {
+    throw new SheetStructureError('The structural edit count must be a positive integer.', 'INVALID_OPERATION')
+  }
+  if (index + count > maxForAxis(axis)) {
+    throw new SheetStructureError('The edited row or column range would exceed the XLSX worksheet limit.', 'LIMIT_EXCEEDED')
+  }
+}
+
+function normalizedBounds(selection: GridSelection): Bounds {
+  const values = [selection.anchor.row, selection.anchor.col, selection.focus.row, selection.focus.col]
+  if (!values.every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    throw new SheetStructureError('The selection contains an invalid coordinate.', 'INVALID_OPERATION')
+  }
+  const bounds = {
+    top: Math.min(selection.anchor.row, selection.focus.row),
+    bottom: Math.max(selection.anchor.row, selection.focus.row),
+    left: Math.min(selection.anchor.col, selection.focus.col),
+    right: Math.max(selection.anchor.col, selection.focus.col),
+  }
+  if (bounds.bottom >= MAX_SHEET_ROWS || bounds.right >= MAX_SHEET_COLUMNS) {
+    throw new SheetStructureError('The selection is outside the worksheet.', 'INVALID_OPERATION')
+  }
+  return bounds
+}
+
+function coordinateFromAddress(address: string): GridCoordinate | null {
+  const parsed = parseA1Address(address)
+  return parsed ? { row: parsed.row - 1, col: parsed.column - 1 } : null
+}
+
+function addressFromCoordinate(coordinate: GridCoordinate): string {
+  const address = formatA1Address({
+    row: coordinate.row + 1,
+    column: coordinate.col + 1,
+    rowAbsolute: false,
+    columnAbsolute: false,
+  })
+  if (!address) throw new SheetStructureError('A worksheet address exceeds the XLSX limit.', 'LIMIT_EXCEEDED')
+  return address
+}
+
+function operationInterval(operation: SheetStructureOperation): Interval {
+  const start = operation.index + 1
+  return { start, end: start + operation.count - 1 }
+}
+
+/** Map one one-based row or column position. `null` means it was deleted. */
+function transformPosition(position: number, operation: SheetStructureOperation): number | null {
+  const { start, end } = operationInterval(operation)
+  if (operation.kind === 'insert') return position >= start ? position + operation.count : position
+  if (position < start) return position
+  if (position > end) return position - operation.count
+  return null
+}
+
+/** Navigation anchors inside deleted space land on the first surviving position. */
+function transformNavigationPosition(position: number, operation: SheetStructureOperation): number {
+  const transformed = transformPosition(position, operation)
+  return transformed ?? Math.min(operation.index + 1, maxForAxis(operation.axis))
+}
+
+/**
+ * Transform an inclusive interval. Insertions inside a range expand it;
+ * deletions shrink it to the surviving cells. Direction is preserved.
+ */
+function transformInterval(interval: Interval, operation: SheetStructureOperation): Interval | null {
+  const ascending = interval.start <= interval.end
+  let low = Math.min(interval.start, interval.end)
+  let high = Math.max(interval.start, interval.end)
+  const { start, end } = operationInterval(operation)
+
+  if (operation.kind === 'insert') {
+    if (start <= low) {
+      low += operation.count
+      high += operation.count
+    } else if (start <= high) {
+      high += operation.count
+    }
+  } else if (high < start) {
+    // The interval is before the deleted area.
+  } else if (low > end) {
+    low -= operation.count
+    high -= operation.count
+  } else {
+    const beforeLow = low
+    const beforeHigh = Math.min(high, start - 1)
+    const afterLow = Math.max(low, end + 1)
+    const afterHigh = high
+    const hasBefore = beforeLow <= beforeHigh
+    const hasAfter = afterLow <= afterHigh
+    if (!hasBefore && !hasAfter) return null
+    low = hasBefore ? beforeLow : afterLow - operation.count
+    high = hasAfter ? afterHigh - operation.count : beforeHigh
+  }
+
+  return ascending ? { start: low, end: high } : { start: high, end: low }
+}
+
+function parseRange(range: string): Bounds | null {
+  const match = /^\s*(\$?[A-Za-z]{1,3}\$?[1-9]\d*)(?::(\$?[A-Za-z]{1,3}\$?[1-9]\d*))?\s*$/.exec(range)
+  if (!match) return null
+  const first = parseA1Address(match[1])
+  const second = parseA1Address(match[2] || match[1])
+  if (!first || !second) return null
+  return {
+    top: Math.min(first.row, second.row),
+    bottom: Math.max(first.row, second.row),
+    left: Math.min(first.column, second.column),
+    right: Math.max(first.column, second.column),
+  }
+}
+
+function boundsToRange(bounds: Bounds): string {
+  const first = formatA1Address({
+    row: bounds.top,
+    column: bounds.left,
+    rowAbsolute: false,
+    columnAbsolute: false,
+  })
+  const second = formatA1Address({
+    row: bounds.bottom,
+    column: bounds.right,
+    rowAbsolute: false,
+    columnAbsolute: false,
+  })
+  if (!first || !second) throw new SheetStructureError('A range exceeds the XLSX worksheet limit.', 'LIMIT_EXCEEDED')
+  return first === second ? first : `${first}:${second}`
+}
+
+function transformBounds(bounds: Bounds, operation: SheetStructureOperation): Bounds | null {
+  const interval = operation.axis === 'row'
+    ? { start: bounds.top, end: bounds.bottom }
+    : { start: bounds.left, end: bounds.right }
+  const transformed = transformInterval(interval, operation)
+  if (!transformed) return null
+  return operation.axis === 'row'
+    ? { ...bounds, top: Math.min(transformed.start, transformed.end), bottom: Math.max(transformed.start, transformed.end) }
+    : { ...bounds, left: Math.min(transformed.start, transformed.end), right: Math.max(transformed.start, transformed.end) }
+}
+
+function formatLike(original: string, value: number, axis: SheetAxis): string | null {
+  if (axis === 'row') {
+    if (value < 1 || value > MAX_SHEET_ROWS) return null
+    return `${original.startsWith('$') ? '$' : ''}${value}`
+  }
+  const label = columnNumberToLabel(value)
+  if (!label) return null
+  const originalLabel = original.replace('$', '')
+  const cased = originalLabel === originalLabel.toLowerCase() ? label.toLowerCase() : label
+  return `${original.startsWith('$') ? '$' : ''}${cased}`
+}
+
+function transformCellToken(token: string, operation: SheetStructureOperation): string | null {
+  const address = parseA1Address(token)
+  if (!address) return token
+  const position = operation.axis === 'row' ? address.row : address.column
+  const transformed = transformPosition(position, operation)
+  if (transformed === null) return null
+  const formatted = formatA1Address({
+    ...address,
+    row: operation.axis === 'row' ? transformed : address.row,
+    column: operation.axis === 'column' ? transformed : address.column,
+  })
+  if (!formatted) return null
+  const originalColumn = /^\$?([A-Za-z]+)/.exec(token)?.[1] || 'A'
+  return originalColumn === originalColumn.toLowerCase()
+    ? formatted.replace(/[A-Z]+/, (label) => label.toLowerCase())
+    : formatted
+}
+
+function transformCellRange(firstToken: string, secondToken: string, operation: SheetStructureOperation): string | null {
+  const first = parseA1Address(firstToken)
+  const second = parseA1Address(secondToken)
+  if (!first || !second) return `${firstToken}:${secondToken}`
+  const interval = operation.axis === 'row'
+    ? { start: first.row, end: second.row }
+    : { start: first.column, end: second.column }
+  const transformed = transformInterval(interval, operation)
+  if (!transformed) return null
+
+  const firstPosition = transformed.start
+  const secondPosition = transformed.end
+  const firstFormatted = formatA1Address({
+    ...first,
+    row: operation.axis === 'row' ? firstPosition : first.row,
+    column: operation.axis === 'column' ? firstPosition : first.column,
+  })
+  const secondFormatted = formatA1Address({
+    ...second,
+    row: operation.axis === 'row' ? secondPosition : second.row,
+    column: operation.axis === 'column' ? secondPosition : second.column,
+  })
+  if (!firstFormatted || !secondFormatted) return null
+  return `${preserveColumnCase(firstToken, firstFormatted)}:${preserveColumnCase(secondToken, secondFormatted)}`
+}
+
+function preserveColumnCase(original: string, formatted: string): string {
+  const label = /^\$?([A-Za-z]+)/.exec(original)?.[1] || 'A'
+  return label === label.toLowerCase()
+    ? formatted.replace(/[A-Z]+/, (value) => value.toLowerCase())
+    : formatted
+}
+
+function transformWholeRange(
+  firstToken: string,
+  secondToken: string,
+  referenceAxis: SheetAxis,
+  operation: SheetStructureOperation,
+): string | null {
+  if (referenceAxis !== operation.axis) return `${firstToken}:${secondToken}`
+  const first = referenceAxis === 'row'
+    ? Number(firstToken.replace('$', ''))
+    : columnLabelToNumber(firstToken.replace('$', ''))
+  const second = referenceAxis === 'row'
+    ? Number(secondToken.replace('$', ''))
+    : columnLabelToNumber(secondToken.replace('$', ''))
+  if (!first || !second) return `${firstToken}:${secondToken}`
+  const transformed = transformInterval({ start: first, end: second }, operation)
+  if (!transformed) return null
+  const formattedFirst = formatLike(firstToken, transformed.start, referenceAxis)
+  const formattedSecond = formatLike(secondToken, transformed.end, referenceAxis)
+  return formattedFirst && formattedSecond ? `${formattedFirst}:${formattedSecond}` : null
+}
+
+function transformParsedReference(reference: ParsedReference, operation: SheetStructureOperation): string | null {
+  if (reference.kind === 'cell') return transformCellToken(reference.first, operation)
+  if (reference.kind === 'cell-range') return transformCellRange(reference.first, reference.second!, operation)
+  if (reference.kind === 'column-range') return transformWholeRange(reference.first, reference.second!, 'column', operation)
+  return transformWholeRange(reference.first, reference.second!, 'row', operation)
+}
+
+function copyDoubleQuotedString(source: string, start: number): number {
+  let position = start + 1
+  while (position < source.length) {
+    if (source[position] !== '"') position += 1
+    else if (source[position + 1] === '"') position += 2
+    else return position + 1
+  }
+  return source.length
+}
+
+function sheetPrefixLength(source: string): number {
+  if (source[0] === "'") {
+    let position = 1
+    while (position < source.length) {
+      if (source[position] !== "'") position += 1
+      else if (source[position + 1] === "'") position += 2
+      else return source[position + 1] === '!' ? position + 2 : 0
+    }
+    return 0
+  }
+  const match = /^[A-Za-z_\\][A-Za-z0-9_.]*!/.exec(source)
+  return match?.[0].length || 0
+}
+
+function referenceMatch(source: string): FormulaReferenceMatch | null {
+  const prefixLength = sheetPrefixLength(source)
+  const prefix = prefixLength ? source.slice(0, prefixLength) : ''
+  const body = source.slice(prefixLength)
+  const cellRange = /^(\$?[A-Za-z]{1,3}\$?[1-9]\d*):(\$?[A-Za-z]{1,3}\$?[1-9]\d*)/.exec(body)
+  if (cellRange) {
+    return {
+      length: prefixLength + cellRange[0].length,
+      prefix,
+      reference: { kind: 'cell-range', first: cellRange[1], second: cellRange[2] },
+    }
+  }
+  const columnRange = /^(\$?[A-Za-z]{1,3}):(\$?[A-Za-z]{1,3})/.exec(body)
+  if (columnRange) {
+    return {
+      length: prefixLength + columnRange[0].length,
+      prefix,
+      reference: { kind: 'column-range', first: columnRange[1], second: columnRange[2] },
+    }
+  }
+  const rowRange = /^(\$?[1-9]\d*):(\$?[1-9]\d*)/.exec(body)
+  if (rowRange) {
+    return {
+      length: prefixLength + rowRange[0].length,
+      prefix,
+      reference: { kind: 'row-range', first: rowRange[1], second: rowRange[2] },
+    }
+  }
+  const cell = /^(\$?[A-Za-z]{1,3}\$?[1-9]\d*)/.exec(body)
+  if (!cell) return null
+  return {
+    length: prefixLength + cell[0].length,
+    prefix,
+    reference: { kind: 'cell', first: cell[1] },
+  }
+}
+
+function hasReferenceBoundaryBefore(source: string, position: number): boolean {
+  return position === 0 || !/[A-Za-z0-9_.$]/.test(source[position - 1])
+}
+
+function hasReferenceBoundaryAfter(source: string, position: number): boolean {
+  return !/[A-Za-z0-9_.]/.test(source[position] || '')
+}
+
+function nextNonWhitespace(source: string, start: number): string {
+  let position = start
+  while (/\s/.test(source[position] || '')) position += 1
+  return source[position] || ''
+}
+
+function decodedSheetPrefix(prefix: string): string | null {
+  if (!prefix) return null
+  const withoutBang = prefix.slice(0, -1)
+  if (withoutBang.startsWith("'") && withoutBang.endsWith("'")) {
+    return withoutBang.slice(1, -1).replace(/''/g, "'")
+  }
+  return withoutBang
+}
+
+function referenceTargetsSheet(
+  prefix: string,
+  formulaSheetId: string | undefined,
+  targetSheet: SheetData,
+): boolean {
+  if (!prefix) return formulaSheetId === targetSheet.id
+  return decodedSheetPrefix(prefix)?.toLocaleLowerCase() === targetSheet.name.toLocaleLowerCase()
+}
+
+/**
+ * Rewrite references for an insert/delete operation. Unlike copy-fill shifts,
+ * structural edits move absolute and relative references alike. String literals
+ * and structured-reference brackets are not interpreted as A1 addresses.
+ */
+export function rewriteFormulaForSheetStructure(
+  formula: string,
+  formulaSheetId: string | undefined,
+  targetSheet: SheetData,
+  operation: SheetStructureOperation,
+): string {
+  validateOperation(operation)
+  let output = ''
+  let position = 0
+
+  while (position < formula.length) {
+    if (formula[position] === '"') {
+      const end = copyDoubleQuotedString(formula, position)
+      output += formula.slice(position, end)
+      position = end
+      continue
+    }
+    if (formula[position] === '[') {
+      const end = formula.indexOf(']', position + 1)
+      if (end >= 0) {
+        output += formula.slice(position, end + 1)
+        position = end + 1
+        continue
+      }
+    }
+    if (hasReferenceBoundaryBefore(formula, position)) {
+      const match = referenceMatch(formula.slice(position))
+      if (match && hasReferenceBoundaryAfter(formula, position + match.length)) {
+        // `[Book.xlsx]Sheet!A1` is an external-workbook reference. The bracket
+        // was copied by the branch above, so consume its sheet/address token
+        // unchanged rather than mistaking it for the local sheet of that name.
+        if (match.prefix && formula[position - 1] === ']') {
+          output += formula.slice(position, position + match.length)
+          position += match.length
+          continue
+        }
+        const singleCellFunction = match.reference.kind === 'cell'
+          && nextNonWhitespace(formula, position + match.length) === '('
+        if (!singleCellFunction && referenceTargetsSheet(match.prefix, formulaSheetId, targetSheet)) {
+          const transformed = transformParsedReference(match.reference, operation)
+          output += match.prefix + (transformed ?? '#REF!')
+          position += match.length
+          continue
+        }
+      }
+    }
+    output += formula[position]
+    position += 1
+  }
+  return output
+}
+
+function transformLocalRangeText(text: string, operation: SheetStructureOperation): string | null {
+  const cellMatch = /^\s*(\$?[A-Za-z]{1,3}\$?[1-9]\d*)(?::(\$?[A-Za-z]{1,3}\$?[1-9]\d*))?\s*$/.exec(text)
+  if (cellMatch) {
+    if (!cellMatch[2]) return transformCellToken(cellMatch[1], operation)
+    return transformCellRange(cellMatch[1], cellMatch[2], operation)
+  }
+  const columnMatch = /^\s*(\$?[A-Za-z]{1,3}):(\$?[A-Za-z]{1,3})\s*$/.exec(text)
+  if (columnMatch) return transformWholeRange(columnMatch[1], columnMatch[2], 'column', operation)
+  const rowMatch = /^\s*(\$?[1-9]\d*):(\$?[1-9]\d*)\s*$/.exec(text)
+  if (rowMatch) return transformWholeRange(rowMatch[1], rowMatch[2], 'row', operation)
+  return rewriteFormulaForSheetStructure(text, '__local__', { id: '__local__', name: '', rowCount: 1, colCount: 1, cells: {}, merges: [], colWidths: {}, rowHeights: {} }, operation)
+}
+
+function transformSqref(text: string, operation: SheetStructureOperation): string | null {
+  const ranges = text.trim().split(/\s+/).filter(Boolean)
+  if (!ranges.length) return text
+  const transformed = ranges
+    .map((range) => transformLocalRangeText(range, operation))
+    .filter((range): range is string => Boolean(range && range !== '#REF!'))
+  return transformed.length ? transformed.join(' ') : null
+}
+
+function preflightArrayRanges(sheet: SheetData, operation: SheetStructureOperation): void {
+  const { start, end } = operationInterval(operation)
+  const seen = new Set<string>()
+  for (const cell of Object.values(sheet.cells)) {
+    if (!cell.formulaRange || seen.has(cell.formulaRange)) continue
+    seen.add(cell.formulaRange)
+    const bounds = parseRange(cell.formulaRange)
+    if (!bounds) continue
+    const low = operation.axis === 'row' ? bounds.top : bounds.left
+    const high = operation.axis === 'row' ? bounds.bottom : bounds.right
+    const conflicts = operation.kind === 'insert'
+      ? start > low && start <= high
+      : Math.max(start, low) <= Math.min(end, high) && !(start <= low && end >= high)
+    if (conflicts) {
+      throw new SheetStructureError(
+        `The edit would split the array/shared formula range ${cell.formulaRange}. Select the complete range or edit outside it.`,
+        'ARRAY_RANGE_CONFLICT',
+      )
+    }
+  }
+}
+
+function preflightOverflow(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (operation.kind !== 'insert') return
+  const maximum = maxForAxis(operation.axis)
+  const overflows = (position: number) => position >= operation.index + 1 && position + operation.count > maximum
+  for (const address of Object.keys(sheet.cells)) {
+    const coordinate = coordinateFromAddress(address)
+    if (coordinate && overflows(operation.axis === 'row' ? coordinate.row + 1 : coordinate.col + 1)) {
+      throw new SheetStructureError('The edit would push worksheet cells beyond the XLSX limit.', 'LIMIT_EXCEEDED')
+    }
+  }
+  const dimensionRecord = operation.axis === 'row'
+    ? { ...(sheet.rowHeights || {}), ...(sheet.rowProperties || {}) }
+    : { ...(sheet.colWidths || {}), ...(sheet.columnProperties || {}) }
+  if (Object.keys(dimensionRecord).some((key) => overflows(Number(key)))) {
+    throw new SheetStructureError('The edit would push row or column metadata beyond the XLSX limit.', 'LIMIT_EXCEEDED')
+  }
+  const hidden = operation.axis === 'row' ? sheet.hiddenRows : sheet.hiddenCols
+  if ((hidden || []).some((value) => overflows(Number(value)))) {
+    throw new SheetStructureError('The edit would push hidden dimensions beyond the XLSX limit.', 'LIMIT_EXCEEDED')
+  }
+  for (const merge of sheet.merges || []) {
+    const bounds = parseRange(merge)
+    if (!bounds) continue
+    const high = operation.axis === 'row' ? bounds.bottom : bounds.right
+    if (overflows(high)) {
+      throw new SheetStructureError('The edit would push a merged range beyond the XLSX limit.', 'LIMIT_EXCEEDED')
+    }
+  }
+}
+
+function transformCells(sheet: SheetData, operation: SheetStructureOperation): void {
+  const cells: Record<string, CellData> = {}
+  for (const [address, sourceCell] of Object.entries(sheet.cells)) {
+    const coordinate = coordinateFromAddress(address)
+    if (!coordinate) {
+      cells[address] = sourceCell
+      continue
+    }
+    const position = operation.axis === 'row' ? coordinate.row + 1 : coordinate.col + 1
+    const transformed = transformPosition(position, operation)
+    if (transformed === null) continue
+    const destination = operation.axis === 'row'
+      ? { ...coordinate, row: transformed - 1 }
+      : { ...coordinate, col: transformed - 1 }
+    const cell = sourceCell
+    if (cell.formulaRange) {
+      const formulaRange = transformLocalRangeText(cell.formulaRange, operation)
+      if (formulaRange) cell.formulaRange = formulaRange
+      else delete cell.formulaRange
+    }
+    const extended = cell as CellData & { sharedFormulaMaster?: string }
+    if (extended.sharedFormulaMaster) {
+      const master = transformCellToken(extended.sharedFormulaMaster, operation)
+      if (master) extended.sharedFormulaMaster = master
+      else delete extended.sharedFormulaMaster
+    }
+    cells[addressFromCoordinate(destination)] = cell
+  }
+  sheet.cells = cells
+}
+
+function transformNumericRecord<T>(
+  record: Record<string, T> | undefined,
+  operation: SheetStructureOperation,
+): Record<string, T> | undefined {
+  if (!record) return undefined
+  const result: Record<string, T> = {}
+  for (const [key, value] of Object.entries(record)) {
+    const index = Number(key)
+    if (!Number.isSafeInteger(index) || index < 1) {
+      result[key] = value
+      continue
+    }
+    const transformed = transformPosition(index, operation)
+    if (transformed !== null) result[String(transformed)] = value
+  }
+  return result
+}
+
+function transformHiddenDimensions(values: number[] | undefined, operation: SheetStructureOperation): number[] | undefined {
+  if (!values) return undefined
+  const transformed = values
+    .map((value) => transformPosition(Number(value), operation))
+    .filter((value): value is number => value !== null && Number.isSafeInteger(value) && value >= 1)
+  return [...new Set(transformed)].sort((left, right) => left - right)
+}
+
+function transformAddressForNavigation(address: unknown, operation: SheetStructureOperation): string | undefined {
+  if (typeof address !== 'string') return undefined
+  const parsed = parseA1Address(address)
+  if (!parsed) return address
+  const position = operation.axis === 'row' ? parsed.row : parsed.column
+  const transformed = transformNavigationPosition(position, operation)
+  return formatA1Address({
+    ...parsed,
+    row: operation.axis === 'row' ? transformed : parsed.row,
+    column: operation.axis === 'column' ? transformed : parsed.column,
+  }) || address
+}
+
+function transformFrozenCount(value: unknown, operation: SheetStructureOperation): number {
+  const current = Math.max(0, Math.floor(Number(value) || 0))
+  const { start, end } = operationInterval(operation)
+  if (operation.kind === 'insert') return start <= current ? current + operation.count : current
+  const removed = Math.max(0, Math.min(current, end) - start + 1)
+  return Math.max(0, current - removed)
+}
+
+function transformViewsAndFrozen(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (sheet.frozen) {
+    if (operation.axis === 'row') sheet.frozen.rows = transformFrozenCount(sheet.frozen.rows, operation)
+    else sheet.frozen.columns = transformFrozenCount(sheet.frozen.columns, operation)
+    if (sheet.frozen.topLeftCell) sheet.frozen.topLeftCell = transformAddressForNavigation(sheet.frozen.topLeftCell, operation)
+    if (sheet.frozen.activeCell) sheet.frozen.activeCell = transformAddressForNavigation(sheet.frozen.activeCell, operation)
+  }
+  if (!sheet.views) return
+  for (const view of sheet.views) {
+    if (operation.axis === 'row' && view.state === 'frozen') view.ySplit = transformFrozenCount(view.ySplit, operation)
+    if (operation.axis === 'column' && view.state === 'frozen') view.xSplit = transformFrozenCount(view.xSplit, operation)
+    if (view.topLeftCell) view.topLeftCell = transformAddressForNavigation(view.topLeftCell, operation)
+    if (view.activeCell) view.activeCell = transformAddressForNavigation(view.activeCell, operation)
+  }
+}
+
+function transformBreaks(value: unknown[] | undefined, operation: SheetStructureOperation): unknown[] | undefined {
+  if (!value) return undefined
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [item]
+    const record = item as Record<string, unknown>
+    const key = 'id' in record ? 'id' : 'row' in record ? 'row' : 'index' in record ? 'index' : null
+    if (!key) return [item]
+    const position = Number(record[key])
+    if (!Number.isSafeInteger(position) || position < 1) return [item]
+    const transformed = transformPosition(position, operation)
+    return transformed === null ? [] : [{ ...record, [key]: transformed }]
+  })
+}
+
+function transformFormulaProperties(
+  value: unknown,
+  formulaSheetId: string,
+  targetSheet: SheetData,
+  operation: SheetStructureOperation,
+  propertyName = '',
+): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => (
+      typeof item === 'string' && /formulae?|formula[12]/i.test(propertyName)
+        ? rewriteFormulaForSheetStructure(item, formulaSheetId, targetSheet, operation)
+        : transformFormulaProperties(item, formulaSheetId, targetSheet, operation, propertyName)
+    ))
+  }
+  if (!value || typeof value !== 'object') {
+    return typeof value === 'string' && /formulae?|formula[12]/i.test(propertyName)
+      ? rewriteFormulaForSheetStructure(value, formulaSheetId, targetSheet, operation)
+      : value
+  }
+  const result: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    result[key] = transformFormulaProperties(child, formulaSheetId, targetSheet, operation, key)
+  }
+  return result
+}
+
+function transformDataValidations(sheet: SheetData, targetSheet: SheetData, operation: SheetStructureOperation): void {
+  if (!sheet.dataValidations) return
+  const result: Record<string, unknown> = {}
+  for (const [range, validation] of Object.entries(sheet.dataValidations)) {
+    const transformedRange = transformSqref(range, operation)
+    if (!transformedRange) continue
+    result[transformedRange] = transformFormulaProperties(validation, sheet.id, targetSheet, operation)
+  }
+  sheet.dataValidations = result
+}
+
+function transformConditionalFormatting(sheet: SheetData, targetSheet: SheetData, operation: SheetStructureOperation): void {
+  if (!sheet.conditionalFormattings) return
+  sheet.conditionalFormattings = sheet.conditionalFormattings.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [item]
+    const record = transformFormulaProperties(item, sheet.id, targetSheet, operation) as Record<string, unknown>
+    if (typeof record.ref === 'string') {
+      const ref = transformSqref(record.ref, operation)
+      if (!ref) return []
+      record.ref = ref
+    }
+    return [record]
+  })
+}
+
+function endpointAddress(endpoint: unknown): string | null {
+  if (typeof endpoint === 'string') return parseA1Address(endpoint) ? endpoint : null
+  if (!endpoint || typeof endpoint !== 'object') return null
+  const record = endpoint as Record<string, unknown>
+  const row = Number(record.row)
+  const column = Number(record.column)
+  if (!Number.isSafeInteger(row) || !Number.isSafeInteger(column)) return null
+  return formatA1Address({ row, column, rowAbsolute: false, columnAbsolute: false })
+}
+
+function transformedEndpoint(original: unknown, address: string): unknown {
+  if (typeof original === 'string') return address
+  if (!original || typeof original !== 'object') return original
+  const parsed = parseA1Address(address)
+  return parsed ? { ...(original as Record<string, unknown>), row: parsed.row, column: parsed.column } : original
+}
+
+function transformAutoFilter(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (typeof sheet.autoFilter === 'string') {
+    const transformed = transformSqref(sheet.autoFilter, operation)
+    if (transformed) sheet.autoFilter = transformed
+    else delete sheet.autoFilter
+    return
+  }
+  if (!sheet.autoFilter || typeof sheet.autoFilter !== 'object') return
+  const filter = sheet.autoFilter as Record<string, unknown>
+  for (const key of ['ref', 'Ref']) {
+    if (typeof filter[key] !== 'string') continue
+    const transformed = transformSqref(filter[key] as string, operation)
+    if (transformed) filter[key] = transformed
+    else delete sheet.autoFilter
+    return
+  }
+  const from = endpointAddress(filter.from)
+  const to = endpointAddress(filter.to)
+  if (!from || !to) return
+  const transformed = transformLocalRangeText(`${from}:${to}`, operation)
+  if (!transformed) {
+    delete sheet.autoFilter
+    return
+  }
+  const match = /^([^:]+):([^:]+)$/.exec(transformed)
+  if (!match) return
+  filter.from = transformedEndpoint(filter.from, match[1])
+  filter.to = transformedEndpoint(filter.to, match[2])
+}
+
+function transformPageSetup(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (!sheet.pageSetup) return
+  for (const key of ['printArea', 'printTitlesRow', 'printTitlesColumn']) {
+    const value = sheet.pageSetup[key]
+    if (typeof value !== 'string') continue
+    const transformed = key === 'printArea'
+      ? splitFormulaAreas(value)
+        .map((area) => rewriteFormulaForSheetStructure(area, sheet.id, sheet, operation))
+        .filter((area) => !area.includes('#REF!'))
+        .join(',')
+      : transformLocalRangeText(value, operation)
+    if (transformed) sheet.pageSetup[key] = transformed
+    else delete sheet.pageSetup[key]
+  }
+}
+
+/** Split print-area unions without treating commas inside quoted sheet names as separators. */
+function splitFormulaAreas(value: string): string[] {
+  const result: string[] = []
+  let current = ''
+  let quoted = false
+  for (let position = 0; position < value.length; position += 1) {
+    const character = value[position]
+    if (character === "'") {
+      current += character
+      if (quoted && value[position + 1] === "'") {
+        current += value[++position]
+      } else {
+        quoted = !quoted
+      }
+    } else if (character === ',' && !quoted) {
+      if (current.trim()) result.push(current.trim())
+      current = ''
+    } else {
+      current += character
+    }
+  }
+  if (current.trim()) result.push(current.trim())
+  return result
+}
+
+function transformSheetStructure(sheet: SheetData, operation: SheetStructureOperation): void {
+  transformCells(sheet, operation)
+  sheet.merges = (sheet.merges || []).flatMap((range) => {
+    const bounds = parseRange(range)
+    if (!bounds) return [range]
+    const transformed = transformBounds(bounds, operation)
+    return transformed ? [boundsToRange(transformed)] : []
+  })
+
+  if (operation.axis === 'row') {
+    sheet.rowHeights = transformNumericRecord(sheet.rowHeights, operation) || {}
+    sheet.rowProperties = transformNumericRecord(sheet.rowProperties, operation)
+    sheet.hiddenRows = transformHiddenDimensions(sheet.hiddenRows, operation)
+    sheet.rowBreaks = transformBreaks(sheet.rowBreaks, operation)
+    const oldCount = Math.max(1, Math.floor(Number(sheet.rowCount) || 1))
+    sheet.rowCount = operation.kind === 'insert'
+      ? Math.min(MAX_SHEET_ROWS, Math.max(oldCount + operation.count, operation.index + operation.count))
+      : Math.max(1, oldCount - Math.max(0, Math.min(operation.count, oldCount - operation.index)))
+  } else {
+    sheet.colWidths = transformNumericRecord(sheet.colWidths, operation) || {}
+    sheet.columnProperties = transformNumericRecord(sheet.columnProperties, operation)
+    sheet.hiddenCols = transformHiddenDimensions(sheet.hiddenCols, operation)
+    const extended = sheet as SheetData & { columnBreaks?: unknown[] }
+    extended.columnBreaks = transformBreaks(extended.columnBreaks, operation)
+    const oldCount = Math.max(1, Math.floor(Number(sheet.colCount) || 1))
+    sheet.colCount = operation.kind === 'insert'
+      ? Math.min(MAX_SHEET_COLUMNS, Math.max(oldCount + operation.count, operation.index + operation.count))
+      : Math.max(1, oldCount - Math.max(0, Math.min(operation.count, oldCount - operation.index)))
+  }
+
+  transformViewsAndFrozen(sheet, operation)
+  transformAutoFilter(sheet, operation)
+  transformPageSetup(sheet, operation)
+}
+
+function localSheetIdForDefinedName(workbook: WorkbookModel, name: DefinedName): string | undefined {
+  const extended = name as DefinedName & { localSheetRefId?: string }
+  if (extended.localSheetRefId && workbook.sheets.some((sheet) => sheet.id === extended.localSheetRefId)) {
+    return extended.localSheetRefId
+  }
+  const index = Number.isInteger(name.localSheetIndex)
+    ? name.localSheetIndex
+    : Number.isInteger(name.localSheetId) ? name.localSheetId : undefined
+  return index !== undefined ? workbook.sheets[index]?.id : undefined
+}
+
+function transformDefinedNames(workbook: WorkbookModel, targetSheet: SheetData, operation: SheetStructureOperation): void {
+  if (workbook.definedNames) {
+    for (const name of workbook.definedNames) {
+      const localSheetId = localSheetIdForDefinedName(workbook, name)
+      if (name.ref) name.ref = rewriteFormulaForSheetStructure(name.ref, localSheetId, targetSheet, operation)
+      if (name.ranges) name.ranges = name.ranges.map((range) => rewriteFormulaForSheetStructure(range, localSheetId, targetSheet, operation))
+    }
+  }
+  const metadataNames = workbook.metadata?.definedNames
+  if (metadataNames) {
+    for (const name of metadataNames) {
+      const localSheetId = Number.isInteger(name.localSheetId) ? workbook.sheets[name.localSheetId!]?.id : undefined
+      if (name.ranges) name.ranges = rewriteFormulaForSheetStructure(name.ranges, localSheetId, targetSheet, operation)
+      if (name.formula) name.formula = rewriteFormulaForSheetStructure(name.formula, localSheetId, targetSheet, operation)
+    }
+  }
+}
+
+function rewriteWorkbookFormulas(workbook: WorkbookModel, targetSheet: SheetData, operation: SheetStructureOperation): void {
+  for (const sheet of workbook.sheets) {
+    for (const cell of Object.values(sheet.cells)) {
+      if (!cell.formula) continue
+      cell.formula = rewriteFormulaForSheetStructure(cell.formula, sheet.id, targetSheet, operation)
+      delete cell.result
+      delete cell.resultType
+      delete cell.display
+    }
+  }
+  transformDefinedNames(workbook, targetSheet, operation)
+  for (const sheet of workbook.sheets) {
+    if (sheet.id === targetSheet.id) {
+      transformDataValidations(sheet, targetSheet, operation)
+      transformConditionalFormatting(sheet, targetSheet, operation)
+    } else {
+      // Validation and conditional-format formulas on other sheets can still
+      // refer explicitly to the structurally edited sheet. Their applied
+      // ranges remain local to their own sheet and therefore do not move.
+      if (sheet.dataValidations) {
+        for (const [key, value] of Object.entries(sheet.dataValidations)) {
+          sheet.dataValidations[key] = transformFormulaProperties(value, sheet.id, targetSheet, operation)
+        }
+      }
+      if (sheet.conditionalFormattings) {
+        sheet.conditionalFormattings = sheet.conditionalFormattings.map((item) => (
+          transformFormulaProperties(item, sheet.id, targetSheet, operation)
+        ))
+      }
+    }
+  }
+}
+
+/**
+ * Apply a row/column edit without mutating the supplied workbook.
+ *
+ * Cell payloads, cross-sheet formulas, merges, dimensions, hidden state,
+ * frozen panes, filters, validation/conditional-format ranges, print ranges,
+ * and defined names are moved together. Formula caches are invalidated and the
+ * workbook is marked for a complete recalculation on its next compatible open.
+ */
+export function applySheetStructureOperation(
+  workbook: WorkbookModel,
+  sheetId: string,
+  operation: SheetStructureOperation,
+): WorkbookModel {
+  validateOperation(operation)
+  const sourceSheet = workbook.sheets.find((sheet) => sheet.id === sheetId)
+  if (!sourceSheet) throw new SheetStructureError(`Worksheet ${sheetId} was not found.`, 'SHEET_NOT_FOUND')
+  preflightArrayRanges(sourceSheet, operation)
+  preflightOverflow(sourceSheet, operation)
+
+  const next = clone(workbook)
+  const targetSheet = next.sheets.find((sheet) => sheet.id === sheetId)!
+  transformSheetStructure(targetSheet, operation)
+  rewriteWorkbookFormulas(next, targetSheet, operation)
+  next.metadata ||= {}
+  next.metadata.calcProperties = {
+    ...(next.metadata.calcProperties || {}),
+    fullCalcOnLoad: true,
+    forceFullCalc: true,
+  }
+  return next
+}
+
+export function insertRows(workbook: WorkbookModel, sheetId: string, index: number, count = 1): WorkbookModel {
+  return applySheetStructureOperation(workbook, sheetId, { axis: 'row', kind: 'insert', index, count })
+}
+
+export function deleteRows(workbook: WorkbookModel, sheetId: string, index: number, count = 1): WorkbookModel {
+  return applySheetStructureOperation(workbook, sheetId, { axis: 'row', kind: 'delete', index, count })
+}
+
+export function insertColumns(workbook: WorkbookModel, sheetId: string, index: number, count = 1): WorkbookModel {
+  return applySheetStructureOperation(workbook, sheetId, { axis: 'column', kind: 'insert', index, count })
+}
+
+export function deleteColumns(workbook: WorkbookModel, sheetId: string, index: number, count = 1): WorkbookModel {
+  return applySheetStructureOperation(workbook, sheetId, { axis: 'column', kind: 'delete', index, count })
+}
+
+/** Resolve menu wording against a zero-based rectangular selection. */
+export function operationForSelection(
+  selection: GridSelection,
+  command: SelectionStructureCommand,
+): SheetStructureOperation {
+  const bounds = normalizedBounds(selection)
+  switch (command) {
+    case 'insert-rows-above':
+      return { axis: 'row', kind: 'insert', index: bounds.top, count: bounds.bottom - bounds.top + 1 }
+    case 'insert-rows-below':
+      return { axis: 'row', kind: 'insert', index: bounds.bottom + 1, count: bounds.bottom - bounds.top + 1 }
+    case 'delete-rows':
+      return { axis: 'row', kind: 'delete', index: bounds.top, count: bounds.bottom - bounds.top + 1 }
+    case 'insert-columns-left':
+      return { axis: 'column', kind: 'insert', index: bounds.left, count: bounds.right - bounds.left + 1 }
+    case 'insert-columns-right':
+      return { axis: 'column', kind: 'insert', index: bounds.right + 1, count: bounds.right - bounds.left + 1 }
+    case 'delete-columns':
+      return { axis: 'column', kind: 'delete', index: bounds.left, count: bounds.right - bounds.left + 1 }
+  }
+}
+
+function selectionAfterOperation(
+  selection: GridSelection,
+  operation: SheetStructureOperation,
+): GridSelection {
+  const bounds = normalizedBounds(selection)
+  if (operation.axis === 'row') {
+    const start = operation.index
+    const end = operation.kind === 'insert' ? start + operation.count - 1 : start
+    const row = Math.min(start, MAX_SHEET_ROWS - 1)
+    return {
+      anchor: { row, col: bounds.left },
+      focus: { row: Math.min(end, MAX_SHEET_ROWS - 1), col: bounds.right },
+    }
+  }
+  const start = operation.index
+  const end = operation.kind === 'insert' ? start + operation.count - 1 : start
+  const col = Math.min(start, MAX_SHEET_COLUMNS - 1)
+  return {
+    anchor: { row: bounds.top, col },
+    focus: { row: bounds.bottom, col: Math.min(end, MAX_SHEET_COLUMNS - 1) },
+  }
+}
+
+export function applySelectionStructureCommand(
+  workbook: WorkbookModel,
+  sheetId: string,
+  selection: GridSelection,
+  command: SelectionStructureCommand,
+): SelectionStructureResult {
+  const operation = operationForSelection(selection, command)
+  const nextWorkbook = applySheetStructureOperation(workbook, sheetId, operation)
+  const targetSheet = nextWorkbook.sheets.find((sheet) => sheet.id === sheetId)!
+  const nextSelection = selectionAfterOperation(selection, operation)
+  const clampCoordinate = (coordinate: GridCoordinate): GridCoordinate => ({
+    row: Math.min(coordinate.row, Math.max(0, targetSheet.rowCount - 1)),
+    col: Math.min(coordinate.col, Math.max(0, targetSheet.colCount - 1)),
+  })
+  return {
+    workbook: nextWorkbook,
+    selection: {
+      anchor: clampCoordinate(nextSelection.anchor),
+      focus: clampCoordinate(nextSelection.focus),
+    },
+    operation,
+  }
+}
+
+function validSheetName(name: string): boolean {
+  return Boolean(name.trim()) && name.length <= 31 && !/[\\/?*:[\]]/.test(name)
+}
+
+function nextSheetNumber(workbook: WorkbookModel): number {
+  let number = 1
+  const names = new Set(workbook.sheets.map((sheet) => sheet.name.toLocaleLowerCase()))
+  while (names.has(`sheet${number}`.toLocaleLowerCase())) number += 1
+  return number
+}
+
+/** Insert a conventional blank sheet without mutating the supplied workbook. */
+export function insertBlankSheet(
+  workbook: WorkbookModel,
+  options: InsertBlankSheetOptions = {},
+): InsertBlankSheetResult {
+  const next = clone(workbook)
+  const number = nextSheetNumber(next)
+  const name = (options.name ?? `Sheet${number}`).trim()
+  if (!validSheetName(name)) {
+    throw new SheetStructureError('Sheet names must be 1–31 characters and cannot contain \\, /, ?, *, [, ], or :.', 'INVALID_OPERATION')
+  }
+  if (next.sheets.some((sheet) => sheet.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+    throw new SheetStructureError(`A worksheet named “${name}” already exists.`, 'INVALID_OPERATION')
+  }
+  let id = options.id?.trim() || `sheet-${number}`
+  if (!id || next.sheets.some((sheet) => sheet.id === id)) {
+    let suffix = number
+    do id = `sheet-${suffix++}`
+    while (next.sheets.some((sheet) => sheet.id === id))
+  }
+  const rowCount = options.rowCount ?? 200
+  const colCount = options.colCount ?? 40
+  if (!Number.isSafeInteger(rowCount) || rowCount < 1 || rowCount > MAX_SHEET_ROWS
+    || !Number.isSafeInteger(colCount) || colCount < 1 || colCount > MAX_SHEET_COLUMNS) {
+    throw new SheetStructureError('The blank sheet dimensions are outside the XLSX worksheet limits.', 'INVALID_OPERATION')
+  }
+  const sheet: SheetData = {
+    id,
+    name,
+    state: 'visible',
+    rowCount,
+    colCount,
+    cells: {},
+    merges: [],
+    colWidths: {},
+    rowHeights: {},
+    frozen: { rows: 0, columns: 0 },
+  }
+  const afterIndex = options.afterSheetId === undefined
+    ? next.sheets.length - 1
+    : next.sheets.findIndex((candidate) => candidate.id === options.afterSheetId)
+  if (options.afterSheetId !== undefined && afterIndex < 0) {
+    throw new SheetStructureError(`Worksheet ${options.afterSheetId} was not found.`, 'SHEET_NOT_FOUND')
+  }
+  const insertionIndex = afterIndex + 1
+  next.sheets.splice(insertionIndex, 0, sheet)
+  for (const definedName of next.definedNames || []) {
+    const extended = definedName as DefinedName & { localSheetRefId?: string }
+    if (extended.localSheetRefId) continue
+    if (Number.isInteger(definedName.localSheetIndex) && definedName.localSheetIndex! >= insertionIndex) {
+      definedName.localSheetIndex! += 1
+    }
+    if (Number.isInteger(definedName.localSheetId) && definedName.localSheetId! >= insertionIndex) {
+      definedName.localSheetId! += 1
+    }
+  }
+  for (const definedName of next.metadata?.definedNames || []) {
+    if (Number.isInteger(definedName.localSheetId) && definedName.localSheetId! >= insertionIndex) {
+      definedName.localSheetId! += 1
+    }
+  }
+  if (options.activate !== false) next.activeSheetId = id
+  return { workbook: next, sheetId: id }
+}

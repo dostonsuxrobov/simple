@@ -1,0 +1,24 @@
+{
+  "initial": {
+    "width": 1266,
+    "height": 1243,
+    "details": "Image details\nRead from this asset\nFormat\nPNG\nDimensions\n1,266 × 1,243 px\nResolution\n1.6 MP\nAspect ratio\n1.02\nColor\nRGBA · transparency\nFile size\n839.0 KB\nProcessed locally on this computer\nPAINTING\nBrush\n12 px"
+  },
+  "edited": {
+    "width": 1013,
+    "height": 994,
+    "modified": true
+  },
+  "rotated": {
+    "width": 994,
+    "height": 1013
+  },
+  "convertedImage": {
+    "name": "brand-icon.png",
+    "dimensions": {
+      "width": 994,
+      "height": 1013
+    }
+  },
+  "conversionKeptEdits": true
+}

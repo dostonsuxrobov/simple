@@ -1,0 +1,150 @@
+:root {
+  font-family: "Segoe UI Variable", "Segoe UI", Arial, sans-serif;
+  color: #111111;
+  background: #f2f2f2;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+button, input, select { font: inherit; }
+button { color: inherit; }
+[hidden] { display: none !important; }
+
+.app-shell { width: 100%; height: 100%; display: flex; flex-direction: column; background: #f2f2f2; }
+.titlebar {
+  position: relative; z-index: 100; height: 46px; flex: 0 0 46px; display: flex; align-items: stretch;
+  background: #ffffff; border-bottom: 1px solid #dedede; user-select: none;
+}
+.drag-region { -webkit-app-region: drag; }
+.title-identity { min-width: 270px; flex: 1 1 auto; display: flex; align-items: center; gap: 9px; padding: 0 10px 0 13px; overflow: hidden; }
+.app-mark, .welcome-mark, .loader-mark { display: grid; place-items: center; flex: none; }
+.app-mark { width: 24px; height: 24px; color: #111; }
+.app-mark svg, .welcome-mark svg, .loader-mark svg, .start-icon svg, .file-row-icon svg { width: 100%; height: 100%; }
+.app-name { font-size: 13px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+.title-divider { width: 1px; height: 16px; background: #dedede; margin: 0 2px; }
+.document-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; font-size: 12px; }
+.save-state { flex: none; padding: 3px 7px; border-radius: 999px; background: #f3f3f3; color: #606060; font-size: 10px; font-weight: 600; }
+.save-state.is-dirty { background: #111; color: #fff; }
+.save-state.is-saving { color: #111; background: #e8e8e8; }
+
+.file-actions { position: relative; display: flex; align-items: center; gap: 2px; padding: 0 8px; -webkit-app-region: no-drag; }
+.action-button, .window-actions button { height: 32px; border: 0; background: transparent; display: inline-flex; align-items: center; justify-content: center; gap: 6px; cursor: default; }
+.action-button { padding: 0 9px; border-radius: 6px; font-size: 11px; font-weight: 550; }
+.action-button svg { width: 16px; height: 16px; }
+.action-button:hover { background: #f0f0f0; }
+.action-button:active { background: #e5e5e5; }
+.primary-action { background: #111; color: #fff; }
+.primary-action:hover { background: #292929; }
+.icon-only { width: 28px; padding: 0; }
+.icon-only svg { width: 13px; height: 13px; }
+.action-menu { position: absolute; right: 7px; top: 41px; width: 226px; padding: 6px; border: 1px solid #d6d6d6; border-radius: 10px; background: #fff; box-shadow: 0 12px 35px rgba(0,0,0,.14); }
+.action-menu button { width: 100%; display: flex; align-items: center; gap: 11px; padding: 9px; border: 0; border-radius: 7px; background: transparent; text-align: left; }
+.action-menu button:hover { background: #f3f3f3; }
+.action-menu svg { width: 18px; height: 18px; flex: none; }
+.action-menu span { display: grid; gap: 1px; }
+.action-menu strong { font-size: 12px; font-weight: 600; }
+.action-menu small { font-size: 10px; color: #737373; }
+
+.window-actions { display: flex; margin-left: auto; -webkit-app-region: no-drag; }
+.window-actions button { width: 45px; height: 45px; border-radius: 0; }
+.window-actions button:hover { background: #ededed; }
+.window-actions svg { width: 15px; height: 15px; }
+.window-actions .close-button:hover { background: #c42b1c; color: white; }
+
+.workspace { position: relative; min-height: 0; flex: 1 1 auto; overflow: hidden; }
+.editor-host { position: absolute; inset: 0; opacity: 0; pointer-events: none; background: #f2f2f2; }
+.editor-host.is-active { opacity: 1; pointer-events: auto; }
+
+.welcome { position: absolute; inset: 0; z-index: 20; overflow: auto; background: #f5f5f5; }
+.welcome-card { width: min(820px, calc(100% - 48px)); margin: 0 auto; padding: clamp(42px, 7vh, 80px) 0 48px; }
+.welcome-brand { display: flex; align-items: center; gap: 17px; margin-bottom: 32px; }
+.welcome-mark { width: 48px; height: 48px; padding: 8px; border: 1px solid #cfcfcf; border-radius: 13px; background: #fff; box-shadow: 0 3px 12px rgba(0,0,0,.05); }
+.welcome h1 { margin: 0; font-size: 27px; line-height: 1.1; font-weight: 660; letter-spacing: -.035em; }
+.welcome-brand p { margin: 5px 0 0; color: #666; font-size: 13px; }
+.start-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 36px; }
+.start-card { display: flex; align-items: center; gap: 14px; min-height: 78px; padding: 14px 16px; border: 1px solid #d6d6d6; border-radius: 11px; background: #fff; text-align: left; transition: border-color 120ms, box-shadow 120ms, transform 120ms; }
+.start-card:hover { border-color: #999; box-shadow: 0 5px 18px rgba(0,0,0,.06); transform: translateY(-1px); }
+.primary-start { background: #111; border-color: #111; color: #fff; }
+.primary-start:hover { border-color: #111; box-shadow: 0 7px 22px rgba(0,0,0,.15); }
+.start-icon { width: 34px; height: 34px; display: grid; place-items: center; padding: 7px; border: 1px solid currentColor; border-radius: 8px; opacity: .9; }
+.start-card span:last-child { display: grid; gap: 4px; }
+.start-card strong { font-size: 13px; font-weight: 620; }
+.start-card small { font-size: 11px; opacity: .66; }
+.welcome-section { margin-top: 28px; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 9px; padding: 0 3px; }
+.section-heading h2 { margin: 0; font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em; }
+.section-heading span { font-size: 10px; color: #777; }
+.file-list { overflow: hidden; border: 1px solid #dadada; border-radius: 10px; background: #fff; }
+.file-row { width: 100%; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 11px; min-height: 57px; padding: 8px 13px; border: 0; border-bottom: 1px solid #ececec; background: #fff; text-align: left; }
+.file-row:last-child { border-bottom: 0; }
+.file-row:hover { background: #f5f5f5; }
+.file-row-icon { width: 27px; height: 27px; padding: 4px; border: 1px solid #d2d2d2; border-radius: 6px; background: #fff; }
+.file-row-copy { min-width: 0; display: grid; gap: 2px; }
+.file-row-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
+.file-row-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #777; font-size: 10px; }
+.file-row time { color: #777; font-size: 10px; white-space: nowrap; }
+.recovery-row { background: #faf7ef; }
+.empty-list { margin: 0; padding: 22px; text-align: center; color: #777; font-size: 11px; }
+.drop-hint { margin: 20px 0 0; color: #777; text-align: center; font-size: 10px; }
+
+.loading-overlay { position: absolute; inset: 0; z-index: 60; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #f5f5f5; transition: opacity 120ms; }
+.loader-mark { width: 45px; height: 45px; margin-bottom: 16px; padding: 9px; border: 1px solid #ccc; border-radius: 12px; background: #fff; }
+.loader-copy { display: grid; gap: 5px; text-align: center; }
+.loader-copy strong { font-size: 13px; font-weight: 620; }
+.loader-copy span { color: #6b6b6b; font-size: 11px; }
+.progress-track { width: 220px; height: 3px; margin-top: 18px; overflow: hidden; border-radius: 3px; background: #dedede; }
+.progress-track span { display: block; width: 4%; height: 100%; background: #111; transition: width 180ms ease; }
+.drop-overlay { position: absolute; inset: 8px; z-index: 80; display: grid; place-items: center; border: 2px dashed #111; border-radius: 12px; background: rgba(255,255,255,.93); }
+.drop-overlay > div { display: grid; justify-items: center; gap: 7px; }
+.drop-overlay svg { width: 32px; height: 32px; }
+.drop-overlay strong { font-size: 14px; }
+.drop-overlay span { color: #666; font-size: 11px; }
+
+.toast { position: fixed; z-index: 150; left: 50%; bottom: 28px; transform: translateX(-50%); max-width: 480px; padding: 10px 14px; border-radius: 8px; background: #111; color: white; box-shadow: 0 8px 26px rgba(0,0,0,.18); font-size: 11px; }
+.toast[data-tone="error"] { background: #a51d15; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 200; display: grid; place-items: center; background: rgba(0,0,0,.24); backdrop-filter: blur(2px); }
+.modal { width: min(400px, calc(100% - 32px)); padding: 24px; border: 1px solid #d2d2d2; border-radius: 13px; background: #fff; box-shadow: 0 20px 60px rgba(0,0,0,.2); }
+.modal-icon { width: 34px; height: 34px; margin-bottom: 16px; }
+.modal-icon svg { width: 100%; height: 100%; }
+.modal h2 { margin: 0 0 7px; font-size: 19px; letter-spacing: -.025em; }
+.modal p { margin: 0; color: #5d5d5d; font-size: 12px; line-height: 1.5; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 24px; }
+.modal-actions button { min-width: 76px; padding: 8px 12px; border: 1px solid #cfcfcf; border-radius: 7px; background: #fff; font-size: 11px; font-weight: 550; }
+.modal-actions button:hover { background: #f1f1f1; }
+.modal-actions .modal-primary { border-color: #111; background: #111; color: #fff; }
+.modal-actions .modal-primary:hover { background: #2a2a2a; }
+
+/* WordCanvas owns the editing chrome. These restrained overrides keep the
+   embedded ribbon inside the same black-and-white visual language. */
+.editor-host button, .editor-host input, .editor-host select { font-family: "Segoe UI Variable", "Segoe UI", Arial, sans-serif !important; }
+.editor-host [class*="rib-btn"] { border-radius: 4px !important; }
+.editor-host [class*="rib-btn"]:hover { background: #e9e9e9 !important; }
+.editor-host .rib-tab.active { color: #111 !important; }
+.editor-host .rib-tab.active::after { background: #111 !important; }
+.editor-host .cw-toolbar button.rib-btn.active { background: #dedede !important; color: #111 !important; border-color: #c9c9c9 !important; }
+.editor-host .cw-header-btn { color: #111 !important; }
+.editor-host .cw-header-btn.active, .editor-host .cw-statusbar { background: #111 !important; border-color: #111 !important; color: #fff !important; }
+.editor-host .outline-item.active { background: #ededed !important; border-left-color: #111 !important; color: #111 !important; }
+.editor-host .cw-review-tab.active { color: #111 !important; border-bottom-color: #111 !important; }
+.editor-host .cw-btn.cw-btn-primary { background: #111 !important; border-color: #111 !important; }
+
+body.focus-mode .titlebar { display: none; }
+body.focus-mode .editor-host .cw-toolbar,
+body.focus-mode .editor-host .cw-ruler-row,
+body.focus-mode .editor-host .cw-statusbar,
+body.focus-mode .editor-host .cw-outline,
+body.focus-mode .editor-host .cw-review { display: none !important; }
+
+@media (max-width: 1040px) {
+  .action-button span { display: none; }
+  .action-button { width: 34px; padding: 0; }
+  .title-identity { min-width: 210px; }
+}
+
+@media (max-width: 760px) {
+  .app-name, .title-divider, .save-state { display: none; }
+  .start-actions { grid-template-columns: 1fr; }
+  .welcome-card { width: calc(100% - 28px); padding-top: 30px; }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+release/
+tmp/
+.stage/
+*.exe
+.cleanup-backups/
+.codex-tmp/
+simple/modules/
+*.log

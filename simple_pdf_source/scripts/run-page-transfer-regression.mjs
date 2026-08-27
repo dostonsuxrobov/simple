@@ -1,0 +1,66 @@
+import { spawn, spawnSync } from 'node:child_process'
+import { copyFile, mkdtemp, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+
+const root = path.resolve('.')
+const port = Number(process.env.SIMPLE_BENCH_PORT || 9394)
+const electron = path.join(root, 'node_modules', 'electron', 'dist', 'electron.exe')
+const packagedExecutable = process.env.SIMPLE_TEST_EXECUTABLE ? path.resolve(process.env.SIMPLE_TEST_EXECUTABLE) : ''
+const executable = packagedExecutable || electron
+const source = path.join(root, 'tmp', 'pdfs', 'simple-interaction-fixture.pdf')
+const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'simple-page-transfer-pdf-'))
+const target = path.join(temporaryDirectory, 'page-transfer.pdf')
+const profile = await mkdtemp(path.join(os.tmpdir(), 'simple-page-transfer-profile-'))
+
+function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: root,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...options,
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (chunk) => { stdout += chunk })
+    child.stderr?.on('data', (chunk) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('exit', (code) => {
+      if (code === 0) resolve(stdout.trim())
+      else reject(new Error(`${path.basename(command)} exited ${code}\n${stdout}${stderr}`.trim()))
+    })
+  })
+}
+
+let app
+try {
+  await copyFile(source, target)
+  app = spawn(executable, [
+    ...(!packagedExecutable ? ['.'] : []),
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profile}`,
+    target,
+  ], {
+    cwd: root,
+    windowsHide: true,
+    stdio: 'ignore',
+  })
+  const output = await run(process.execPath, ['scripts/smoke-page-transfer.mjs'], {
+    env: { ...process.env, SIMPLE_BENCH_PORT: String(port) },
+  })
+  console.log(output)
+} finally {
+  if (app && app.exitCode === null) {
+    app.kill()
+    await Promise.race([
+      new Promise((resolve) => app.once('exit', resolve)),
+      new Promise((resolve) => setTimeout(resolve, 2_000)),
+    ])
+    if (app.exitCode === null) {
+      spawnSync('taskkill.exe', ['/pid', String(app.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
+    }
+  }
+  await rm(profile, { recursive: true, force: true })
+  await rm(temporaryDirectory, { recursive: true, force: true })
+}

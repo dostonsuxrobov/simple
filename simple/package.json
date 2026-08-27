@@ -1,0 +1,153 @@
+{
+  "name": "simple-unified",
+  "version": "1.1.0",
+  "description": "One portable Windows app for documents, spreadsheets, PDFs, images, videos, and text files.",
+  "author": "simple",
+  "license": "MIT",
+  "private": true,
+  "main": "electron/bootstrap.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "sync": "node scripts/sync-build.cjs",
+    "build": "npm run sync && npm test && node scripts/prepare-portable-build.cjs && electron-builder --win portable --x64",
+    "build:dir": "npm run sync && electron-builder --win dir --x64",
+    "test": "node scripts/verify.cjs",
+    "watch": "node scripts/watch-and-build.cjs",
+    "icon": "python scripts/make-icon.py"
+  },
+  "devDependencies": {
+    "electron": "43.4.1",
+    "electron-builder": "26.15.3",
+    "esbuild": "0.28.2"
+  },
+  "build": {
+    "appId": "com.simple.unified",
+    "productName": "simple",
+    "executableName": "simple",
+    "asar": true,
+    "compression": "normal",
+    "electronLanguages": [
+      "en-US"
+    ],
+    "files": [
+      "electron/**/*",
+      "launcher/**/*",
+      "modules/**/*",
+      "build/icon.ico",
+      "build/icon.png",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "portable": {
+      "useZip": false
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "simple.exe"
+    },
+    "fileAssociations": [
+      {
+        "ext": "docx",
+        "name": "simple document",
+        "description": "Document opened by simple",
+        "role": "Editor",
+        "icon": "build/icon.ico"
+      },
+      {
+        "ext": [
+          "pdf",
+          "txt",
+          "md",
+          "doc"
+        ],
+        "name": "simple readable file",
+        "description": "Readable file opened by simple",
+        "role": "Editor",
+        "icon": "build/icon.ico"
+      },
+      {
+        "ext": [
+          "png",
+          "jpg",
+          "jpeg",
+          "webp",
+          "gif",
+          "bmp",
+          "svg",
+          "avif"
+        ],
+        "name": "simple image",
+        "description": "Image opened by simple",
+        "role": "Editor",
+        "icon": "build/icon.ico"
+      },
+      {
+        "ext": [
+          "mp4",
+          "m4v",
+          "webm",
+          "ogv",
+          "mov",
+          "mkv"
+        ],
+        "name": "simple video",
+        "description": "Video opened by simple",
+        "role": "Viewer",
+        "icon": "build/icon.ico"
+      },
+      {
+        "ext": [
+          "xlsx",
+          "xlsm",
+          "xlsb",
+          "xls",
+          "xltx",
+          "xltm",
+          "xlt",
+          "xlam",
+          "xla",
+          "xml",
+          "ods",
+          "fods",
+          "csv",
+          "tsv",
+          "tab",
+          "numbers",
+          "slk",
+          "sylk",
+          "dif",
+          "dbf",
+          "prn",
+          "wk1",
+          "wk2",
+          "wk3",
+          "wk4",
+          "wks",
+          "wq1",
+          "wq2",
+          "wb1",
+          "wb2",
+          "wb3",
+          "123",
+          "qpw",
+          "html",
+          "htm"
+        ],
+        "name": "simple spreadsheet",
+        "description": "Spreadsheet opened by simple",
+        "role": "Editor",
+        "icon": "build/icon.ico"
+      }
+    ]
+  }
+}

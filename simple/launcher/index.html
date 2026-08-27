@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'" />
+    <title>simple</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="titlebar">
+      <div class="drag-region"><img src="../build/icon.png" alt="" /><span>simple</span></div>
+      <div class="window-controls">
+        <button id="minimize" aria-label="Minimize">—</button>
+        <button id="close" class="close" aria-label="Close">×</button>
+      </div>
+    </header>
+
+    <main id="drop-target">
+      <section class="hero">
+        <div class="brand-copy">
+          <p class="eyebrow">ONE QUIET WORKSPACE</p>
+          <h1>Your files, kept <em>simple.</em></h1>
+          <p class="lede">Open documents, spreadsheets, PDFs, images, videos, and text with one portable app. The file extension picks the right workspace automatically.</p>
+          <div class="hero-actions">
+            <button id="open" class="primary">Choose files</button>
+            <span>or drop them anywhere</span>
+          </div>
+        </div>
+        <div class="hero-icon"><img src="../build/icon.png" alt="simple file icon" /></div>
+      </section>
+
+      <section class="workspace-grid" aria-label="Workspaces">
+        <button class="workspace-card" data-mode="docs">
+          <span class="card-index">01</span>
+          <strong>Documents</strong>
+          <small>DOCX editing, PDF export, print</small>
+          <span class="formats">DOCX</span>
+        </button>
+        <button class="workspace-card" data-mode="calc">
+          <span class="card-index">02</span>
+          <strong>Spreadsheets</strong>
+          <small>Workbooks, formulas, delimited data</small>
+          <span class="formats">XLSX · ODS · CSV + more</span>
+        </button>
+        <button class="workspace-card" data-mode="pdf">
+          <span class="card-index">03</span>
+          <strong>PDF & text</strong>
+          <small>Read, annotate, edit, and convert</small>
+          <span class="formats">PDF · TXT · MD · DOC</span>
+        </button>
+        <button class="workspace-card" data-mode="image">
+          <span class="card-index">04</span>
+          <strong>Images</strong>
+          <small>Crop, rotate, paint, save, print, and convert to PDF</small>
+          <span class="formats">PNG · JPG · WEBP + more</span>
+        </button>
+        <button class="workspace-card" data-mode="video">
+          <span class="card-index">05</span>
+          <strong>Video</strong>
+          <small>Playback, seeking, speed, and fullscreen</small>
+          <span class="formats">MP4 · WEBM · MOV + more</span>
+        </button>
+      </section>
+
+      <section class="file-support">
+        <div>
+          <p class="eyebrow">WINDOWS FILE SUPPORT</p>
+          <h2>One icon for every format.</h2>
+          <p>Make simple available in Windows, then choose it as the default app for the file types you want.</p>
+        </div>
+        <div class="support-actions">
+          <button id="register" class="secondary">Add file support</button>
+          <button id="defaults" class="text-button">Choose defaults</button>
+          <button id="unregister" class="text-button muted">Remove</button>
+        </div>
+      </section>
+
+      <div id="drop-overlay" hidden><img src="../build/icon.png" alt="" /><strong>Open with simple</strong><span>Release to route each file</span></div>
+      <div id="status" role="status" aria-live="polite"></div>
+    </main>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

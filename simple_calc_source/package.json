@@ -1,0 +1,111 @@
+{
+  "name": "simple-calc",
+  "version": "1.0.0",
+  "description": "A minimal, local-first spreadsheet editor with broad workbook compatibility.",
+  "author": "simple_calc",
+  "license": "MIT",
+  "overrides": {
+    "exceljs": {
+      "uuid": "^11.1.0"
+    }
+  },
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:workbooks && npm run test:legacy-xls && npm run test:legacy-xls-layout && npm run test:fidelity && npm run test:formulas && npm run test:number-format && npm run test:structure && npx tsc --noEmit",
+    "test:workbooks": "node scripts/qa-workbooks.cjs",
+    "test:legacy-xls": "node scripts/qa-legacy-xls.cjs",
+    "test:legacy-xls-layout": "node scripts/qa-legacy-xls-layout.mjs",
+    "test:fidelity": "node scripts/qa-fidelity.cjs",
+    "test:formulas": "node --no-warnings --experimental-transform-types scripts/qa-formulas.ts",
+    "test:number-format": "esbuild scripts/qa-number-format.ts --bundle --platform=node --format=esm --outfile=tmp/qa-number-format.mjs && node tmp/qa-number-format.mjs",
+    "test:structure": "esbuild scripts/qa-sheet-operations.ts --bundle --platform=node --format=esm --outfile=tmp/qa-sheet-operations.mjs && node tmp/qa-sheet-operations.mjs",
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build:web": "vite build",
+    "build": "npm run build:web && node scripts/prepare-portable-build.cjs && electron-builder --win portable --x64",
+    "build:dir": "npm run build:web && electron-builder --win dir --x64",
+    "build:installer": "npm run build:web && electron-builder --win nsis --x64",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "jszip": "^3.10.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.simple.calc",
+    "productName": "simple_calc",
+    "asar": true,
+    "electronLanguages": [
+      "en-US"
+    ],
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/icon.ico",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "portable": {
+      "useZip": false
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "simple_calc-${version}-portable.${ext}"
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "xlsx",
+          "xlsm",
+          "xlsb",
+          "xls"
+        ],
+        "name": "Excel workbook",
+        "role": "Editor"
+      },
+      {
+        "ext": [
+          "ods",
+          "fods"
+        ],
+        "name": "OpenDocument spreadsheet",
+        "role": "Editor"
+      },
+      {
+        "ext": [
+          "csv",
+          "tsv"
+        ],
+        "name": "Delimited spreadsheet",
+        "role": "Editor"
+      }
+    ]
+  }
+}
