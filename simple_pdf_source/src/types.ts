@@ -11,6 +11,7 @@ export type ToolMode =
   | 'rectangle'
   | 'crop'
   | 'addText'
+  | 'sign'
 
 export interface DocumentPayload {
   data: Uint8Array | ArrayBuffer | { type: 'Buffer'; data: number[] }
@@ -46,6 +47,8 @@ export interface HighlightOverlay {
   opacity: number
 }
 
+export type DisplayRotation = 0 | 90 | 180 | 270
+
 export interface MarkupOverlay {
   id: string
   type: 'markup'
@@ -55,6 +58,8 @@ export interface MarkupOverlay {
   color: [number, number, number]
   opacity: number
   thickness: number
+  /** Effective page rotation shown on screen when this markup was created. */
+  displayRotation?: DisplayRotation
 }
 
 export interface InkPoint {
@@ -95,6 +100,8 @@ export interface TextOverlay {
   baselineOffset?: number
   /** Original PDF word-space advance in points, before replacement fitting. */
   sourceSpaceWidth?: number
+  /** Effective page rotation shown on screen when this text box was created. */
+  displayRotation?: DisplayRotation
   align: 'left' | 'center' | 'right'
   color: [number, number, number]
   backgroundColor?: [number, number, number]
@@ -111,6 +118,8 @@ export interface ObjectOverlay {
   dataUrl?: string
   opacity: number
   cover: boolean
+  /** Effective page rotation shown on screen when this object was captured. */
+  displayRotation?: DisplayRotation
 }
 
 export type PdfOverlay = HighlightOverlay | MarkupOverlay | InkOverlay | TextOverlay | ObjectOverlay
@@ -157,6 +166,8 @@ export interface PageTextEdit {
   /** UTF-16 offsets of the selection inside sourceItemText. */
   sourceSelectionStart?: number
   sourceSelectionEnd?: number
+  /** Effective page rotation shown on screen when this text box was created. */
+  displayRotation?: DisplayRotation
   align: 'left' | 'center' | 'right'
   color: [number, number, number]
   backgroundColor?: [number, number, number]
@@ -188,6 +199,8 @@ export interface PageObjectEdit {
   dataUrl?: string
   opacity: number
   cover: boolean
+  /** Effective page rotation shown on screen when this object was captured. */
+  displayRotation?: DisplayRotation
   label: string
   modified: boolean
 }
@@ -212,6 +225,33 @@ export interface ActiveSearchMatch {
   query: string
 }
 
+export interface PrinterSummary {
+  name: string
+  displayName: string
+  isDefault: boolean
+  supportsDuplex: boolean
+  supportsColor: boolean
+}
+
+export type PrintDuplexMode = 'simplex' | 'longEdge' | 'shortEdge'
+
+export interface PrintDirectOptions {
+  deviceName?: string
+  copies?: number
+  /** Zero-based page indices, already resolved; omit to print every page. */
+  pageIndices?: number[]
+  landscape?: boolean
+  color?: boolean
+  duplexMode?: PrintDuplexMode
+  collate?: boolean
+  scaleFitToPage?: boolean
+}
+
+export interface PrintDirectResult {
+  success: boolean
+  failureReason: string
+}
+
 export interface SimpleApi {
   openFile: () => Promise<DocumentPayload | null>
   openInNewWindow: (filePath?: string) => Promise<boolean>
@@ -230,6 +270,8 @@ export interface SimpleApi {
   exportPages: (data: Uint8Array, indices: number[], suggestedName: string) => Promise<string | null>
   startPageDrag: (data: Uint8Array, indices: number[], suggestedName: string) => Promise<string | null>
   printPdf: (data: Uint8Array, name: string) => Promise<boolean>
+  listPrinters: () => Promise<PrinterSummary[]>
+  printPdfDirect: (data: Uint8Array, name: string, options: PrintDirectOptions) => Promise<PrintDirectResult>
   savePdf: (input: { data: Uint8Array; path: string | null; name: string; forceDialog: boolean }) => Promise<{ path: string; name: string } | null>
   showItem: (filePath: string) => Promise<void>
   getVersion: () => Promise<string>

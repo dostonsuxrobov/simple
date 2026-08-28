@@ -1,4 +1,4 @@
-import { Crop, Hand, Highlighter, MousePointer2, Pencil, Square, Strikethrough, TextCursorInput, Type, Underline } from 'lucide-react'
+import { Crop, Hand, Highlighter, MousePointer2, Pencil, Signature, Square, Strikethrough, TextCursorInput, Type, Underline } from 'lucide-react'
 import type { ToolMode } from '../types'
 
 const toolDetails: Record<ToolMode, { icon: typeof Hand; label: string; hint: string }> = {
@@ -12,6 +12,7 @@ const toolDetails: Record<ToolMode, { icon: typeof Hand; label: string; hint: st
   draw: { icon: Pencil, label: 'Draw', hint: 'Drag directly on the page to add ink' },
   rectangle: { icon: Square, label: 'Rectangle', hint: 'Drag a rectangle directly on the page' },
   crop: { icon: Crop, label: 'Crop', hint: 'Drag a rectangle, then choose Apply' },
+  sign: { icon: Signature, label: 'Sign', hint: 'Click a saved signature, then click the page to place it' },
 }
 
 export function StatusBar({ tool, pageIndex, pageCount, selectionCount }: { tool: ToolMode; pageIndex: number; pageCount: number; selectionCount: number }) {

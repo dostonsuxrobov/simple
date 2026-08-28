@@ -1,5 +1,5 @@
-import { WordCanvas, type EditorHandle } from "@forevka/wordcanvas";
-import { DocumentBuilder } from "@forevka/wordcanvas/builder";
+import { WordCanvas, type EditorHandle, type RibbonActionContext } from "@forevka/wordcanvas";
+import { DocumentBuilder, pt } from "@forevka/wordcanvas/builder";
 import "./styles.css";
 
 const icon = (paths: string, viewBox = "0 0 24 24") => `<svg aria-hidden="true" viewBox="${viewBox}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
@@ -17,7 +17,15 @@ const icons = {
   restore: icon('<path d="M8 8V4h12v12h-4M4 8h12v12H4z"/>'),
   close: icon('<path d="m6 6 12 12M18 6 6 18"/>'),
   chevron: icon('<path d="m8 10 4 4 4-4"/>'),
+  envelope: icon('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3.5 6.5 8.5 6.5 8.5-6.5"/>'),
 };
+
+const ENVELOPE_SIZES = [
+  { id: "no10", label: "#10 (9.5 × 4.125 in)", pageWidthPx: 912, pageHeightPx: 396 },
+  { id: "monarch", label: "Monarch (7.5 × 3.875 in)", pageWidthPx: 720, pageHeightPx: 372 },
+  { id: "dl", label: "DL (220 × 110 mm)", pageWidthPx: 832, pageHeightPx: 416 },
+  { id: "c5", label: "C5 (229 × 162 mm)", pageWidthPx: 866, pageHeightPx: 612 },
+];
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div class="app-shell">
@@ -89,6 +97,19 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <div class="modal-actions"><button id="cancel-close">Cancel</button><button id="discard-close">Discard</button><button class="modal-primary" id="save-close">Save</button></div>
       </div>
     </div>
+    <div class="modal-backdrop" id="envelope-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="envelope-title">
+        <div class="modal-icon">${icons.envelope}</div>
+        <h2 id="envelope-title">Create an envelope</h2>
+        <p>The envelope replaces the document in this window. Both addresses stay editable afterwards.</p>
+        <div class="envelope-fields">
+          <label>Envelope size<select id="envelope-size">${ENVELOPE_SIZES.map((size) => `<option value="${size.id}">${size.label}</option>`).join("")}</select></label>
+          <label>Return address<textarea id="envelope-return" rows="3" spellcheck="false"></textarea></label>
+          <label>Delivery address<textarea id="envelope-delivery" rows="4" spellcheck="false"></textarea></label>
+        </div>
+        <div class="modal-actions"><button id="envelope-cancel">Cancel</button><button class="modal-primary" id="envelope-create">Create envelope</button></div>
+      </div>
+    </div>
   </div>`;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -104,6 +125,7 @@ const toast = $("toast");
 const actionMenu = $("action-menu");
 const moreButton = $("more-button");
 const closeModal = $("close-modal");
+const envelopeModal = $("envelope-modal");
 
 let handle: EditorHandle | null = null;
 let currentPath: string | null = null;
@@ -117,6 +139,7 @@ let recoveryMaxTimer: number | null = null;
 let recoveryInFlight = false;
 let toastTimer: number | null = null;
 let pendingExternalPath: string | null = null;
+let envelopeContext: RibbonActionContext | null = null;
 const sessionId = crypto.randomUUID();
 
 const RECOVERY_IDLE_DELAY_MS = 12_000;
@@ -157,6 +180,13 @@ const editor = new WordCanvas({
   behavior: { zoomStep: 1.1, zoomMin: 0.35, zoomMax: 3 },
   customizeRibbon(api) {
     api.removeTab("file");
+    api.addGroup("layout", { id: "simple.envelopes", label: "Envelopes" });
+    api.addButton("simple.envelopes", {
+      id: "simple.envelopes.create",
+      label: "Envelope…",
+      tooltip: "Create an envelope",
+      onClick: (ctx) => openEnvelopeDialog(ctx),
+    });
   },
   onLoadProgress(progress) {
     progressBar.style.width = `${Math.max(4, progress.percent * 100)}%`;
@@ -408,6 +438,57 @@ async function printDocument() {
   }
 }
 
+function addressLines(value: string) {
+  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function documentIsEmpty(ctx: RibbonActionContext) {
+  return ctx.getDocument().blocks.every((block) => block.kind === "paragraph" && block.runs.every((run) => !run.text.trim()));
+}
+
+function openEnvelopeDialog(ctx: RibbonActionContext) {
+  envelopeContext = ctx;
+  envelopeModal.hidden = false;
+  $<HTMLTextAreaElement>("envelope-return").focus();
+}
+
+function applyEnvelope(ctx: RibbonActionContext, size: (typeof ENVELOPE_SIZES)[number], returnAddress: string, deliveryAddress: string) {
+  const margins = { top: 48, right: 72, bottom: 48, left: 72 };
+  const returnLines = addressLines(returnAddress);
+  const deliveryLines = addressLines(deliveryAddress);
+  const builder = DocumentBuilder.create({ pageSize: { pageWidthPx: size.pageWidthPx, pageHeightPx: size.pageHeightPx }, margins });
+  for (const line of returnLines.length ? returnLines : [""]) {
+    builder.paragraph(line, { fontFamily: "Calibri", fontSizePx: pt(10), color: "#111111" }).spacing({ lineHeight: 1.15, before: 0, after: 0 });
+  }
+  const returnBlockPx = Math.max(returnLines.length, 1) * Math.round(pt(10) * 1.4);
+  const deliverySpaceBeforePx = Math.max(24, Math.round(size.pageHeightPx / 2 - margins.top - returnBlockPx));
+  const deliveryIndentPx = Math.round(size.pageWidthPx * 0.42);
+  (deliveryLines.length ? deliveryLines : [""]).forEach((line, index) => {
+    builder.paragraph(line, { fontFamily: "Calibri", fontSizePx: pt(12), color: "#111111" })
+      .indent({ left: deliveryIndentPx })
+      .spacing({ lineHeight: 1.15, before: index === 0 ? deliverySpaceBeforePx : 0, after: 0 });
+  });
+  ctx.setDocument(builder.build());
+}
+
+function createEnvelope() {
+  const ctx = envelopeContext;
+  if (!ctx) return;
+  const sizeId = $<HTMLSelectElement>("envelope-size").value;
+  const size = ENVELOPE_SIZES.find((candidate) => candidate.id === sizeId) ?? ENVELOPE_SIZES[0];
+  if (documentOpen && (dirty || !documentIsEmpty(ctx)) && !window.confirm(`Replace "${documentName}" with the envelope? Unsaved changes will be lost.`)) return;
+  applyEnvelope(ctx, size, $<HTMLTextAreaElement>("envelope-return").value, $<HTMLTextAreaElement>("envelope-delivery").value);
+  envelopeModal.hidden = true;
+  currentPath = null;
+  documentName = "Envelope";
+  documentOpen = true;
+  welcome.hidden = true;
+  editorHost.classList.add("is-active");
+  markDirty();
+  setTitle();
+  notify("Envelope created.");
+}
+
 async function refreshWelcomeLists() {
   const [recents, recoveries] = await Promise.all([window.simpleDocs.getRecents(), window.simpleDocs.getRecoveries()]);
   const recentList = $("recent-list");
@@ -485,6 +566,8 @@ $("focus-button").addEventListener("click", () => window.simpleDocs.toggleFullsc
 $("cancel-close").addEventListener("click", () => { closeModal.hidden = true; });
 $("discard-close").addEventListener("click", async () => { await window.simpleDocs.clearRecovery(sessionId); window.simpleDocs.confirmClose(); });
 $("save-close").addEventListener("click", async () => { if (await saveDocument(false)) window.simpleDocs.confirmClose(); });
+$("envelope-cancel").addEventListener("click", () => { envelopeModal.hidden = true; });
+$("envelope-create").addEventListener("click", createEnvelope);
 
 document.addEventListener("keydown", (event) => {
   const modifier = event.ctrlKey || event.metaKey;
@@ -518,7 +601,7 @@ document.addEventListener("keydown", (event) => {
     window.simpleDocs.toggleFullscreen();
     return;
   }
-  if (!documentOpen || closeModal.hidden === false) return;
+  if (!documentOpen || closeModal.hidden === false || envelopeModal.hidden === false) return;
   if (isNavigationOnlyControl(event.target)) return;
   const key = event.key.toLowerCase();
   const directMutation = !modifier && (event.key.length === 1 || ["backspace", "delete", "enter", "tab"].includes(key));
@@ -537,11 +620,11 @@ editorHost.addEventListener("drop", (event) => {
 
 function isNavigationOnlyControl(target: EventTarget | null) {
   if (!(target instanceof Element)) return false;
-  if (target.closest(".cw-outline, .cw-statusbar, .cw-ruler-row, .cw-vruler, .cw-review, .cw-mode-select")) return true;
+  if (target.closest(".cw-outline, .cw-statusbar, .cw-ruler-row, .cw-vruler, .cw-review, .cw-mode-select, .modal-backdrop")) return true;
   const control = target.closest<HTMLElement>("button, [role=button], select, input");
   if (!control) return false;
   const label = (control.getAttribute("aria-label") || control.getAttribute("title") || control.getAttribute("placeholder") || control.textContent || "").trim().toLowerCase();
-  return ["home", "insert", "layout", "table", "view", "review", "editing", "suggesting", "viewing", "find", "replace", "replace all", "select all"].includes(label)
+  return ["home", "insert", "layout", "table", "view", "review", "editing", "suggesting", "viewing", "find", "replace", "replace all", "select all", "envelope…", "create an envelope"].includes(label)
     || label.startsWith("zoom ");
 }
 

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { Check, Crop, ExternalLink, GripHorizontal, LoaderCircle, X } from 'lucide-react'
 import type {
   ActiveSearchMatch,
   DetectedPageObject,
+  DisplayRotation,
   PageObjectEdit,
   PageTextEdit,
   PdfOverlay,
@@ -100,10 +101,11 @@ interface PdfPageProps {
   onCancelObjectEdit: () => void
   onObjectRegionSelected: () => void
   onHighlight: (rects: PdfRect[]) => void
-  onTextMarkup: (style: 'underline' | 'strikeout', rects: PdfRect[]) => void
+  onTextMarkup: (style: 'underline' | 'strikeout', rects: PdfRect[], displayRotation: DisplayRotation) => void
   onInk: (points: Array<{ x: number; y: number }>) => void
   onRectangle: (rect: PdfRect) => void
   onCrop: (rect: PdfRect) => void
+  onPlaceSignature: (point: { x: number; y: number }, displayRotation: DisplayRotation) => void
   onNavigate: (pageIndex: number) => void
   onFormChange: (name: string, value: string | boolean) => void
 }
@@ -126,6 +128,10 @@ function sameRect(a?: PdfRect, b?: PdfRect) {
     && Math.abs(a.y - b.y) < 0.01
     && Math.abs(a.width - b.width) < 0.01
     && Math.abs(a.height - b.height) < 0.01
+}
+
+function textViewportSignature(viewport: { width: number; height: number; rotation: number; scale: number }) {
+  return `${viewport.width}x${viewport.height}x${viewport.rotation}x${viewport.scale}`
 }
 
 function liveSelectionIntersectsTextLayer(layer: HTMLElement) {
@@ -241,11 +247,11 @@ function sourcePdfSpaceWidth(font: PdfCommonFont | undefined, text: string, item
   return spaceUnits / 1000 * fontSize * scaleX * (itemWidth / rawWidth)
 }
 
-export function PdfPage({
+export const PdfPage = memo(function PdfPage({
   pdf, pageIndex, zoom, rotation, tool, overlays, formValues, textEdit, objectEdit, activeSearchMatch, selectingObjectRegion,
   onPageReady, onRequestTextEdit, onTextEditChange, onCommitTextEdit, onCancelTextEdit,
   onRequestObjectEdit, onObjectEditChange, onCommitObjectEdit, onCancelObjectEdit,
-  onObjectRegionSelected, onHighlight, onCrop, onNavigate, onFormChange,
+  onObjectRegionSelected, onHighlight, onCrop, onPlaceSignature, onNavigate, onFormChange,
   onTextMarkup, onInk, onRectangle,
 }: PdfPageProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -258,6 +264,7 @@ export function PdfPage({
   const fontDataRef = useRef(new Map<string, Uint8Array>())
   const [page, setPage] = useState<PDFPageProxy | null>(null)
   const [loading, setLoading] = useState(true)
+  const [renderViewport, setRenderViewport] = useState<ReturnType<PDFPageProxy['getViewport']> | null>(null)
   const [canvasReadyViewport, setCanvasReadyViewport] = useState<ReturnType<PDFPageProxy['getViewport']> | null>(null)
   const [renderError, setRenderError] = useState('')
   const [annotations, setAnnotations] = useState<any[]>([])
@@ -272,6 +279,8 @@ export function PdfPage({
   const [textLayerVersion, setTextLayerVersion] = useState(0)
   const [textLayerRefreshVersion, setTextLayerRefreshVersion] = useState(0)
   const [searchMatchGeometry, setSearchMatchGeometry] = useState<SearchMatchGeometry>({ key: '', rects: [] })
+  const canvasReadyViewportRef = useRef(canvasReadyViewport)
+  canvasReadyViewportRef.current = canvasReadyViewport
   const activeSearchKey = activeSearchMatch?.pageIndex === pageIndex
     ? `${activeSearchMatch.query}\u0000${activeSearchMatch.occurrenceIndex}`
     : ''
@@ -297,6 +306,7 @@ export function PdfPage({
     const angle = (((page.rotate || 0) + rotation) % 360 + 360) % 360
     return page.getViewport({ scale: zoom, rotation: angle })
   }, [page, zoom, rotation])
+  const displayRotation = ((((viewport?.rotation || 0) % 360) + 360) % 360) as DisplayRotation
 
   useEffect(() => {
     if (!viewport) return
@@ -304,11 +314,45 @@ export function PdfPage({
     setRegionDraft(null)
     setShapeDraft(null)
     setInkDraft([])
+  }, [viewport])
+
+  useEffect(() => {
+    if (!viewport) return
     onPageReady?.({ width: viewport.width, height: viewport.height })
   }, [viewport, onPageReady])
 
+  // Ctrl+wheel zoom arrives in bursts. While a canvas rendered at the same
+  // rotation already exists, the layout effect below CSS-scales it for instant
+  // feedback and the expensive pdf.js re-render waits for the gesture to settle.
   useEffect(() => {
-    if (!page || !viewport || !canvasRef.current) return
+    if (!viewport) {
+      setRenderViewport(null)
+      return
+    }
+    const ready = canvasReadyViewportRef.current
+    if (!ready || ready.rotation !== viewport.rotation) {
+      setRenderViewport(viewport)
+      return
+    }
+    const timer = window.setTimeout(() => setRenderViewport(viewport), 140)
+    return () => window.clearTimeout(timer)
+  }, [viewport])
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current
+    if (!viewport || !canvas) return
+    canvas.style.width = `${viewport.width}px`
+    canvas.style.height = `${viewport.height}px`
+    // Spans built for another viewport must never stay visible floating over
+    // the rescaled canvas; the rebuild restores visibility when it lands.
+    const layer = textLayerRef.current
+    if (layer?.dataset.viewportSignature && layer.dataset.viewportSignature !== textViewportSignature(viewport)) {
+      layer.style.visibility = 'hidden'
+    }
+  }, [viewport])
+
+  useEffect(() => {
+    if (!page || !renderViewport || !canvasRef.current) return
     let cancelled = false
     const canvas = canvasRef.current
     // Chromium's grayscale canvas text is visibly softer than native PDF
@@ -318,28 +362,29 @@ export function PdfPage({
     // bounded. ContinuousPdfViewer still mounts only nearby canvases.
     const desiredDpr = Math.min(Math.max(window.devicePixelRatio || 1, 1.5), 2.5)
     const maxCanvasPixels = 24_000_000
-    const pixelArea = viewport.width * viewport.height * desiredDpr * desiredDpr
+    const pixelArea = renderViewport.width * renderViewport.height * desiredDpr * desiredDpr
     const dpr = pixelArea > maxCanvasPixels
       ? Math.max(1, desiredDpr * Math.sqrt(maxCanvasPixels / pixelArea))
       : desiredDpr
-    canvas.width = Math.max(1, Math.ceil(viewport.width * dpr))
-    canvas.height = Math.max(1, Math.ceil(viewport.height * dpr))
-    canvas.style.width = `${viewport.width}px`
-    canvas.style.height = `${viewport.height}px`
+    canvas.width = Math.max(1, Math.ceil(renderViewport.width * dpr))
+    canvas.height = Math.max(1, Math.ceil(renderViewport.height * dpr))
     const context = canvas.getContext('2d', { alpha: false })
     if (!context) return
+    // Resizing an opaque canvas clears it to black. Paint the page background
+    // right away so rotate/zoom/mount never flash before pdf.js renders.
+    context.fillStyle = '#fff'
+    context.fillRect(0, 0, canvas.width, canvas.height)
     setLoading(true)
-    setCanvasReadyViewport(null)
     setRenderError('')
     const renderTask = page.render({
       canvasContext: context,
-      viewport,
-      transform: dpr === 1 ? undefined : [canvas.width / viewport.width, 0, 0, canvas.height / viewport.height, 0, 0],
+      viewport: renderViewport,
+      transform: dpr === 1 ? undefined : [canvas.width / renderViewport.width, 0, 0, canvas.height / renderViewport.height, 0, 0],
     })
     renderTask.promise.then(() => {
       if (!cancelled) {
         setLoading(false)
-        setCanvasReadyViewport(viewport)
+        setCanvasReadyViewport(renderViewport)
       }
     }).catch((error) => {
       if (!cancelled && error?.name !== 'RenderingCancelledException') {
@@ -351,7 +396,7 @@ export function PdfPage({
       cancelled = true
       renderTask.cancel()
     }
-  }, [page, viewport])
+  }, [page, renderViewport])
 
   useEffect(() => {
     if (!page || tool !== 'edit') {
@@ -373,7 +418,14 @@ export function PdfPage({
     const currentViewport = viewport
     let cancelled = false
     const layer = textLayerRef.current
+    const viewportSignature = textViewportSignature(currentViewport)
     if (liveSelectionIntersectsTextLayer(layer)) {
+      // The canvas underneath has already re-rendered. While the rebuild is
+      // deferred, never leave spans built for a different viewport visible
+      // floating over the new orientation.
+      if (layer.dataset.viewportSignature && layer.dataset.viewportSignature !== viewportSignature) {
+        layer.style.visibility = 'hidden'
+      }
       let retryFrame = 0
       const retryWhenSafe = () => {
         window.cancelAnimationFrame(retryFrame)
@@ -406,9 +458,12 @@ export function PdfPage({
       }
       if (cancelled) return
       const styles = content.styles as Record<string, { fontFamily?: string; ascent?: number; descent?: number; vertical?: boolean }>
-      const spans: Array<{ span: HTMLSpanElement; width: number; angle: number; measured: number }> = []
+      const spans: Array<{ span: HTMLSpanElement; width: number; angle: number; measured: number; flow: number; read: number; fontHeight: number }> = []
       const fragment = document.createDocumentFragment()
       const measurementContext = document.createElement('canvas').getContext('2d')
+      const rotationRadians = (((currentViewport.rotation % 360) + 360) % 360) * (Math.PI / 180)
+      const flowAxis = { x: -Math.sin(rotationRadians), y: Math.cos(rotationRadians) }
+      const readAxis = { x: Math.cos(rotationRadians), y: Math.sin(rotationRadians) }
 
       for (const [itemIndex, rawItem] of content.items.entries()) {
         if (!('str' in rawItem) || !rawItem.str) continue
@@ -483,7 +538,6 @@ export function PdfPage({
           span.dataset.textWhitespace = 'true'
           span.style.pointerEvents = 'none'
         }
-        fragment.appendChild(span)
         let measured = 0
         if (measurementContext) {
           try {
@@ -498,10 +552,30 @@ export function PdfPage({
           width: (style.vertical ? item.height : item.width) * currentViewport.scale,
           angle,
           measured,
+          flow: tx[4] * flowAxis.x + tx[5] * flowAxis.y,
+          read: tx[4] * readAxis.x + tx[5] * readAxis.y,
+          fontHeight,
         })
       }
 
+      // Native ::selection paints the DOM interval between anchor and focus.
+      // Append spans in visual reading order — baselines clustered into lines
+      // along the page's flow axis, items sorted along the reading axis — so a
+      // drag never leaps across lines when the content stream is out of order.
+      // This also puts copied text into reading order.
+      const lines: Array<{ flow: number; fontHeight: number; items: typeof spans }> = []
+      for (const item of [...spans].sort((a, b) => a.flow - b.flow)) {
+        const line = lines.at(-1)
+        if (line && Math.abs(item.flow - line.flow) <= Math.max(1, Math.max(item.fontHeight, line.fontHeight) * 0.4)) line.items.push(item)
+        else lines.push({ flow: item.flow, fontHeight: item.fontHeight, items: [item] })
+      }
+      for (const line of lines) {
+        for (const entry of [...line.items].sort((a, b) => a.read - b.read)) fragment.appendChild(entry.span)
+      }
+
       layer.appendChild(fragment)
+      layer.dataset.viewportSignature = viewportSignature
+      layer.style.visibility = ''
       // Read every *untransformed* width before writing transforms. Measuring a
       // rotated bounding box uses the font height as its width; at 90 degrees
       // that previously produced scale factors above 20x and selection regions
@@ -654,12 +728,22 @@ export function PdfPage({
     const sy = clamp(Math.floor(box.top * scaleY), 0, source.height - 1)
     const sw = clamp(Math.ceil(box.width * scaleX), 1, source.width - sx)
     const sh = clamp(Math.ceil(box.height * scaleY), 1, source.height - sy)
+    // The on-screen canvas is rotated by the display rotation. Undo it here so
+    // the stored pixels are in unrotated PDF orientation and the saver's
+    // axis-aligned draw stays correct.
+    const rotation = ((viewport.rotation % 360) + 360) % 360
     const output = document.createElement('canvas')
-    output.width = sw
-    output.height = sh
+    output.width = rotation % 180 ? sh : sw
+    output.height = rotation % 180 ? sw : sh
     const context = output.getContext('2d')
     if (!context) return undefined
-    context.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh)
+    if (rotation) {
+      context.translate(output.width / 2, output.height / 2)
+      context.rotate(-rotation * Math.PI / 180)
+      context.drawImage(source, sx, sy, sw, sh, -sw / 2, -sh / 2, sw, sh)
+    } else {
+      context.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh)
+    }
     return output.toDataURL('image/png')
   }, [viewport])
 
@@ -845,6 +929,14 @@ export function PdfPage({
     // no range intentionally does nothing; a PDF.js text item may represent a
     // complete line and must never be mistaken for a focused selection.
     if (tool === 'highlight' || tool === 'underline' || tool === 'strikeout') return
+    if (tool === 'sign') {
+      if (!viewport || (event.target as HTMLElement).closest('button, input, textarea')) return
+      const point = localPoint(event.clientX, event.clientY)
+      if (!point) return
+      const [x, y] = viewport.convertToPdfPoint(point.x, point.y)
+      onPlaceSignature({ x, y }, displayRotation)
+      return
+    }
     if (tool !== 'addText' || !viewport || !surfaceRef.current) return
     if ((event.target as HTMLElement).closest('button, input, textarea')) return
     const point = localPoint(event.clientX, event.clientY)
@@ -868,6 +960,7 @@ export function PdfPage({
       text: '',
       fontSize: 12,
       fontFamily: 'Segoe UI',
+      displayRotation,
       align: 'left',
       color: [0.04, 0.04, 0.05],
       cover: false,
@@ -897,7 +990,7 @@ export function PdfPage({
         .map((rect) => viewportRectToPdf(viewport, rect))
       if (rects.length) {
         if (tool === 'highlight') onHighlight(rects)
-        else onTextMarkup(tool as 'underline' | 'strikeout', rects)
+        else onTextMarkup(tool as 'underline' | 'strikeout', rects, displayRotation)
         selection.removeAllRanges()
       }
     }, 0)
@@ -1015,6 +1108,7 @@ export function PdfPage({
         dataUrl: captureRect(rect),
         opacity: 1,
         cover: true,
+        displayRotation,
         label: 'Artwork region',
         modified: false,
       })
@@ -1252,9 +1346,30 @@ export function PdfPage({
               if (overlay.style === 'rectangle') {
                 return <div key={overlay.id} className="rectangle-overlay" style={{ ...box, borderColor: colorCss(overlay.color), borderWidth: overlay.thickness * zoom, opacity: overlay.opacity }} title="Saved rectangle" />
               }
+              // Keep the bar under (or through) the marked text as it was seen
+              // when created, even after the page is rotated on screen.
+              const relativeRotation = ((((overlay.displayRotation || 0) - displayRotation) % 360) + 360) % 360
+              const barThickness = Math.max(1, overlay.thickness * zoom)
+              const barStyle: CSSProperties = relativeRotation % 180
+                ? {
+                    background: colorCss(overlay.color),
+                    width: barThickness,
+                    height: '100%',
+                    top: 0,
+                    ...(overlay.style === 'strikeout'
+                      ? { left: '50%', transform: 'translateX(-50%)' }
+                      : relativeRotation === 90
+                        ? { left: 'auto', right: 1 }
+                        : { left: 1 }),
+                  }
+                : {
+                    background: colorCss(overlay.color),
+                    height: barThickness,
+                    ...(relativeRotation === 180 && overlay.style === 'underline' ? { top: 1, bottom: 'auto' } : {}),
+                  }
               return (
                 <div key={overlay.id} className={`text-markup-overlay markup-${overlay.style}`} style={{ ...box, opacity: overlay.opacity }} title={overlay.style === 'underline' ? 'Saved underline' : 'Saved strikeout'}>
-                  <span style={{ background: colorCss(overlay.color), height: Math.max(1, overlay.thickness * zoom) }} />
+                  <span style={barStyle} />
                 </div>
               )
             }
@@ -1282,6 +1397,7 @@ export function PdfPage({
                           dataUrl: overlay.dataUrl,
                           opacity: overlay.opacity,
                           cover: overlay.cover,
+                          displayRotation: overlay.displayRotation,
                           label: overlay.kind === 'image' ? 'Image' : 'Artwork region',
                           modified: false,
                         })
@@ -1339,6 +1455,7 @@ export function PdfPage({
                       fontData: overlay.fontData,
                       baselineOffset: overlay.baselineOffset,
                       sourceSpaceWidth: overlay.sourceSpaceWidth,
+                      displayRotation: overlay.displayRotation,
                       align: overlay.align || 'left',
                       color: overlay.color,
                       backgroundColor: overlay.backgroundColor,
@@ -1378,6 +1495,7 @@ export function PdfPage({
                   dataUrl: candidate.dataUrl || captureRect(candidate.rect),
                   opacity: 1,
                   cover: true,
+                  displayRotation,
                   label: candidate.label,
                   modified: false,
                 })
@@ -1538,4 +1656,4 @@ export function PdfPage({
       </div>
     </div>
   )
-}
+})

@@ -41,7 +41,7 @@ function supportedPaths(argv) {
   const seen = new Set()
   const paths = []
   for (const argument of Array.isArray(argv) ? argv : []) {
-    if (typeof argument !== 'string' || !modeForPath(argument)) continue
+    if (typeof argument !== 'string' || argument.startsWith('-') || !modeForPath(argument)) continue
     const key = process.platform === 'win32' ? argument.toLowerCase() : argument
     if (seen.has(key)) continue
     seen.add(key)

@@ -115,6 +115,11 @@ button { color: inherit; }
 .modal-actions button:hover { background: #f1f1f1; }
 .modal-actions .modal-primary { border-color: #111; background: #111; color: #fff; }
 .modal-actions .modal-primary:hover { background: #2a2a2a; }
+.envelope-fields { display: grid; gap: 12px; margin-top: 18px; }
+.envelope-fields label { display: grid; gap: 5px; font-size: 11px; font-weight: 600; color: #444; }
+.envelope-fields select, .envelope-fields textarea { padding: 7px 9px; border: 1px solid #cfcfcf; border-radius: 7px; background: #fff; font: inherit; font-size: 12px; color: #111; }
+.envelope-fields textarea { min-height: 54px; resize: vertical; line-height: 1.45; }
+.envelope-fields select:focus-visible, .envelope-fields textarea:focus-visible { outline: 2px solid #111; outline-offset: -1px; }
 
 /* WordCanvas owns the editing chrome. These restrained overrides keep the
    embedded ribbon inside the same black-and-white visual language. */

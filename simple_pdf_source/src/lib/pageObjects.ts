@@ -129,11 +129,25 @@ function placedImageDataUrl(image: PdfImageData, matrix: Matrix, rect: PdfRect):
   return canvas.toDataURL('image/png')
 }
 
+const pageObjectsCache = new WeakMap<PDFPageProxy, Promise<DetectedPageObject[]>>()
+
 /**
  * Finds raster-image paint operations exposed by PDF.js. These bounds are a
  * rendering aid, not a mutation API; the original PDF object remains untouched.
+ * Detection walks the full operator list and decodes every image, so the result
+ * is shared across mounts and tool switches for the lifetime of the page proxy.
  */
-export async function detectPageObjects(page: PDFPageProxy, pageIndex: number): Promise<DetectedPageObject[]> {
+export function detectPageObjects(page: PDFPageProxy, pageIndex: number): Promise<DetectedPageObject[]> {
+  let request = pageObjectsCache.get(page)
+  if (!request) {
+    request = extractPageObjects(page, pageIndex)
+    pageObjectsCache.set(page, request)
+    request.catch(() => pageObjectsCache.delete(page))
+  }
+  return request
+}
+
+async function extractPageObjects(page: PDFPageProxy, pageIndex: number): Promise<DetectedPageObject[]> {
   const list = await page.getOperatorList()
   const candidates: PendingPageObject[] = []
   const stack: Matrix[] = []

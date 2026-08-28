@@ -22,3 +22,9 @@ export function pageReorderDestination(draggedPage: number, insertIndex: number)
 export function isPdfTransferFile(file: Pick<File, 'name' | 'type'>) {
   return file.type.toLowerCase() === 'application/pdf' || /\.pdf$/i.test(file.name)
 }
+
+const IMPORTABLE_TRANSFER_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg'])
+
+export function isImportableTransferFile(file: Pick<File, 'name' | 'type'>) {
+  return IMPORTABLE_TRANSFER_TYPES.has(file.type.toLowerCase()) || /\.(pdf|png|jpe?g|txt|md|docx?)$/i.test(file.name)
+}

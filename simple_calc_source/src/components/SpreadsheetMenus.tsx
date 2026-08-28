@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { ChevronRight, Search } from 'lucide-react'
 
@@ -53,6 +53,75 @@ function MenuItems({ items, close }: { items: SpreadsheetMenuItem[]; close: () =
       ) : null}
     </div>
   ))
+}
+
+interface SpreadsheetContextMenuProps {
+  x: number
+  y: number
+  label: string
+  items: SpreadsheetMenuItem[]
+  onClose: () => void
+}
+
+export function SpreadsheetContextMenu({ x, y, label, items, onClose }: SpreadsheetContextMenuProps) {
+  const rootRef = useRef<HTMLDivElement>(null)
+  const [position, setPosition] = useState({ left: x, top: y })
+
+  useLayoutEffect(() => {
+    const rect = rootRef.current?.getBoundingClientRect()
+    if (!rect) return
+    setPosition({
+      left: Math.max(4, Math.min(x, window.innerWidth - rect.width - 4)),
+      top: Math.max(4, Math.min(y, window.innerHeight - rect.height - 4)),
+    })
+  }, [items, x, y])
+
+  useEffect(() => {
+    const closeOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) onClose()
+    }
+    const closeWithEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      onClose()
+    }
+    window.addEventListener('pointerdown', closeOutside)
+    window.addEventListener('keydown', closeWithEscape)
+    window.addEventListener('blur', onClose)
+    return () => {
+      window.removeEventListener('pointerdown', closeOutside)
+      window.removeEventListener('keydown', closeWithEscape)
+      window.removeEventListener('blur', onClose)
+    }
+  }, [onClose])
+
+  useEffect(() => {
+    rootRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
+  }, [])
+
+  const moveFocus = (delta: number) => {
+    const buttons = [...(rootRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || [])]
+    if (!buttons.length) return
+    const index = buttons.indexOf(document.activeElement as HTMLButtonElement)
+    buttons[(index + delta + buttons.length) % buttons.length].focus()
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      className="sheet-context-menu"
+      role="menu"
+      aria-label={label}
+      style={{ left: position.left, top: position.top }}
+      onContextMenu={(event) => event.preventDefault()}
+      onKeyDown={(event) => {
+        if (event.key === 'ArrowDown') { event.preventDefault(); moveFocus(1) }
+        else if (event.key === 'ArrowUp') { event.preventDefault(); moveFocus(-1) }
+      }}
+    >
+      <MenuItems items={items} close={onClose} />
+    </div>
+  )
 }
 
 function flattenItems(menus: SpreadsheetMenuDefinition[]) {

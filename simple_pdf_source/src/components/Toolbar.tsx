@@ -15,6 +15,9 @@ import {
   Printer,
   Redo2,
   Save,
+  Signature,
+  Square,
+  Strikethrough,
   TextCursorInput,
   Type,
   Underline,
@@ -82,8 +85,11 @@ export function Toolbar(props: ToolbarProps) {
         <IconButton icon={Type} label="Add text (T)" active={tool === 'addText'} onClick={() => onTool('addText')} />
         <IconButton icon={Highlighter} label="Highlight text" active={tool === 'highlight'} onClick={() => onTool('highlight')} />
         <IconButton icon={Underline} label="Underline text" active={tool === 'underline'} onClick={() => onTool('underline')} />
+        <IconButton icon={Strikethrough} label="Strikeout text" active={tool === 'strikeout'} onClick={() => onTool('strikeout')} />
         <IconButton icon={Pencil} label="Draw freehand" active={tool === 'draw'} onClick={() => onTool('draw')} />
+        <IconButton icon={Square} label="Draw rectangle" active={tool === 'rectangle'} onClick={() => onTool('rectangle')} />
         <IconButton icon={Crop} label="Crop page (C)" active={tool === 'crop'} onClick={() => onTool('crop')} />
+        <IconButton icon={Signature} label="Sign document" active={tool === 'sign'} onClick={() => onTool('sign')} />
       </div>
 
       <div className="toolbar-group page-controls">

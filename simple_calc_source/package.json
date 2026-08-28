@@ -29,6 +29,7 @@
   },
   "dependencies": {
     "exceljs": "^4.4.0",
+    "immer": "^11.1.18",
     "jszip": "^3.10.1",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },

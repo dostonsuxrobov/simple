@@ -123,19 +123,19 @@ async function selectCell(address) {
   await pause(60)
 }
 
-async function usePromptResponses(responses) {
-  await evaluate(`(() => {
-    window.__simpleCalcQAPrompt = window.prompt;
-    const responses = ${JSON.stringify(responses)};
-    window.prompt = () => responses.shift() ?? null;
+async function completeTextPrompt(label, value) {
+  await waitFor(`document.querySelector('.prompt-card label span')?.textContent === ${JSON.stringify(label)}`, `${label} prompt`)
+  const completed = await evaluate(`(() => {
+    const form = document.querySelector('.prompt-card');
+    const field = form?.querySelector('input, textarea');
+    if (!form || !field) return false;
+    const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(field, ${JSON.stringify(value)});
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    form.requestSubmit();
+    return true;
   })()`)
-}
-
-async function restorePrompt() {
-  await evaluate(`(() => {
-    if (window.__simpleCalcQAPrompt) window.prompt = window.__simpleCalcQAPrompt;
-    delete window.__simpleCalcQAPrompt;
-  })()`)
+  assert.equal(completed, true, `Could not complete the ${label} prompt`)
 }
 
 async function editCell(address, value) {
@@ -516,10 +516,10 @@ await waitFor("document.querySelector('.sheet-viewport')", 'new workbook grid')
 const gridMetrics = await evaluate(`(() => ({
   cells: document.querySelectorAll('.grid-cell').length,
   tabs: document.querySelectorAll('.sheet-tab').length,
-  formulaBar: Boolean(document.querySelector('.formula-bar input')),
+  formulaBar: Boolean(document.querySelector('.formula-bar input[aria-label="Formula bar"]')),
   menuTriggers: [...document.querySelectorAll('[data-menu-trigger]')].map((item) => item.textContent.trim()),
   toolbarControls: document.querySelectorAll('.command-bar button, .command-bar select').length,
-  active: document.querySelector('.name-box')?.textContent,
+  active: document.querySelector('.name-box')?.value,
 }))()`)
 assert(gridMetrics.cells > 20 && gridMetrics.cells < 1500, `Unexpected virtualized cell count: ${gridMetrics.cells}`)
 assert.equal(gridMetrics.tabs, 1)
@@ -537,12 +537,12 @@ const formulaState = await evaluate(`(() => {
   return { display: cell.textContent.trim() };
 })()`)
 await pause(60)
-const formulaBarValue = await evaluate("document.querySelector('.formula-bar input').value")
+const formulaBarValue = await evaluate("document.querySelector('.formula-bar input[aria-label=\"Formula bar\"]').value")
 if (formulaState.display !== '8') {
   const debugState = await evaluate(`(() => ({
     cells: [...document.querySelectorAll('.grid-cell')].filter((item) => /-(A1|B1|A2)$/.test(item.id)).map((item) => ({ id: item.id, text: item.textContent, title: item.title })),
-    formulaBar: document.querySelector('.formula-bar input')?.value,
-    active: document.querySelector('.name-box')?.textContent,
+    formulaBar: document.querySelector('.formula-bar input[aria-label="Formula bar"]')?.value,
+    active: document.querySelector('.name-box')?.value,
   }))()`)
   console.error('Formula debug state:', debugState)
 }
@@ -573,7 +573,7 @@ try {
   await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-C5'))?.textContent.trim() === '5'", 'numeric series autofill')
 } catch (error) {
   const fillDebug = await evaluate(`(() => ({
-    active: document.querySelector('.name-box')?.textContent,
+    active: document.querySelector('.name-box')?.value,
     selection: getComputedStyle(document.querySelector('.selection-outline')).cssText,
     values: ['C1', 'C2', 'C3', 'C4', 'C5'].map((address) => {
       const item = [...document.querySelectorAll('.grid-cell')].find((cell) => cell.id.endsWith('-' + address));
@@ -583,6 +583,7 @@ try {
   console.error('Autofill debug state:', JSON.stringify(fillDebug))
   throw error
 }
+await waitFor("document.querySelector('.aggregate-picker output')?.textContent.trim() === '15'", 'autofill aggregate')
 const autofillState = await evaluate(`(() => ({
   values: ['C1', 'C2', 'C3', 'C4', 'C5'].map((address) => [...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-' + address))?.textContent.trim()),
   aggregate: document.querySelector('.aggregate-picker output')?.textContent.trim(),
@@ -622,7 +623,7 @@ await waitFor("document.querySelector('.aggregate-picker output')?.textContent.t
 await evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true }))")
 await waitFor("document.querySelector('.search-panel input') === document.activeElement", 'focused find panel')
 await call('Input.insertText', { text: '8' })
-await waitFor("document.querySelector('.name-box')?.textContent === 'A2'", 'formula search result')
+await waitFor("document.querySelector('.name-box')?.value === 'A2'", 'formula search result')
 const searchState = await evaluate(`(() => ({
   query: document.querySelector('.search-panel input')?.value,
   count: document.querySelector('.search-count')?.textContent.trim(),
@@ -749,10 +750,9 @@ await evaluate("[...document.querySelectorAll('.grid-cell')].find((item) => item
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-F2'))?.querySelector('.cell-checkbox')?.checked === true", 'checked checkbox')
 
 await selectCell('G2')
-await usePromptResponses(['Low, Medium, High'])
 await click('[data-menu-trigger="insert"]')
 await click('[data-menu-action="insert-dropdown"]')
-await restorePrompt()
+await completeTextPrompt('Dropdown options, separated by commas', 'Low, Medium, High')
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-G2'))?.querySelector('.cell-dropdown')", 'inserted dropdown')
 await evaluate(`(() => {
   const dropdown = [...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-G2')).querySelector('.cell-dropdown');
@@ -762,17 +762,16 @@ await evaluate(`(() => {
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-G2'))?.querySelector('.cell-dropdown')?.value === 'High'", 'selected dropdown value')
 
 await selectCell('H2')
-await usePromptResponses(['Persistent note'])
 await click('[data-menu-trigger="insert"]')
 await click('[data-menu-action="insert-note"]')
-await restorePrompt()
+await completeTextPrompt('Note for the selected cell', 'Persistent note')
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-H2'))?.classList.contains('has-note')", 'inserted note')
 
 await selectCell('I2')
-await usePromptResponses(['https://example.com', 'Example'])
 await click('[data-menu-trigger="insert"]')
 await click('[data-menu-action="insert-link"]')
-await restorePrompt()
+await completeTextPrompt('Link URL or email address', 'https://example.com')
+await completeTextPrompt('Text to display', 'Example')
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-I2'))?.querySelector('.cell-hyperlink')?.textContent === 'Example'", 'inserted hyperlink')
 
 await editCell('A8', 'Merged title')
@@ -876,8 +875,8 @@ assert(savedSummary.getCell('H2').note, 'Cell note did not survive save')
 assert.equal(savedSummary.getCell('I2').hyperlink, 'https://example.com')
 assert.equal(savedSummary.getCell('A8').value, 'Merged title')
 assert.equal(savedSummary.getCell('B8').isMerged, true)
-assert(Math.abs(savedSummary.getColumn(2).width - ((fittedDimensions.columnB - 5) / 7)) < 0.2)
-assert(Math.abs(savedSummary.getColumn(5).width - ((fittedDimensions.columnE - 5) / 7)) < 0.2)
+assert(Math.abs(savedSummary.getColumn(2).width - (fittedDimensions.columnB / 8)) < 0.2)
+assert(Math.abs(savedSummary.getColumn(5).width - (fittedDimensions.columnE / 8)) < 0.2)
 assert(Math.abs(savedSummary.getRow(4).height - fittedDimensions.row4 * 0.75) < 0.2)
 assert(Math.abs(savedSummary.getRow(6).height - fittedDimensions.row6 * 0.75) < 0.2)
 

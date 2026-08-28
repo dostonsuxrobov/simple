@@ -4,6 +4,8 @@ import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { AlertTriangle, FileWarning, FolderOpen, RotateCcw } from 'lucide-react'
 import { EditInspector } from './components/EditInspector'
 import { ContinuousPdfViewer } from './components/ContinuousPdfViewer'
+import { PrintDialog, type PrintDialogSubmission } from './components/PrintDialog'
+import { SignaturePanel, type SignatureImage } from './components/SignaturePanel'
 import { Sidebar } from './components/Sidebar'
 import { StatusBar } from './components/StatusBar'
 import { TitleBar } from './components/TitleBar'
@@ -21,6 +23,7 @@ import { clamp, errorMessage, isTypingTarget, withoutExtension } from './lib/uti
 import type {
   ActiveSearchMatch,
   Bookmark,
+  DisplayRotation,
   DocumentPayload,
   OpenDocument,
   PageObjectEdit,
@@ -49,6 +52,21 @@ function fittedZoom(viewer: HTMLElement, viewport: { width: number; height: numb
   const availableWidth = Math.max(120, viewer.clientWidth - 104)
   const availableHeight = Math.max(120, viewer.clientHeight - 52)
   return clamp(Math.min(availableWidth / viewport.width, availableHeight / viewport.height), 0.35, 4)
+}
+
+function boundHistoryStack(next: Snapshot[]) {
+  const uniqueDocuments = new Set<Uint8Array>()
+  let total = 0
+  for (const item of next) {
+    if (uniqueDocuments.has(item.bytes)) continue
+    uniqueDocuments.add(item.bytes)
+    total += item.bytes.byteLength
+  }
+  while (next.length > 1 && total > MAX_HISTORY_BYTES) {
+    const removed = next.shift()
+    if (removed && !next.some((item) => item.bytes === removed.bytes)) total -= removed.bytes.byteLength
+  }
+  return next.slice(-20)
 }
 
 function viewerHasActiveTextSelection(viewer: HTMLElement) {
@@ -145,6 +163,7 @@ function upsertTextEdit(current: PdfOverlay[], edit: PageTextEdit): PdfOverlay[]
     fontData: edit.fontData,
     baselineOffset: committedBaselineOffset,
     sourceSpaceWidth: edit.sourceSpaceWidth,
+    displayRotation: edit.displayRotation,
     align: edit.align,
     color: edit.color,
     backgroundColor: edit.backgroundColor,
@@ -166,6 +185,7 @@ function upsertObjectEdit(current: PdfOverlay[], edit: PageObjectEdit): PdfOverl
     dataUrl: edit.dataUrl,
     opacity: edit.opacity,
     cover: edit.cover,
+    displayRotation: edit.displayRotation,
   }
   if (edit.overlayId) return current.map((item) => item.id === edit.overlayId ? overlay : item)
   return [...current, overlay]
@@ -225,11 +245,13 @@ export default function App() {
   const [textEdit, setTextEdit] = useState<PageTextEdit | null>(null)
   const [objectEdit, setObjectEdit] = useState<PageObjectEdit | null>(null)
   const [selectingObjectRegion, setSelectingObjectRegion] = useState(false)
+  const [pendingSignature, setPendingSignature] = useState<SignatureImage | null>(null)
   const [undoStack, setUndoStack] = useState<Snapshot[]>([])
   const [redoStack, setRedoStack] = useState<Snapshot[]>([])
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>(readRecentFiles)
   const [isDragging, setIsDragging] = useState(false)
   const [isPanning, setIsPanning] = useState(false)
+  const [printDialogOpen, setPrintDialogOpen] = useState(false)
   const [immersive, setImmersive] = useState(false)
   const dragDepth = useRef(0)
   const viewerRef = useRef<HTMLElement>(null)
@@ -240,6 +262,7 @@ export default function App() {
   const lastSelectedPage = useRef(0)
   const undoStackRef = useRef<Snapshot[]>([])
   const redoStackRef = useRef<Snapshot[]>([])
+  const dragExportBytesRef = useRef<Uint8Array | null>(null)
   const liveStateRef = useRef({ bytes, overlays, formValues, bookmarks, bookmarksDirty, pageRotations, pageIndex, dirty })
 
   useEffect(() => {
@@ -247,6 +270,10 @@ export default function App() {
     undoStackRef.current = undoStack
     redoStackRef.current = redoStack
   }, [bytes, overlays, formValues, bookmarks, bookmarksDirty, pageRotations, pageIndex, dirty, undoStack, redoStack])
+
+  useEffect(() => {
+    dragExportBytesRef.current = null
+  }, [bytes, overlays, formValues, bookmarks, bookmarksDirty, pageRotations, textEdit, objectEdit])
 
   const showToast = useCallback((message: string, action?: string, onAction?: () => void) => {
     setToast({ message, action, onAction })
@@ -386,19 +413,7 @@ export default function App() {
 
   function addUndoSnapshot(snapshot: Snapshot) {
     setUndoStack((current) => {
-      const next = [...current, snapshot]
-      const uniqueDocuments = new Set<Uint8Array>()
-      let total = 0
-      for (const item of next) {
-        if (uniqueDocuments.has(item.bytes)) continue
-        uniqueDocuments.add(item.bytes)
-        total += item.bytes.byteLength
-      }
-      while (next.length > 1 && total > MAX_HISTORY_BYTES) {
-        const removed = next.shift()
-        if (removed && !next.some((item) => item.bytes === removed.bytes)) total -= removed.bytes.byteLength
-      }
-      const bounded = next.slice(-20)
+      const bounded = boundHistoryStack([...current, snapshot])
       undoStackRef.current = bounded
       return bounded
     })
@@ -426,7 +441,7 @@ export default function App() {
     const current = currentSnapshot()
     if (!previous || !current) return
     const nextUndo = undoStackRef.current.slice(0, -1)
-    const nextRedo = [...redoStackRef.current, current].slice(-20)
+    const nextRedo = boundHistoryStack([...redoStackRef.current, current])
     undoStackRef.current = nextUndo
     redoStackRef.current = nextRedo
     setUndoStack(nextUndo)
@@ -477,6 +492,7 @@ export default function App() {
     setTextEdit(null)
     setObjectEdit(null)
     setSelectingObjectRegion(false)
+    setPendingSignature(null)
     setTool('select')
     rememberFile(file)
     if (file.converted) showToast('Converted to PDF — save to choose where to keep it')
@@ -523,19 +539,24 @@ export default function App() {
     }
   }
 
-  useEffect(() => window.simple.onOpenExternal((filePath) => { openPath(filePath) }), [documentFile, dirty, textEdit, objectEdit])
+  const openPathRef = useRef(openPath)
+  openPathRef.current = openPath
+
+  useEffect(() => window.simple.onOpenExternal((filePath) => { openPathRef.current(filePath) }), [])
 
   async function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault()
     dragDepth.current = 0
     setIsDragging(false)
     if (!canReplaceCurrent()) return
-    const file = event.dataTransfer.files[0]
+    const files = Array.from(event.dataTransfer.files)
+    const file = files[0]
     if (!file) return
     setBusy('Opening document…')
     try {
       const payload = await window.simple.openBytes(file.name, await file.arrayBuffer())
       await openPayload(payload)
+      if (files.length > 1) showToast(`Opened ${file.name} — ${files.length - 1} more ${files.length === 2 ? 'file' : 'files'} ignored`)
     } catch (error) {
       showToast(errorMessage(error))
     } finally {
@@ -629,6 +650,9 @@ export default function App() {
 
   function rotatePages(degrees = 90) {
     const indices = targetPages()
+    // A live native selection freezes text-layer rebuilds and page pruning;
+    // rotated canvases must never sit beneath the old orientation's spans.
+    window.getSelection()?.removeAllRanges()
     const snapshot = currentSnapshot()
     if (snapshot) addUndoSnapshot(snapshot)
     setPageRotations((current) => {
@@ -829,6 +853,14 @@ export default function App() {
     }
   }
 
+  function importDroppedPages(files: File[], insertIndex: number) {
+    if (!files.length) {
+      showToast('Dropped files must be PDF, image, Word, or text documents.')
+      return
+    }
+    void importPagesAt(files, insertIndex)
+  }
+
   async function startPageDrag(index: number, event: DragEvent<HTMLElement>) {
     if (!bytes || !documentFile) return
     event.preventDefault()
@@ -839,7 +871,8 @@ export default function App() {
         setSelectedPages(new Set([index]))
         lastSelectedPage.current = index
       }
-      const output = await preparedBytes()
+      const output = dragExportBytesRef.current ?? await preparedBytes()
+      dragExportBytesRef.current = output
       const suggested = `${withoutExtension(documentFile.name)} - ${indices.length === 1 ? `page ${indices[0] + 1}` : `${indices.length} pages`}.pdf`
       await window.simple.startPageDrag(output, indices, suggested)
     } catch (error) {
@@ -877,6 +910,40 @@ export default function App() {
     }
   }
 
+  async function runPrintJob(job: PrintDialogSubmission) {
+    if (!bytes || !documentFile || !pdf) return
+    setPrintDialogOpen(false)
+    setBusy('Printing…')
+    try {
+      const output = await preparedBytes()
+      let landscape: boolean
+      if (job.orientation === 'auto') {
+        const probeIndex = job.pageIndices?.[0] ?? 0
+        const probePage = await pdf.getPage(probeIndex + 1)
+        const rotation = (((probePage.rotate || 0) + (pageRotations[probeIndex] || 0)) % 360 + 360) % 360
+        const viewport = probePage.getViewport({ scale: 1, rotation })
+        landscape = viewport.width > viewport.height
+      } else {
+        landscape = job.orientation === 'landscape'
+      }
+      const result = await window.simple.printPdfDirect(output, documentFile.name, {
+        deviceName: job.deviceName,
+        copies: job.copies,
+        ...(job.pageIndices ? { pageIndices: job.pageIndices } : {}),
+        landscape,
+        color: job.color,
+        ...(job.duplexMode ? { duplexMode: job.duplexMode } : {}),
+        collate: job.collate,
+      })
+      if (result.success) showToast(`Sent to ${job.printerLabel}`)
+      else showToast(result.failureReason ? `Print failed — ${result.failureReason}` : 'Print failed', 'Open preview', () => { void printDocument() })
+    } catch (error) {
+      showToast(errorMessage(error), 'Open preview', () => { void printDocument() })
+    } finally {
+      setBusy('')
+    }
+  }
+
   async function cropPage(rect: PdfRect, targetPageIndex = pageIndex) {
     if (await mutate({ type: 'crop', pageIndex: targetPageIndex, rect }, 'Cropping page…')) {
       setTool('select')
@@ -900,7 +967,7 @@ export default function App() {
     showToast(`${additions.length === 1 ? 'Highlight' : 'Highlights'} added`)
   }
 
-  function addTextMarkup(style: 'underline' | 'strikeout', rects: PdfRect[], targetPageIndex = pageIndex) {
+  function addTextMarkup(style: 'underline' | 'strikeout', rects: PdfRect[], targetPageIndex = pageIndex, displayRotation: DisplayRotation = 0) {
     const snapshot = currentSnapshot()
     if (snapshot) addUndoSnapshot(snapshot)
     const additions: PdfOverlay[] = rects.map((rect) => ({
@@ -912,6 +979,7 @@ export default function App() {
       color: [0.86, 0.15, 0.15],
       opacity: 0.95,
       thickness: 1.35,
+      displayRotation,
     }))
     setOverlays((current) => [...current, ...additions])
     setDirty(true)
@@ -1063,6 +1131,47 @@ export default function App() {
         opacity: 1,
         cover: false,
         label: picked.name,
+        modified: true,
+      })
+    } catch (error) {
+      showToast(errorMessage(error))
+    }
+  }
+
+  async function placeSignature(targetPageIndex: number, point: { x: number; y: number }, displayRotation: DisplayRotation) {
+    const signature = pendingSignature
+    if (!pdf || !signature) return
+    setPendingSignature(null)
+    try {
+      const page = await pdf.getPage(targetPageIndex + 1)
+      const view = page.view
+      const pageBounds: PdfRect = {
+        x: Math.min(view[0], view[2]),
+        y: Math.min(view[1], view[3]),
+        width: Math.abs(view[2] - view[0]),
+        height: Math.abs(view[3] - view[1]),
+      }
+      // The rect lives in unrotated PDF space; size against the page edge the
+      // user sees as its width so the signature reads correctly as displayed.
+      const sideways = displayRotation === 90 || displayRotation === 270
+      const displayedPageWidth = sideways ? pageBounds.height : pageBounds.width
+      const scale = Math.min(1, displayedPageWidth * 0.4 / signature.width)
+      const width = sideways ? signature.height * scale : signature.width * scale
+      const height = sideways ? signature.width * scale : signature.height * scale
+      beginObjectEdit({
+        pageIndex: targetPageIndex,
+        kind: 'image',
+        rect: {
+          x: clamp(point.x - width / 2, pageBounds.x, pageBounds.x + Math.max(0, pageBounds.width - width)),
+          y: clamp(point.y - height / 2, pageBounds.y, pageBounds.y + Math.max(0, pageBounds.height - height)),
+          width,
+          height,
+        },
+        dataUrl: signature.dataUrl,
+        opacity: 1,
+        cover: false,
+        displayRotation,
+        label: 'Signature',
         modified: true,
       })
     } catch (error) {
@@ -1339,86 +1448,108 @@ export default function App() {
       if (objectEdit) commitObjectEditValue(objectEdit, false)
       setSelectingObjectRegion(false)
     }
+    // Reactivating the sign tool reopens the panel to pick another signature.
+    setPendingSignature(null)
     setTool(nextTool)
   }
 
-  useEffect(() => {
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.defaultPrevented) return
-      const typing = isTypingTarget(event.target)
-      const control = event.ctrlKey || event.metaKey
-      const key = event.key.toLocaleLowerCase()
-      const directTextEditor = event.target instanceof HTMLTextAreaElement
-        && event.target.getAttribute('aria-label') === 'Edit text directly on the PDF'
-      const nativeTextRange = directTextEditor && event.target.selectionStart !== event.target.selectionEnd
-      if (control && (key === 'c' || key === 'x') && (textEdit || objectEdit) && !nativeTextRange) {
-        event.preventDefault()
-        copyCurrentEdit(key === 'x')
-        return
-      }
-      if (control && key === 'v' && !typing && editClipboardRef.current && (tool === 'edit' || tool === 'addText')) {
-        event.preventDefault()
-        void pasteCurrentEditClipboard()
-        return
-      }
-      if (control && event.key.toLocaleLowerCase() === 'f' && pdf) {
-        event.preventDefault()
-        if (immersive) {
-          if (document.fullscreenElement) void document.exitFullscreen()
-          setImmersive(false)
-        }
-        setSidebarOpen(true)
-        setSearchRequestId((request) => request + 1)
-        return
-      }
-      if (control && event.key.toLocaleLowerCase() === 'o') { event.preventDefault(); openFile(); return }
-      if (control && event.key.toLocaleLowerCase() === 's') { event.preventDefault(); save(event.shiftKey); return }
-      if (control && event.key.toLocaleLowerCase() === 'p') { event.preventDefault(); printDocument(); return }
-      if (control && event.key.toLocaleLowerCase() === 'z') { event.preventDefault(); undo(); return }
-      if (control && event.key.toLocaleLowerCase() === 'y') { event.preventDefault(); redo(); return }
-      if (event.key === 'F4') {
-        event.preventDefault()
-        if (sidebarOpen) setActiveSearchMatch(null)
-        setSidebarOpen((open) => !open)
-        return
-      }
-      if (event.key === 'Escape') {
-        if (immersive) {
-          event.preventDefault()
-          if (document.fullscreenElement) void document.exitFullscreen()
-          setImmersive(false)
-          return
-        }
-        if (textEdit || objectEdit || selectingObjectRegion) cancelEditSelection()
-        else setTool('select')
-        return
-      }
-      if (!pdf || typing) return
-      if (event.key === 'PageUp') { event.preventDefault(); goToPage(pageIndex - 1) }
-      else if (event.key === 'PageDown') { event.preventDefault(); goToPage(pageIndex + 1) }
-      else if (control && event.key === 'Home') { event.preventDefault(); goToPage(0) }
-      else if (control && event.key === 'End') { event.preventDefault(); goToPage(pdf.numPages - 1) }
-      else if (control && (event.key === '+' || event.key === '=')) { event.preventDefault(); setZoomMode('custom'); setZoom((value) => clamp(value + 0.15, 0.35, 4)) }
-      else if (control && event.key === '-') { event.preventDefault(); setZoomMode('custom'); setZoom((value) => clamp(value - 0.15, 0.35, 4)) }
-      else if (control && event.key === '0') { event.preventDefault(); setZoomMode('fit'); void fitView() }
-      else if (event.key.toLocaleLowerCase() === 'h') changeTool('hand')
-      else if (event.key.toLocaleLowerCase() === 'v') changeTool('select')
-      else if (event.key.toLocaleLowerCase() === 'e') changeTool('edit')
-      else if (event.key.toLocaleLowerCase() === 't') changeTool('addText')
-      else if (event.key.toLocaleLowerCase() === 'c') changeTool('crop')
-      else if (event.key === 'Delete' && (textEdit || objectEdit)) deleteEditSelection()
-      else if (event.key === 'Delete' && (document.activeElement as HTMLElement | null)?.closest('.sidebar')) deletePages()
+  function handleKeyDown(event: KeyboardEvent) {
+    if (event.defaultPrevented) return
+    if (printDialogOpen) {
+      // The dialog owns Escape and Enter itself; ignore every other shortcut
+      // so typing a range or tabbing between fields cannot switch tools.
+      if (event.key === 'Escape') { event.preventDefault(); setPrintDialogOpen(false) }
+      return
     }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  })
+    const typing = isTypingTarget(event.target)
+    const control = event.ctrlKey || event.metaKey
+    const unmodified = !control && !event.altKey
+    const key = event.key.toLocaleLowerCase()
+    const directTextEditor = event.target instanceof HTMLTextAreaElement
+      && event.target.getAttribute('aria-label') === 'Edit text directly on the PDF'
+    const nativeTextRange = directTextEditor && event.target.selectionStart !== event.target.selectionEnd
+    if (control && (key === 'c' || key === 'x') && (textEdit || objectEdit) && !nativeTextRange) {
+      event.preventDefault()
+      copyCurrentEdit(key === 'x')
+      return
+    }
+    if (control && key === 'v' && !typing && editClipboardRef.current && (tool === 'edit' || tool === 'addText')) {
+      event.preventDefault()
+      void pasteCurrentEditClipboard()
+      return
+    }
+    if (control && event.key.toLocaleLowerCase() === 'f' && pdf) {
+      event.preventDefault()
+      if (immersive) {
+        if (document.fullscreenElement) void document.exitFullscreen()
+        setImmersive(false)
+      }
+      setSidebarOpen(true)
+      setSearchRequestId((request) => request + 1)
+      return
+    }
+    if (control && event.key.toLocaleLowerCase() === 'o') { event.preventDefault(); openFile(); return }
+    if (control && event.key.toLocaleLowerCase() === 's') { event.preventDefault(); save(event.shiftKey); return }
+    if (control && event.key.toLocaleLowerCase() === 'p') { event.preventDefault(); if (pdf && bytes && documentFile) setPrintDialogOpen(true); return }
+    if (control && event.key.toLocaleLowerCase() === 'z') { event.preventDefault(); undo(); return }
+    if (control && event.key.toLocaleLowerCase() === 'y') { event.preventDefault(); redo(); return }
+    if (event.key === 'F4') {
+      event.preventDefault()
+      if (sidebarOpen) setActiveSearchMatch(null)
+      setSidebarOpen((open) => !open)
+      return
+    }
+    if (event.key === 'Escape') {
+      if (immersive) {
+        event.preventDefault()
+        if (document.fullscreenElement) void document.exitFullscreen()
+        setImmersive(false)
+        return
+      }
+      if (tool === 'sign') {
+        setPendingSignature(null)
+        setTool('select')
+        return
+      }
+      if (textEdit || objectEdit || selectingObjectRegion) cancelEditSelection()
+      else window.getSelection()?.removeAllRanges()
+      return
+    }
+    if (!pdf || typing) return
+    if (event.key === 'PageUp') { event.preventDefault(); goToPage(pageIndex - 1) }
+    else if (event.key === 'PageDown') { event.preventDefault(); goToPage(pageIndex + 1) }
+    else if (control && event.key === 'Home') { event.preventDefault(); goToPage(0) }
+    else if (control && event.key === 'End') { event.preventDefault(); goToPage(pdf.numPages - 1) }
+    else if (control && (event.key === '+' || event.key === '=')) { event.preventDefault(); setZoomMode('custom'); setZoom((value) => clamp(value + 0.15, 0.35, 4)) }
+    else if (control && event.key === '-') { event.preventDefault(); setZoomMode('custom'); setZoom((value) => clamp(value - 0.15, 0.35, 4)) }
+    else if (control && event.key === '0') { event.preventDefault(); setZoomMode('fit'); void fitView() }
+    else if (unmodified && event.key.toLocaleLowerCase() === 'h') changeTool('hand')
+    else if (unmodified && event.key.toLocaleLowerCase() === 'v') changeTool('select')
+    else if (unmodified && event.key.toLocaleLowerCase() === 'e') changeTool('edit')
+    else if (unmodified && event.key.toLocaleLowerCase() === 't') changeTool('addText')
+    else if (unmodified && event.key.toLocaleLowerCase() === 'c') changeTool('crop')
+    else if (event.key === 'Delete' && (textEdit || objectEdit)) deleteEditSelection()
+    else if (event.key === 'Delete' && (document.activeElement as HTMLElement | null)?.closest('.sidebar')) deletePages()
+  }
+
+  const handleKeyDownRef = useRef(handleKeyDown)
+  handleKeyDownRef.current = handleKeyDown
+
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => handleKeyDownRef.current(event)
+    window.addEventListener('keydown', listener)
+    return () => window.removeEventListener('keydown', listener)
+  }, [])
 
   function closeWindow() {
     if ((dirty || textEdit?.modified || objectEdit?.modified) && !window.confirm('Close simple and discard unsaved changes?')) return
     window.simple.close()
   }
 
-  useEffect(() => window.simple.onCloseRequested(closeWindow), [dirty, textEdit, objectEdit])
+  const closeWindowRef = useRef(closeWindow)
+  closeWindowRef.current = closeWindow
+
+  useEffect(() => window.simple.onCloseRequested(() => closeWindowRef.current()), [])
 
   function removeRecent(filePath: string) {
     setRecentFiles((current) => {
@@ -1473,7 +1604,7 @@ export default function App() {
         onTool={changeTool}
         onPage={goToPage}
         onZoom={changeZoom}
-        onPrint={printDocument}
+        onPrint={() => { if (pdf) setPrintDialogOpen(true) }}
         onBookmark={toggleBookmark}
         onImmersive={() => { void toggleImmersive() }}
       />
@@ -1500,7 +1631,7 @@ export default function App() {
             onRotateRight={() => rotatePages(90)}
             onDeletePages={deletePages}
             onPageDragStart={startPageDrag}
-            onImportPagesAt={importPagesAt}
+            onImportPagesAt={importDroppedPages}
             onExportPages={exportPages}
             onDeleteBookmark={deleteBookmark}
             onRenameBookmark={renameBookmark}
@@ -1556,7 +1687,7 @@ export default function App() {
               onCurrentPage={updateCurrentPageFromScroll}
               onSelectPage={selectPage}
               onPageDragStart={startPageDrag}
-              onImportPagesAt={importPagesAt}
+              onImportPagesAt={importDroppedPages}
               onRequestTextEdit={beginTextEdit}
               onTextEditChange={setTextEdit}
               onCommitTextEdit={commitTextEdit}
@@ -1567,10 +1698,11 @@ export default function App() {
               onCancelObjectEdit={() => setObjectEdit(null)}
               onObjectRegionSelected={() => setSelectingObjectRegion(false)}
               onHighlight={(index, rects) => addHighlights(rects, index)}
-              onTextMarkup={(index, style, rects) => addTextMarkup(style, rects, index)}
+              onTextMarkup={(index, style, rects, displayRotation) => addTextMarkup(style, rects, index, displayRotation)}
               onInk={(index, points) => addInk(points, index)}
               onRectangle={(index, rect) => addRectangle(rect, index)}
               onCrop={(index, rect) => cropPage(rect, index)}
+              onPlaceSignature={(index, point, displayRotation) => { void placeSignature(index, point, displayRotation) }}
               onNavigate={goToPage}
               onFormChange={(name, value) => { setFormValues((current) => ({ ...current, [name]: value })); setDirty(true) }}
             />
@@ -1618,6 +1750,23 @@ export default function App() {
       </div>
 
       {pdf && <StatusBar tool={tool} pageIndex={pageIndex} pageCount={pdf.numPages} selectionCount={selectedPages.size} />}
+      {tool === 'sign' && pdf && !pendingSignature && (
+        <SignaturePanel
+          onUse={setPendingSignature}
+          onClose={() => setTool('select')}
+        />
+      )}
+      {printDialogOpen && pdf && (
+        <PrintDialog
+          documentName={documentFile.name}
+          pageCount={pdf.numPages}
+          currentPage={pageIndex}
+          selectedPages={[...selectedPages].sort((a, b) => a - b)}
+          onPrint={(submission) => { void runPrintJob(submission) }}
+          onPreview={() => { setPrintDialogOpen(false); void printDocument() }}
+          onClose={() => setPrintDialogOpen(false)}
+        />
+      )}
       {busy && <BusyOverlay label={busy} />}
       {toast && <Toast {...toast} onClose={() => setToast(null)} />}
     </div>

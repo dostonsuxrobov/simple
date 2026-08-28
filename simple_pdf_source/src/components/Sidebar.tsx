@@ -18,7 +18,7 @@ import {
 } from 'lucide-react'
 import type { ActiveSearchMatch, Bookmark, SearchResult } from '../types'
 import { getPageTextContent } from '../lib/pdf'
-import { pageReorderDestination } from '../lib/pageTransfer'
+import { isImportableTransferFile, pageReorderDestination } from '../lib/pageTransfer'
 import { normalizeSearchValue } from '../lib/search'
 import { cx, errorMessage } from '../lib/utils'
 import { EmptyState, IconButton } from './ui'
@@ -76,6 +76,7 @@ function PageThumbnail({
   onDragStart, onExportDragStart, onDragEnd, onDrop, onRotateLeft, onRotateRight, onDelete,
 }: PageThumbnailProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const paperRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState(false)
   const [dropEdge, setDropEdge] = useState<'before' | 'after' | null>(null)
 
@@ -94,7 +95,7 @@ function PageThumbnail({
         if (cancelled || !canvasRef.current) return
         const pageRotation = (((page.rotate || 0) + rotation) % 360 + 360) % 360
         const base = page.getViewport({ scale: 1, rotation: pageRotation })
-        const scale = Math.min(132 / base.width, 168 / base.height)
+        const scale = Math.min(168 / base.width, 168 / base.height)
         const viewport = page.getViewport({ scale, rotation: pageRotation })
         const dpr = Math.min(window.devicePixelRatio || 1, 2)
         const canvas = canvasRef.current
@@ -102,6 +103,10 @@ function PageThumbnail({
         canvas.height = Math.floor(viewport.height * dpr)
         canvas.style.width = `${viewport.width}px`
         canvas.style.height = `${viewport.height}px`
+        if (paperRef.current) {
+          paperRef.current.style.width = `${viewport.width}px`
+          paperRef.current.style.height = `${viewport.height}px`
+        }
         const context = canvas.getContext('2d', { alpha: false })
         if (!context) return
         renderTask = page.render({
@@ -153,7 +158,7 @@ function PageThumbnail({
       onClick={onClick}
       data-drop-edge={dropEdge || undefined}
     >
-      <div className="thumbnail-paper">
+      <div className="thumbnail-paper" ref={paperRef}>
         {error ? <span className="thumbnail-error">Preview unavailable</span> : <canvas ref={canvasRef} />}
         {bookmarked && <span className="thumbnail-bookmark" title="Bookmarked"><BookmarkIcon size={11} fill="currentColor" /></span>}
         {selected && (
@@ -189,8 +194,8 @@ function PageThumbnail({
           type="button"
           className="thumbnail-export-handle"
           draggable
-          title={exportPageCount > 1 ? `Drag ${exportPageCount} selected pages as one PDF` : `Drag page ${index + 1} as a PDF`}
-          aria-label={exportPageCount > 1 ? `Drag ${exportPageCount} selected pages as one PDF` : `Drag page ${index + 1} as a PDF`}
+          title={exportPageCount > 1 ? `Drag to export ${exportPageCount} selected pages as one PDF file` : `Drag to export page ${index + 1} as a PDF file`}
+          aria-label={exportPageCount > 1 ? `Drag to export ${exportPageCount} selected pages as one PDF file` : `Drag to export page ${index + 1} as a PDF file`}
           onPointerDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
           onDragStart={(event) => {
@@ -223,7 +228,7 @@ interface SidebarProps {
   onRotateLeft: () => void
   onRotateRight: () => void
   onDeletePages: () => void
-  onPageDragStart?: (index: number, event: ReactDragEvent<HTMLDivElement>) => void
+  onPageDragStart?: (index: number, event: ReactDragEvent<HTMLButtonElement>) => void
   onImportPagesAt?: (files: File[], insertIndex: number) => void
   onExportPages: () => void
   onDeleteBookmark: (id: string) => void
@@ -491,11 +496,11 @@ export function Sidebar({
                     onDragEnd={() => setDraggedPage(null)}
                     onDrop={(event, insertIndex) => {
                       const internalPage = event.dataTransfer.getData(INTERNAL_PAGE_DRAG_TYPE)
-                      const pdfFiles = Array.from(event.dataTransfer.files).filter((file) => file.type === 'application/pdf' || /\.pdf$/i.test(file.name))
+                      const importableFiles = Array.from(event.dataTransfer.files).filter(isImportableTransferFile)
                       if (internalPage && draggedPage !== null) {
                         const destination = pageReorderDestination(draggedPage, insertIndex)
                         if (destination !== draggedPage) onReorder(draggedPage, destination)
-                      } else if (pdfFiles.length) onImportPagesAt?.(pdfFiles, insertIndex)
+                      } else if (event.dataTransfer.files.length) onImportPagesAt?.(importableFiles, insertIndex)
                       setDraggedPage(null)
                     }}
                   />

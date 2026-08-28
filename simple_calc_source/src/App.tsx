@@ -1,5 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, CSSProperties, DragEvent, KeyboardEvent, MouseEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react'
+import type { ChangeEvent, CSSProperties, DragEvent, KeyboardEvent, MouseEvent, MutableRefObject, PointerEvent as ReactPointerEvent, RefObject } from 'react'
+import { applyPatches, enablePatches, produceWithPatches, setAutoFreeze } from 'immer'
+import type { Patch } from 'immer'
 import {
   AlignCenter,
   AlignLeft,
@@ -7,11 +9,14 @@ import {
   AlignVerticalJustifyCenter,
   AlignVerticalJustifyEnd,
   AlignVerticalJustifyStart,
+  ArrowDownAZ,
+  ArrowUpZA,
   Bold,
   Check,
   CheckSquare,
   ChevronDown,
   CircleAlert,
+  ClipboardPaste,
   Columns3,
   Copy,
   DollarSign,
@@ -34,9 +39,12 @@ import {
   Percent,
   RotateCw,
   Rows3,
+  Pencil,
   Plus,
   Redo2,
+  Replace,
   Save,
+  Scissors,
   Search,
   Sigma,
   Square,
@@ -52,11 +60,13 @@ import {
   X,
 } from 'lucide-react'
 import appIcon from '../icon.png'
-import { SpreadsheetMenus } from './components/SpreadsheetMenus'
-import type { SpreadsheetMenuDefinition } from './components/SpreadsheetMenus'
+import { SpreadsheetContextMenu, SpreadsheetMenus } from './components/SpreadsheetMenus'
+import type { SpreadsheetMenuDefinition, SpreadsheetMenuItem } from './components/SpreadsheetMenus'
 import { createAutofillPatch } from './lib/autofill'
-import { evaluateFormula, shiftFormulaReferences } from './lib/formulas'
+import { evaluateFormula, isFormulaError, shiftFormulaReferences } from './lib/formulas'
+import type { FormulaEvaluationHooks } from './lib/formulas'
 import { accountingDisplayParts, formatScalar, isAccountingNumberFormat } from './lib/number-format'
+import { registerRecoverySave } from './lib/recovery'
 import { applySelectionStructureCommand } from './lib/sheet-operations'
 import type { SelectionStructureCommand } from './lib/sheet-operations'
 import type {
@@ -73,6 +83,9 @@ import type {
   WorkbookModel,
   WorkbookPayload,
 } from './spreadsheet-types'
+
+enablePatches()
+setAutoFreeze(false)
 
 const RECENT_KEY = 'simple-calc:recent:v1'
 const DEFAULT_ROWS = 200
@@ -99,6 +112,11 @@ interface Selection {
   focus: Coord
 }
 
+interface GridContextTarget {
+  kind: 'cell' | 'row-header' | 'column-header'
+  coord: Coord
+}
+
 type AggregateMode = 'sum' | 'average' | 'minimum' | 'maximum' | 'count' | 'numeric'
 
 interface OpenWorkbook {
@@ -120,6 +138,23 @@ interface InternalClipboard {
   text: string
   origin: Coord
   cells: CellData[][]
+}
+
+interface HistoryEntry {
+  patches: Patch[]
+  inversePatches: Patch[]
+}
+
+interface TextPromptRequest {
+  title: string
+  label: string
+  initialValue?: string
+  multiline?: boolean
+}
+
+interface TextPromptState extends TextPromptRequest {
+  id: number
+  resolve: (value: string | null) => void
 }
 
 function makeId(prefix = 'sheet') {
@@ -214,6 +249,104 @@ function rangeAddresses(selection: Selection, limit = 100_000) {
     for (let col = bounds.left; col <= bounds.right; col += 1) addresses.push(addressOf({ row, col }))
   }
   return addresses
+}
+
+function hiddenIndexSet(values?: number[]) {
+  return new Set((values || []).map((value) => Number(value) - 1).filter((value) => Number.isInteger(value) && value >= 0))
+}
+
+function stepPastHidden(position: number, delta: number, max: number, hidden: Set<number>) {
+  if (!delta) return clamp(position, 0, max)
+  const step = delta > 0 ? 1 : -1
+  let index = clamp(position, 0, max)
+  for (let remaining = Math.abs(delta); remaining > 0; remaining -= 1) {
+    let next = index + step
+    while (next >= 0 && next <= max && hidden.has(next)) next += step
+    if (next < 0 || next > max) break
+    index = next
+  }
+  return index
+}
+
+function edgeJumpCoord(sheet: SheetData, from: Coord, rowDelta: number, colDelta: number, hidden: Set<number>): Coord {
+  const vertical = rowDelta !== 0
+  const step = (vertical ? rowDelta : colDelta) > 0 ? 1 : -1
+  const position = vertical ? from.row : from.col
+  const filled = new Set<number>()
+  let farthest = Math.max(0, (vertical ? sheet.rowCount : sheet.colCount) - 1)
+  for (const [address, cell] of Object.entries(sheet.cells)) {
+    if (!cell.formula && (cell.value === undefined || cell.value === null || cell.value === '')) continue
+    const coord = coordOf(address)
+    if (!coord || (vertical ? coord.col !== from.col : coord.row !== from.row)) continue
+    const index = vertical ? coord.row : coord.col
+    farthest = Math.max(farthest, index)
+    if (!hidden.has(index)) filled.add(index)
+  }
+  const edge = step > 0 ? farthest : 0
+  let target = position
+  if (filled.has(position) && filled.has(position + step)) {
+    while (target !== edge && filled.has(target + step)) target += step
+  } else {
+    target = step > 0 ? Math.max(edge, position) : Math.min(edge, position)
+    for (let index = position + step; step > 0 ? index <= edge : index >= edge; index += step) {
+      if (filled.has(index)) { target = index; break }
+    }
+  }
+  while (hidden.has(target) && (step > 0 ? target > position : target < position)) target -= step
+  return vertical ? { row: target, col: from.col } : { row: from.row, col: target }
+}
+
+function contiguousRegionBounds(sheet: SheetData, origin: Coord) {
+  const filled: Coord[] = []
+  for (const [address, cell] of Object.entries(sheet.cells)) {
+    if (!cell.formula && (cell.value === undefined || cell.value === null || cell.value === '')) continue
+    const coord = coordOf(address)
+    if (coord) filled.push(coord)
+  }
+  const bounds = { top: origin.row, bottom: origin.row, left: origin.col, right: origin.col }
+  let grew = true
+  while (grew) {
+    grew = false
+    for (const coord of filled) {
+      if (coord.row < bounds.top - 1 || coord.row > bounds.bottom + 1 || coord.col < bounds.left - 1 || coord.col > bounds.right + 1) continue
+      if (coord.row < bounds.top) { bounds.top = coord.row; grew = true }
+      if (coord.row > bounds.bottom) { bounds.bottom = coord.row; grew = true }
+      if (coord.col < bounds.left) { bounds.left = coord.col; grew = true }
+      if (coord.col > bounds.right) { bounds.right = coord.col; grew = true }
+    }
+  }
+  return bounds
+}
+
+function compareCellScalars(a: CellScalar, b: CellScalar) {
+  const rank = (value: CellScalar) => typeof value === 'number' ? 0 : typeof value === 'string' ? 1 : 2
+  if (rank(a) !== rank(b)) return rank(a) - rank(b)
+  if (typeof a === 'number' && typeof b === 'number') return a - b
+  if (typeof a === 'boolean' && typeof b === 'boolean') return Number(a) - Number(b)
+  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' })
+}
+
+function replaceAllOccurrences(source: string, query: string, replacement: string) {
+  if (!query) return source
+  const haystack = source.toLocaleLowerCase()
+  const needle = query.toLocaleLowerCase()
+  let output = ''
+  let position = 0
+  for (let found = haystack.indexOf(needle); found >= 0; found = haystack.indexOf(needle, position)) {
+    output += source.slice(position, found) + replacement
+    position = found + needle.length
+  }
+  return output + source.slice(position)
+}
+
+function replacementDraft(cell: CellData, query: string, replacement: string) {
+  if (cell.formula) {
+    const replaced = replaceAllOccurrences(cell.formula, query, replacement)
+    return replaced === cell.formula ? null : `=${replaced}`
+  }
+  const source = cell.value === null || cell.value === undefined ? '' : String(cell.value)
+  const replaced = replaceAllOccurrences(source, query, replacement)
+  return replaced === source ? null : replaced
 }
 
 function normalizeFormula(formula: string) {
@@ -339,9 +472,15 @@ function readRecent(): RecentWorkbook[] {
 }
 
 function rememberRecent(current: RecentWorkbook[], item: RecentWorkbook) {
-  const next = [item, ...current.filter((entry) => entry.path.toLowerCase() !== item.path.toLowerCase())].slice(0, 8)
-  localStorage.setItem(RECENT_KEY, JSON.stringify(next))
-  return next
+  return [item, ...current.filter((entry) => entry.path.toLowerCase() !== item.path.toLowerCase())].slice(0, 8)
+}
+
+function writeRecent(items: RecentWorkbook[]) {
+  try {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(items))
+  } catch {
+    return
+  }
 }
 
 function errorMessage(error: unknown) {
@@ -529,10 +668,54 @@ function cellContentCss(cell: CellData | undefined, width?: number): CSSProperti
 function createValueResolver(workbook: WorkbookModel) {
   const cache = new Map<string, CellScalar>()
   const visiting = new Set<string>()
+  const staleResults = new Set<string>()
+  const usedRanges = new Map<string, { maxRow: number; maxCol: number }>()
 
   const resolveSheet = (reference: string) => workbook.sheets.find((sheet) => (
     sheet.id === reference || sheet.name.toLocaleLowerCase() === reference.toLocaleLowerCase()
   ))
+
+  const usedRangeOf = (sheet: SheetData) => {
+    const cached = usedRanges.get(sheet.id)
+    if (cached) return cached
+    let maxRow = 1
+    let maxCol = 1
+    for (const address of Object.keys(sheet.cells)) {
+      const coord = coordOf(address)
+      if (!coord) continue
+      if (coord.row + 1 > maxRow) maxRow = coord.row + 1
+      if (coord.col + 1 > maxCol) maxCol = coord.col + 1
+    }
+    const bounds = { maxRow, maxCol }
+    usedRanges.set(sheet.id, bounds)
+    return bounds
+  }
+
+  const hooks: FormulaEvaluationHooks = {
+    getUsedRange: (sheetReference) => {
+      const sheet = resolveSheet(sheetReference)
+      return sheet ? usedRangeOf(sheet) : null
+    },
+    forEachCellInRange: (sheetReference, bounds, visit) => {
+      const sheet = resolveSheet(sheetReference)
+      if (!sheet) return
+      for (const address of Object.keys(sheet.cells)) {
+        const coord = coordOf(address)
+        if (!coord) continue
+        const row = coord.row + 1
+        const column = coord.col + 1
+        if (row >= bounds.startRow && row <= bounds.endRow && column >= bounds.startColumn && column <= bounds.endColumn) visit(row, column)
+      }
+    },
+    resolveDefinedName: (name) => {
+      const wanted = name.toLocaleLowerCase()
+      const candidates = (workbook.definedNames || []).filter((item) => item.name.toLocaleLowerCase() === wanted)
+      const entry = candidates.find((item) => item.localSheetIndex === undefined && item.localSheetId === undefined) || candidates[0]
+      if (entry) return entry.ranges?.[0] || entry.ref
+      const metadataEntry = workbook.metadata?.definedNames?.find((item) => item.name.toLocaleLowerCase() === wanted)
+      return metadataEntry ? metadataEntry.ranges || metadataEntry.formula : undefined
+    },
+  }
 
   const resolve = (sheetReference: string, address: string): CellScalar => {
     const sheet = resolveSheet(sheetReference)
@@ -547,19 +730,61 @@ function createValueResolver(workbook: WorkbookModel) {
     visiting.add(key)
     let value: CellScalar
     try {
-      const evaluated = evaluateFormula(cell.formula, sheet.id, resolve)
+      const coord = coordOf(normalized)
+      const evaluated = evaluateFormula(cell.formula, sheet.id, resolve, coord ? { ...hooks, currentCell: { row: coord.row + 1, column: coord.col + 1 } } : hooks)
       value = (evaluated === undefined ? null : evaluated) as CellScalar
       if (typeof value === 'string' && value.startsWith('#') && cell.result !== undefined && cell.result !== null && !['#DIV/0!', '#CIRC!', '#REF!'].includes(value)) {
+        if (!Object.is(cell.result, value)) staleResults.add(key)
         value = cell.result
       }
     } catch {
+      if (cell.result !== undefined && cell.result !== null) staleResults.add(key)
       value = cell.result ?? '#ERROR!'
     }
     visiting.delete(key)
     cache.set(key, value)
     return value
   }
-  return resolve
+  return Object.assign(resolve, {
+    hasStaleResult: (sheetReference: string, address: string) => {
+      const sheet = resolveSheet(sheetReference)
+      return sheet ? staleResults.has(`${sheet.id}!${address.replace(/\$/g, '').toUpperCase()}`) : false
+    },
+  })
+}
+
+const workbookResolvers = new WeakMap<WorkbookModel, ReturnType<typeof createValueResolver>>()
+
+function valueResolverFor(workbook: WorkbookModel) {
+  let resolver = workbookResolvers.get(workbook)
+  if (!resolver) {
+    resolver = createValueResolver(workbook)
+    workbookResolvers.set(workbook, resolver)
+  }
+  return resolver
+}
+
+function withRecalculatedResults(workbook: WorkbookModel): WorkbookModel {
+  const resolver = valueResolverFor(workbook)
+  let changed = false
+  const sheets = workbook.sheets.map((sheet) => {
+    let cells: SheetData['cells'] | null = null
+    for (const [address, cell] of Object.entries(sheet.cells)) {
+      if (!cell.formula) continue
+      const value = resolver(sheet.id, address)
+      if (value === null || isFormulaError(value) || value === '#ERROR!') continue
+      if (Object.is(cell.result, value)) continue
+      const recalculated = { ...cell, result: value }
+      delete recalculated.resultType
+      delete recalculated.display
+      if (!cells) cells = { ...sheet.cells }
+      cells[address] = recalculated
+    }
+    if (!cells) return sheet
+    changed = true
+    return { ...sheet, cells }
+  })
+  return changed ? { ...workbook, sheets } : workbook
 }
 
 function parseClipboardText(text: string) {
@@ -708,15 +933,34 @@ function noteText(note: CellData['note']) {
   return typeof note.text === 'string' ? note.text : ''
 }
 
+interface ValidationRange {
+  bounds: NonNullable<ReturnType<typeof mergeBounds>>
+  validation: Record<string, unknown>
+}
+
+const validationRangeCache = new WeakMap<Record<string, unknown>, ValidationRange[]>()
+
+function indexedValidationRanges(validations: Record<string, unknown>) {
+  const cached = validationRangeCache.get(validations)
+  if (cached) return cached
+  const ranges: ValidationRange[] = []
+  for (const [range, validation] of Object.entries(validations)) {
+    if (!validation || typeof validation !== 'object') continue
+    const bounds = mergeBounds(range)
+    if (bounds) ranges.push({ bounds, validation: validation as Record<string, unknown> })
+  }
+  validationRangeCache.set(validations, ranges)
+  return ranges
+}
+
 function validationForCell(sheet: SheetData, address: string) {
-  const validations = sheet.dataValidations || {}
+  const validations = sheet.dataValidations
+  if (!validations) return undefined
   if (validations[address] && typeof validations[address] === 'object') return validations[address] as Record<string, unknown>
   const coord = coordOf(address)
   if (!coord) return undefined
-  for (const [range, validation] of Object.entries(validations)) {
-    const bounds = mergeBounds(range)
-    if (!bounds || coord.row < bounds.top || coord.row > bounds.bottom || coord.col < bounds.left || coord.col > bounds.right) continue
-    if (validation && typeof validation === 'object') return validation as Record<string, unknown>
+  for (const { bounds, validation } of indexedValidationRanges(validations)) {
+    if (coord.row >= bounds.top && coord.row <= bounds.bottom && coord.col >= bounds.left && coord.col <= bounds.right) return validation
   }
   return undefined
 }
@@ -758,10 +1002,11 @@ interface GridProps {
   showGridlines: boolean
   showNotes: boolean
   displayValue: (sheetId: string, address: string) => string
+  staleValue: (sheetId: string, address: string) => boolean
   onSelection: (selection: Selection) => void
   onBeginEdit: (draft?: string) => void
   onDraft: (draft: string) => void
-  onCommitEdit: () => void
+  onCommitEdit: (direction?: 'up' | 'down' | 'left' | 'right') => void
   onCancelEdit: () => void
   onFill: (target: Coord) => void
   onCellValue: (address: string, value: CellData['value']) => void
@@ -770,6 +1015,7 @@ interface GridProps {
   onRowResize: (row: number, height: number) => void
   onFreeze: (axis: 'rows' | 'columns', count: number) => void
   onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void
+  onContextTarget: (target: GridContextTarget, position: { x: number; y: number }) => void
 }
 
 interface GridCellViewProps {
@@ -785,10 +1031,11 @@ interface GridCellViewProps {
   columnMetrics: AxisMetric[]
   rowMetrics: AxisMetric[]
   mergeRanges: Array<NonNullable<ReturnType<typeof mergeBounds>>>
-  selection: Selection
+  selectionRef: MutableRefObject<Selection>
   viewportRef: RefObject<HTMLDivElement | null>
   fillDraggingRef: RefObject<boolean>
   displayValue: GridProps['displayValue']
+  staleValue: GridProps['staleValue']
   onSelection: GridProps['onSelection']
   onBeginEdit: GridProps['onBeginEdit']
   onCellValue: GridProps['onCellValue']
@@ -837,10 +1084,11 @@ const GridCellView = memo(function GridCellView({
   columnMetrics,
   rowMetrics,
   mergeRanges,
-  selection,
+  selectionRef,
   viewportRef,
   fillDraggingRef,
   displayValue,
+  staleValue,
   onSelection,
   onBeginEdit,
   onCellValue,
@@ -857,6 +1105,7 @@ const GridCellView = memo(function GridCellView({
     : axisSize(row, defaultRow, rowMetrics)
   const cell = mergedDisplayCell(sheet, merge, sheet.cells[address])
   const cellText = displayValue(sheet.id, address)
+  const staleResult = Boolean(cell?.formula) && staleValue(sheet.id, address)
   const accounting = accountingDisplayParts(cellText, cell?.numFmt || cell?.style?.numFmt)
   const rawValue = cell?.formula ? cell.result : cell?.value
   const validation = validationForCell(sheet, address)
@@ -887,12 +1136,12 @@ const GridCellView = memo(function GridCellView({
   return (
     <div
       id={`cell-${sheet.id}-${address}`}
-      className={`grid-cell${cell?.formula ? ' has-formula' : ''}${cell?.note ? ' has-note' : ''}${cell?.style?.fill ? ' has-fill' : ''}${canOverflow && contentWidth > width ? ' can-overflow' : ''}${pane !== 'body' ? ' is-frozen' : ''}`}
+      className={`grid-cell${cell?.formula ? ' has-formula' : ''}${staleResult ? ' stale-result' : ''}${cell?.note ? ' has-note' : ''}${cell?.style?.fill ? ' has-fill' : ''}${canOverflow && contentWidth > width ? ' can-overflow' : ''}${pane !== 'body' ? ' is-frozen' : ''}`}
       style={{ left, top, width, height, ...cellCss(cell) }}
       role="gridcell"
       aria-rowindex={row + 1}
       aria-colindex={col + 1}
-      title={noteText(cell?.note) || cell?.hyperlinkTooltip || (cell?.formula ? `=${cell.formula}` : cellText || undefined)}
+      title={staleResult ? 'Value from last file save — formula not recalculated' : noteText(cell?.note) || cell?.hyperlinkTooltip || (cell?.formula ? `=${cell.formula}` : cellText || undefined)}
       onMouseDown={(event) => {
         if (event.button !== 0) return
         event.preventDefault()
@@ -900,11 +1149,11 @@ const GridCellView = memo(function GridCellView({
         const target = merge ? { row: merge.top, col: merge.left } : { row, col }
         const anchor = merge ? { row: merge.bottom, col: merge.right } : target
         onSelection(event.shiftKey
-          ? { anchor: selection.anchor, focus: merge ? { row: merge.bottom, col: merge.right } : target }
+          ? { anchor: selectionRef.current.anchor, focus: merge ? { row: merge.bottom, col: merge.right } : target }
           : { anchor, focus: target })
       }}
       onMouseEnter={(event) => {
-        if (!fillDraggingRef.current && event.buttons === 1) onSelection({ anchor: selection.anchor, focus: merge ? { row: merge.bottom, col: merge.right } : { row, col } })
+        if (!fillDraggingRef.current && event.buttons === 1) onSelection({ anchor: selectionRef.current.anchor, focus: merge ? { row: merge.bottom, col: merge.right } : { row, col } })
       }}
       onDoubleClick={() => onBeginEdit()}
     >
@@ -969,8 +1218,9 @@ const GridCellRow = memo(function GridCellRow({ coordinates, mergeMap, ...cellPr
     previous.frozenColumnCount !== next.frozenColumnCount || previous.defaultColumn !== next.defaultColumn ||
     previous.defaultRow !== next.defaultRow || previous.columnMetrics !== next.columnMetrics ||
     previous.rowMetrics !== next.rowMetrics || previous.mergeRanges !== next.mergeRanges ||
-    previous.selection !== next.selection || previous.viewportRef !== next.viewportRef ||
+    previous.selectionRef !== next.selectionRef || previous.viewportRef !== next.viewportRef ||
     previous.fillDraggingRef !== next.fillDraggingRef || previous.displayValue !== next.displayValue ||
+    previous.staleValue !== next.staleValue ||
     previous.onSelection !== next.onSelection || previous.onBeginEdit !== next.onBeginEdit ||
     previous.onCellValue !== next.onCellValue || previous.onOpenHyperlink !== next.onOpenHyperlink ||
     previous.coordinates.length !== next.coordinates.length
@@ -989,6 +1239,7 @@ function SpreadsheetGrid({
   showGridlines,
   showNotes,
   displayValue,
+  staleValue,
   onSelection,
   onBeginEdit,
   onDraft,
@@ -1001,8 +1252,11 @@ function SpreadsheetGrid({
   onRowResize,
   onFreeze,
   onKeyDown,
+  onContextTarget,
 }: GridProps) {
   const viewportRef = useRef<HTMLDivElement>(null)
+  const selectionRef = useRef(selection)
+  selectionRef.current = selection
   const fillDraggingRef = useRef(false)
   const fillTargetRef = useRef<Coord | null>(null)
   const fillPointerIdRef = useRef<number | null>(null)
@@ -1016,6 +1270,7 @@ function SpreadsheetGrid({
   const selectionOutlineRef = useRef<HTMLDivElement>(null)
   const fillPreviewOverlayRef = useRef<HTMLDivElement>(null)
   const editorOverlayRef = useRef<HTMLTextAreaElement>(null)
+  const editorCommitViaKeyRef = useRef(false)
   const [fillTarget, setFillTarget] = useState<Coord | null>(null)
   const [resize, setResize] = useState<DimensionResize | null>(null)
   const [freezeDrag, setFreezeDrag] = useState<FreezeDrag | null>(null)
@@ -1274,36 +1529,41 @@ function SpreadsheetGrid({
   const frozenRenderColumnEnd = frozenColumnCount
     ? Math.min(frozenColumnCount - 1, axisIndexAt(Math.max(0, viewport.width - HEADER_WIDTH), columns, defaultColumn, columnMetrics) + 2)
     : -1
-  const renderedRows = [...new Set([
+  const renderedRows = useMemo(() => [...new Set([
     ...Array.from({ length: Math.max(0, endRow - startRow + 1) }, (_, offset) => startRow + offset),
     ...Array.from({ length: frozenRenderRowEnd + 1 }, (_, row) => row),
-  ])].filter((row) => !hiddenRows.has(row)).sort((a, b) => a - b)
-  const renderedColumns = [...new Set([
+  ])].filter((row) => !hiddenRows.has(row)).sort((a, b) => a - b), [endRow, frozenRenderRowEnd, hiddenRows, startRow])
+  const renderedColumns = useMemo(() => [...new Set([
     ...Array.from({ length: Math.max(0, endCol - startCol + 1) }, (_, offset) => startCol + offset),
     ...Array.from({ length: frozenRenderColumnEnd + 1 }, (_, col) => col),
-  ])].filter((col) => !hiddenColumns.has(col)).sort((a, b) => a - b)
+  ])].filter((col) => !hiddenColumns.has(col)).sort((a, b) => a - b), [endCol, frozenRenderColumnEnd, hiddenColumns, startCol])
 
-  const visibleCellMap = new Map<string, { row: number; col: number }>()
-  for (const row of renderedRows) {
-    for (const col of renderedColumns) visibleCellMap.set(addressOf({ row, col }), { row, col })
-  }
-
-  const mergeMap = new Map<string, ReturnType<typeof mergeBounds>>()
-  for (const merge of mergeRanges) {
-    const intersectsRows = renderedRows.some((row) => row >= merge.top && row <= merge.bottom)
-    const intersectsColumns = renderedColumns.some((col) => col >= merge.left && col <= merge.right)
-    if (!intersectsRows || !intersectsColumns) continue
+  const { visibleCells, mergeMap } = useMemo(() => {
+    const visibleCellMap = new Map<string, { row: number; col: number }>()
     for (const row of renderedRows) {
-      if (row < merge.top || row > merge.bottom) continue
-      for (const col of renderedColumns) {
-        if (col >= merge.left && col <= merge.right) mergeMap.set(addressOf({ row, col }), merge)
-      }
+      for (const col of renderedColumns) visibleCellMap.set(addressOf({ row, col }), { row, col })
     }
-    const master = { row: merge.top, col: merge.left }
-    visibleCellMap.set(addressOf(master), master)
-    mergeMap.set(addressOf(master), merge)
-  }
-  const visibleCells = [...visibleCellMap.values()].sort((a, b) => a.row - b.row || a.col - b.col)
+
+    const merges = new Map<string, ReturnType<typeof mergeBounds>>()
+    for (const merge of mergeRanges) {
+      const intersectsRows = renderedRows.some((row) => row >= merge.top && row <= merge.bottom)
+      const intersectsColumns = renderedColumns.some((col) => col >= merge.left && col <= merge.right)
+      if (!intersectsRows || !intersectsColumns) continue
+      for (const row of renderedRows) {
+        if (row < merge.top || row > merge.bottom) continue
+        for (const col of renderedColumns) {
+          if (col >= merge.left && col <= merge.right) merges.set(addressOf({ row, col }), merge)
+        }
+      }
+      const master = { row: merge.top, col: merge.left }
+      visibleCellMap.set(addressOf(master), master)
+      merges.set(addressOf(master), merge)
+    }
+    return {
+      visibleCells: [...visibleCellMap.values()].sort((a, b) => a.row - b.row || a.col - b.col),
+      mergeMap: merges,
+    }
+  }, [mergeRanges, renderedColumns, renderedRows])
 
   const measurementContext = useMemo(() => document.createElement('canvas').getContext('2d'), [])
   const measureText = (text: string, cell?: CellData) => {
@@ -1471,6 +1731,27 @@ function SpreadsheetGrid({
     })
   }
 
+  const handleViewportContextMenu = (event: MouseEvent<HTMLDivElement>) => {
+    const element = viewportRef.current
+    if (!element) return
+    if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return
+    const rect = element.getBoundingClientRect()
+    const localX = event.clientX - rect.left
+    const localY = event.clientY - rect.top
+    if (localX < HEADER_WIDTH && localY < HEADER_HEIGHT) return
+    event.preventDefault()
+    const columnLocal = localX - HEADER_WIDTH
+    const rowLocal = localY - HEADER_HEIGHT
+    const columnPixel = columnLocal < frozenWidth ? columnLocal : columnLocal + element.scrollLeft
+    const rowPixel = rowLocal < frozenHeight ? rowLocal : rowLocal + element.scrollTop
+    const coord = {
+      row: axisIndexAt(Math.max(0, rowPixel), rows, defaultRow, rowMetrics),
+      col: axisIndexAt(Math.max(0, columnPixel), columns, defaultColumn, columnMetrics),
+    }
+    const kind = localX < HEADER_WIDTH ? 'row-header' as const : localY < HEADER_HEIGHT ? 'column-header' as const : 'cell' as const
+    onContextTarget({ kind, coord }, { x: event.clientX, y: event.clientY })
+  }
+
   const bounds = selectionBounds(selection)
   const selectionPinnedX = bounds.right < frozenColumnCount
   const selectionPinnedY = bounds.bottom < frozenRowCount
@@ -1577,31 +1858,33 @@ function SpreadsheetGrid({
     }
   }, [onFill])
 
-  const cellsByPane: Record<CellPane, Array<{ row: number; col: number }>> = {
-    body: [],
-    'frozen-row': [],
-    'frozen-column': [],
-    'frozen-corner': [],
-  }
-  for (const coordinate of visibleCells) {
-    const address = addressOf(coordinate)
-    const merge = mergeMap.get(address)
-    if (merge && (merge.top !== coordinate.row || merge.left !== coordinate.col)) continue
-    const frozenColumn = merge ? merge.right < frozenColumnCount : coordinate.col < frozenColumnCount
-    const frozenRow = merge ? merge.bottom < frozenRowCount : coordinate.row < frozenRowCount
-    const pane: CellPane = frozenRow && frozenColumn ? 'frozen-corner' : frozenRow ? 'frozen-row' : frozenColumn ? 'frozen-column' : 'body'
-    cellsByPane[pane].push(coordinate)
-  }
-
-  const rowsByPane = Object.fromEntries((Object.keys(cellsByPane) as CellPane[]).map((pane) => {
-    const grouped = new Map<number, Array<{ row: number; col: number }>>()
-    for (const coordinate of cellsByPane[pane]) {
-      const row = grouped.get(coordinate.row)
-      if (row) row.push(coordinate)
-      else grouped.set(coordinate.row, [coordinate])
+  const rowsByPane = useMemo(() => {
+    const cellsByPane: Record<CellPane, Array<{ row: number; col: number }>> = {
+      body: [],
+      'frozen-row': [],
+      'frozen-column': [],
+      'frozen-corner': [],
     }
-    return [pane, [...grouped.values()]]
-  })) as Record<CellPane, Array<Array<{ row: number; col: number }>>>
+    for (const coordinate of visibleCells) {
+      const address = addressOf(coordinate)
+      const merge = mergeMap.get(address)
+      if (merge && (merge.top !== coordinate.row || merge.left !== coordinate.col)) continue
+      const frozenColumn = merge ? merge.right < frozenColumnCount : coordinate.col < frozenColumnCount
+      const frozenRow = merge ? merge.bottom < frozenRowCount : coordinate.row < frozenRowCount
+      const pane: CellPane = frozenRow && frozenColumn ? 'frozen-corner' : frozenRow ? 'frozen-row' : frozenColumn ? 'frozen-column' : 'body'
+      cellsByPane[pane].push(coordinate)
+    }
+
+    return Object.fromEntries((Object.keys(cellsByPane) as CellPane[]).map((pane) => {
+      const grouped = new Map<number, Array<{ row: number; col: number }>>()
+      for (const coordinate of cellsByPane[pane]) {
+        const row = grouped.get(coordinate.row)
+        if (row) row.push(coordinate)
+        else grouped.set(coordinate.row, [coordinate])
+      }
+      return [pane, [...grouped.values()]]
+    })) as Record<CellPane, Array<Array<{ row: number; col: number }>>>
+  }, [frozenColumnCount, frozenRowCount, mergeMap, visibleCells])
 
   const renderGridRows = (pane: CellPane) => rowsByPane[pane].map((coordinates) => (
     <GridCellRow
@@ -1617,10 +1900,11 @@ function SpreadsheetGrid({
       columnMetrics={columnMetrics}
       rowMetrics={rowMetrics}
       mergeRanges={mergeRanges}
-      selection={selection}
+      selectionRef={selectionRef}
       viewportRef={viewportRef}
       fillDraggingRef={fillDraggingRef}
       displayValue={displayValue}
+      staleValue={staleValue}
       onSelection={onSelection}
       onBeginEdit={onBeginEdit}
       onCellValue={onCellValue}
@@ -1716,6 +2000,7 @@ function SpreadsheetGrid({
       aria-activedescendant={`cell-${sheet.id}-${addressOf(selection.focus)}`}
       onKeyDown={onKeyDown}
       onScroll={(event) => handleViewportScroll(event.currentTarget)}
+      onContextMenu={handleViewportContextMenu}
     >
       <div className="sheet-canvas" style={{ width: totalWidth, height: totalHeight }}>
         <div className="column-header-layer" style={{ width: totalWidth - HEADER_WIDTH, height: HEADER_HEIGHT }}>
@@ -1860,12 +2145,15 @@ function SpreadsheetGrid({
               style={{ left, top, width: Math.max(width, 160), minHeight: height, transform: pinnedTransform(frozenColumn, frozenRow) }}
               value={editing.draft}
               onChange={(event) => onDraft(event.target.value)}
-              onFocus={(event) => event.currentTarget.select()}
-              onBlur={onCommitEdit}
+              onFocus={(event) => { editorCommitViaKeyRef.current = false; event.currentTarget.select() }}
+              onBlur={() => {
+                if (editorCommitViaKeyRef.current) { editorCommitViaKeyRef.current = false; return }
+                onCommitEdit()
+              }}
               onKeyDown={(event) => {
                 if (event.key === 'Escape') { event.preventDefault(); onCancelEdit() }
-                else if (event.key === 'Enter' && !event.altKey && !event.shiftKey) { event.preventDefault(); event.currentTarget.blur() }
-                else if (event.key === 'Tab') { event.preventDefault(); event.currentTarget.blur() }
+                else if (event.key === 'Enter' && !event.altKey) { event.preventDefault(); editorCommitViaKeyRef.current = true; onCommitEdit(event.shiftKey ? 'up' : 'down'); viewportRef.current?.focus() }
+                else if (event.key === 'Tab') { event.preventDefault(); editorCommitViaKeyRef.current = true; onCommitEdit(event.shiftKey ? 'left' : 'right'); viewportRef.current?.focus() }
               }}
             />
           )
@@ -1904,6 +2192,52 @@ function SpreadsheetGrid({
           />
         </div>
       </div>
+    </div>
+  )
+}
+
+function TextPromptDialog({ request, onClose }: { request: TextPromptRequest; onClose: (value: string | null) => void }) {
+  const [value, setValue] = useState(request.initialValue || '')
+  const fieldRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null)
+  useEffect(() => {
+    fieldRef.current?.focus()
+    fieldRef.current?.select()
+  }, [])
+  return (
+    <div className="prompt-overlay" onPointerDown={(event) => { if (event.target === event.currentTarget) onClose(null) }}>
+      <form
+        className="prompt-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label={request.title}
+        onSubmit={(event) => { event.preventDefault(); onClose(value) }}
+        onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose(null) } }}
+      >
+        <h2>{request.title}</h2>
+        <label>
+          <span>{request.label}</span>
+          {request.multiline ? (
+            <textarea
+              ref={fieldRef as RefObject<HTMLTextAreaElement>}
+              rows={5}
+              value={value}
+              onChange={(event) => setValue(event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); onClose(value) } }}
+            />
+          ) : (
+            <input
+              ref={fieldRef as RefObject<HTMLInputElement>}
+              value={value}
+              onChange={(event) => setValue(event.target.value)}
+            />
+          )}
+        </label>
+        <div className="prompt-actions">
+          {request.multiline && <span className="prompt-hint">Ctrl+Enter to save</span>}
+          <button type="button" className="secondary-action" onClick={() => onClose(null)}>Cancel</button>
+          <button type="submit" className="primary-action">OK</button>
+        </div>
+      </form>
     </div>
   )
 }
@@ -2021,22 +2355,35 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchIndex, setSearchIndex] = useState(-1)
+  const [replaceOpen, setReplaceOpen] = useState(false)
+  const [replaceValue, setReplaceValue] = useState('')
+  const [contextMenu, setContextMenu] = useState<{ kind: GridContextTarget['kind'] | 'sheet-tab'; x: number; y: number; sheetId?: string } | null>(null)
   const [showFormulaBar, setShowFormulaBar] = useState(true)
   const [showFormulas, setShowFormulas] = useState(false)
   const [showNotes, setShowNotes] = useState(true)
   const [immersive, setImmersive] = useState(false)
-  const historyRef = useRef<WorkbookModel[]>([])
-  const futureRef = useRef<WorkbookModel[]>([])
+  const [textPrompt, setTextPrompt] = useState<TextPromptState | null>(null)
+  const [nameBoxDraft, setNameBoxDraft] = useState<string | null>(null)
+  const [nameBoxInvalid, setNameBoxInvalid] = useState(false)
+  const [statsSelection, setStatsSelection] = useState(selection)
+  const [pointerDown, setPointerDown] = useState(false)
+  const historyRef = useRef<HistoryEntry[]>([])
+  const futureRef = useRef<HistoryEntry[]>([])
   const internalClipboard = useRef<InternalClipboard | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const searchOriginRef = useRef('A1')
+  const promptIdRef = useRef(0)
+  const formulaBarDirtyRef = useRef<{ sheetId: string; address: string; draft: string } | null>(null)
   const workbookRef = useRef(workbook)
   const documentRef = useRef(documentFile)
   const dirtyRef = useRef(dirty)
+  const selectionRef = useRef(selection)
 
   useEffect(() => { workbookRef.current = workbook }, [workbook])
   useEffect(() => { documentRef.current = documentFile }, [documentFile])
   useEffect(() => { dirtyRef.current = dirty }, [dirty])
+  useEffect(() => { selectionRef.current = selection }, [selection])
+  useEffect(() => { writeRecent(recent) }, [recent])
   useEffect(() => {
     if (!toast) return
     const timeout = window.setTimeout(() => setToast(''), 3800)
@@ -2047,10 +2394,12 @@ export default function App() {
   const gridlinesVisible = activeSheet?.views?.[0]?.showGridLines !== false
   const activeAddress = addressOf(selection.focus)
   const activeCell = activeSheet?.cells[activeAddress]
+  const hiddenRowSet = useMemo(() => hiddenIndexSet(activeSheet?.hiddenRows), [activeSheet?.hiddenRows])
+  const hiddenColSet = useMemo(() => hiddenIndexSet(activeSheet?.hiddenCols), [activeSheet?.hiddenCols])
 
-  useEffect(() => setFormulaDraft(rawCellValue(activeCell)), [activeSheet?.id, activeAddress, activeCell])
-
-  const valueResolver = useMemo(() => workbook ? createValueResolver(workbook) : () => null, [workbook])
+  const valueResolver = useMemo<ReturnType<typeof createValueResolver>>(() => (
+    workbook ? valueResolverFor(workbook) : Object.assign(() => null, { hasStaleResult: () => false })
+  ), [workbook])
   const displayValue = useCallback((sheetId: string, address: string) => {
     if (!workbook) return ''
     const sheet = workbook.sheets.find((item) => item.id === sheetId)
@@ -2061,6 +2410,7 @@ export default function App() {
     const cachedResultMatches = !cell.formula || Object.is(value, cell.result)
     return formatScalar(value, cell.numFmt || cell.style?.numFmt, cachedResultMatches ? cell.display : undefined)
   }, [showFormulas, workbook, valueResolver])
+  const staleValue = useCallback((sheetId: string, address: string) => valueResolver.hasStaleResult(sheetId, address), [valueResolver])
 
   const resetHistory = useCallback(() => {
     historyRef.current = []
@@ -2071,11 +2421,10 @@ export default function App() {
   const mutateWorkbook = useCallback((mutator: (next: WorkbookModel) => void) => {
     const current = workbookRef.current
     if (!current) return
-    historyRef.current.push(current)
+    const [next, patches, inversePatches] = produceWithPatches(current, (draft) => { mutator(draft as WorkbookModel) })
+    historyRef.current.push({ patches, inversePatches })
     if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift()
     futureRef.current = []
-    const next = structuredClone(current) as WorkbookModel
-    mutator(next)
     workbookRef.current = next
     setWorkbook(next)
     setDirty(true)
@@ -2103,9 +2452,10 @@ export default function App() {
 
   const undo = useCallback(() => {
     const current = workbookRef.current
-    const previous = historyRef.current.pop()
-    if (!current || !previous) return
-    futureRef.current.push(current)
+    const entry = historyRef.current.pop()
+    if (!current || !entry) return
+    futureRef.current.push(entry)
+    const previous = applyPatches(current, entry.inversePatches)
     workbookRef.current = previous
     setWorkbook(previous)
     setDirty(true)
@@ -2115,9 +2465,10 @@ export default function App() {
 
   const redo = useCallback(() => {
     const current = workbookRef.current
-    const next = futureRef.current.pop()
-    if (!current || !next) return
-    historyRef.current.push(current)
+    const entry = futureRef.current.pop()
+    if (!current || !entry) return
+    historyRef.current.push(entry)
+    const next = applyPatches(current, entry.patches)
     workbookRef.current = next
     setWorkbook(next)
     setDirty(true)
@@ -2126,6 +2477,11 @@ export default function App() {
   }, [])
 
   const canDiscard = useCallback(() => !dirtyRef.current || window.confirm('Discard the unsaved changes in this spreadsheet?'), [])
+
+  const askText = useCallback((request: TextPromptRequest) => new Promise<string | null>((resolve) => {
+    promptIdRef.current += 1
+    setTextPrompt({ ...request, id: promptIdRef.current, resolve })
+  }), [])
 
   const applyPayload = useCallback((payload: WorkbookPayload) => {
     const normalized = normalizeWorkbook(payload.workbook, payload.name)
@@ -2190,11 +2546,7 @@ export default function App() {
     try {
       applyPayload(await window.simpleCalc.openPath(filePath))
     } catch (error) {
-      setRecent((current) => {
-        const next = current.filter((item) => item.path !== filePath)
-        localStorage.setItem(RECENT_KEY, JSON.stringify(next))
-        return next
-      })
+      setRecent((current) => current.filter((item) => item.path !== filePath))
       setToast(errorMessage(error))
     } finally {
       setBusy('')
@@ -2230,7 +2582,7 @@ export default function App() {
     try {
       const result = await window.simpleCalc.saveWorkbook({
         documentId: currentDocument.documentId,
-        workbook: currentWorkbook,
+        workbook: withRecalculatedResults(currentWorkbook),
         saveAs: saveAs || currentDocument.requiresSaveAs || format !== 'xlsx',
         format,
         suggestedName: currentDocument.name,
@@ -2283,6 +2635,32 @@ export default function App() {
     setEditing(null)
   }, [mutateWorkbook])
 
+  useEffect(() => {
+    const pending = formulaBarDirtyRef.current
+    if (pending) {
+      if (pending.sheetId === activeSheet?.id && pending.address === activeAddress) return
+      formulaBarDirtyRef.current = null
+      if (pending.sheetId === activeSheet?.id) commitCell(pending.address, pending.draft)
+    }
+    setFormulaDraft(rawCellValue(activeCell))
+  }, [activeSheet?.id, activeAddress, activeCell, commitCell])
+
+  useEffect(() => {
+    registerRecoverySave(async () => {
+      const currentWorkbook = workbookRef.current
+      const currentDocument = documentRef.current
+      if (!currentWorkbook || !currentDocument) throw new Error('No workbook is open to recover.')
+      return window.simpleCalc.saveWorkbook({
+        documentId: currentDocument.documentId,
+        workbook: withRecalculatedResults(currentWorkbook),
+        saveAs: true,
+        format: 'xlsx',
+        suggestedName: currentDocument.name,
+        sourceUnmodified: false,
+      })
+    })
+  }, [])
+
   const setCellValue = useCallback((address: string, value: CellData['value']) => {
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
@@ -2303,9 +2681,38 @@ export default function App() {
   }, [])
 
   const beginEdit = useCallback((initialDraft?: string) => {
-    if (!activeSheet) return
-    setEditing({ address: activeAddress, draft: initialDraft === undefined ? rawCellValue(activeSheet.cells[activeAddress]) : initialDraft })
-  }, [activeAddress, activeSheet])
+    const current = workbookRef.current
+    const sheet = current?.sheets.find((item) => item.id === current.activeSheetId) || current?.sheets[0]
+    if (!sheet) return
+    const address = addressOf(selectionRef.current.focus)
+    setEditing({ address, draft: initialDraft === undefined ? rawCellValue(sheet.cells[address]) : initialDraft })
+  }, [])
+
+  const handleGridSelection = useCallback((next: Selection) => {
+    setSelection(next)
+    setEditing(null)
+  }, [])
+
+  const closeContextMenu = useCallback(() => setContextMenu(null), [])
+
+  const openGridContextMenu = useCallback((target: GridContextTarget, position: { x: number; y: number }) => {
+    const current = workbookRef.current
+    const sheet = current?.sheets.find((item) => item.id === current.activeSheetId)
+    if (!sheet) return
+    const bounds = selectionBounds(selectionRef.current)
+    if (target.kind === 'cell') {
+      const inside = target.coord.row >= bounds.top && target.coord.row <= bounds.bottom && target.coord.col >= bounds.left && target.coord.col <= bounds.right
+      if (!inside) setSelection({ anchor: target.coord, focus: target.coord })
+    } else if (target.kind === 'row-header') {
+      if (target.coord.row < bounds.top || target.coord.row > bounds.bottom) {
+        setSelection({ anchor: { row: target.coord.row, col: 0 }, focus: { row: target.coord.row, col: Math.max(0, sheet.colCount - 1) } })
+      }
+    } else if (target.coord.col < bounds.left || target.coord.col > bounds.right) {
+      setSelection({ anchor: { row: 0, col: target.coord.col }, focus: { row: Math.max(0, sheet.rowCount - 1), col: target.coord.col } })
+    }
+    setEditing(null)
+    setContextMenu({ kind: target.kind, x: position.x, y: position.y })
+  }, [])
 
   const clearSelection = useCallback(() => {
     const addresses = rangeAddresses(selection)
@@ -2328,10 +2735,9 @@ export default function App() {
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => {
-        const cell = sheet.cells[address] || {}
-        const style = structuredClone(cell.style || {}) as CellStyle
+        const cell = sheet.cells[address] ||= {}
+        const style = cell.style ||= {}
         update(style)
-        sheet.cells[address] = { ...cell, style }
       })
     })
   }, [mutateWorkbook, selection])
@@ -2377,11 +2783,11 @@ export default function App() {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => {
         const coord = coordOf(address)!
-        const cell = sheet.cells[address] || {}
-        const style = structuredClone(cell.style || {}) as CellStyle
+        const cell = sheet.cells[address] ||= {}
+        const style = cell.style ||= {}
         if (preset === 'clear') delete style.border
         else {
-          const border = structuredClone(style.border || {}) as CellBorder
+          const border = style.border ||= {}
           if (preset === 'all') border.top = border.bottom = border.left = border.right = side
           if (preset === 'bottom') border.bottom = side
           if (preset === 'outer') {
@@ -2390,9 +2796,7 @@ export default function App() {
             if (coord.col === bounds.left) border.left = side
             if (coord.col === bounds.right) border.right = side
           }
-          style.border = border
         }
-        sheet.cells[address] = { ...cell, style }
       })
     })
   }, [mutateWorkbook, selection])
@@ -2460,19 +2864,18 @@ export default function App() {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => {
         const coord = coordOf(address)!
-        const cell = sheet.cells[address] || {}
-        const style = structuredClone(cell.style || {}) as CellStyle
+        const cell = sheet.cells[address] ||= {}
+        const style = cell.style ||= {}
         style.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: coord.row === bounds.top ? 'FFDCE9E0' : (coord.row - bounds.top) % 2 ? 'FFF4F7F4' : 'FFFFFFFF' } }
         if (coord.row === bounds.top) style.font = { ...(style.font || {}), bold: true, color: { argb: 'FF294936' } }
-        sheet.cells[address] = { ...cell, style }
       })
     })
   }, [mutateWorkbook, selection])
 
-  const insertLink = useCallback(() => {
+  const insertLink = useCallback(async () => {
     if (!activeSheet) return
     const existing = activeCell?.hyperlink || 'https://'
-    const entered = window.prompt('Link URL or email address:', existing)?.trim()
+    const entered = (await askText({ title: 'Insert link', label: 'Link URL or email address', initialValue: existing }))?.trim()
     if (!entered) return
     const target = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entered) ? `mailto:${entered}` : /^[a-z][a-z0-9+.-]*:/i.test(entered) ? entered : `https://${entered}`
     try {
@@ -2484,17 +2887,22 @@ export default function App() {
     }
     if (activeCell?.formula) { setToast('A formula cell cannot also contain a direct hyperlink.'); return }
     const currentText = activeCell?.value == null ? '' : String(activeCell.value)
-    const text = window.prompt('Text to display:', currentText || entered)
+    const text = await askText({ title: 'Insert link', label: 'Text to display', initialValue: currentText || entered })
     if (text === null) return
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       sheet.cells[activeAddress] = { ...(sheet.cells[activeAddress] || {}), value: text || entered, hyperlink: target, hyperlinkTooltip: target }
     })
-  }, [activeAddress, activeCell, activeSheet, mutateWorkbook])
+  }, [activeAddress, activeCell, activeSheet, askText, mutateWorkbook])
 
-  const editAnnotation = useCallback((kind: 'note' | 'comment') => {
+  const editAnnotation = useCallback(async (kind: 'note' | 'comment') => {
     const current = noteText(activeCell?.note)
-    const value = window.prompt(kind === 'note' ? 'Cell note:' : 'Offline comment (saved as an Excel note):', current)
+    const value = await askText({
+      title: kind === 'note' ? 'Cell note' : 'Offline comment',
+      label: kind === 'note' ? 'Note for the selected cell' : 'Comment for the selected cell (saved as an Excel note)',
+      initialValue: current,
+      multiline: true,
+    })
     if (value === null) return
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
@@ -2504,7 +2912,7 @@ export default function App() {
       if (hasCellContent(cell)) sheet.cells[activeAddress] = cell
       else delete sheet.cells[activeAddress]
     })
-  }, [activeAddress, activeCell?.note, mutateWorkbook])
+  }, [activeAddress, activeCell?.note, askText, mutateWorkbook])
 
   const insertCheckboxes = useCallback(() => {
     const addresses = rangeAddresses(selection)
@@ -2528,8 +2936,8 @@ export default function App() {
     })
   }, [mutateWorkbook, selection])
 
-  const insertDropdown = useCallback(() => {
-    const entered = window.prompt('Dropdown options, separated by commas:', 'Option 1, Option 2')
+  const insertDropdown = useCallback(async () => {
+    const entered = await askText({ title: 'Insert dropdown', label: 'Dropdown options, separated by commas', initialValue: 'Option 1, Option 2' })
     if (entered === null) return
     const options = [...new Set(entered.split(',').map((item) => item.trim()).filter(Boolean))].slice(0, 100)
     if (options.length < 2) { setToast('Enter at least two dropdown options.'); return }
@@ -2554,7 +2962,7 @@ export default function App() {
         sheet.cells[address] = cell
       })
     })
-  }, [mutateWorkbook, selection])
+  }, [askText, mutateWorkbook, selection])
 
   const removeValidation = useCallback(() => {
     const bounds = selectionBounds(selection)
@@ -2592,11 +3000,12 @@ export default function App() {
     if (!current) return
     try {
       const result = applySelectionStructureCommand(current, current.activeSheetId, selection, command)
-      historyRef.current.push(current)
+      const [next, patches, inversePatches] = produceWithPatches(current, (draft) => { Object.assign(draft, result.workbook) })
+      historyRef.current.push({ patches, inversePatches })
       if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift()
       futureRef.current = []
-      workbookRef.current = result.workbook
-      setWorkbook(result.workbook)
+      workbookRef.current = next
+      setWorkbook(next)
       setSelection(result.selection)
       setEditing(null)
       setDirty(true)
@@ -2644,11 +3053,14 @@ export default function App() {
       const internal = internalClipboard.current?.text === text ? internalClipboard.current : null
       const rows = internal ? internal.cells : parseClipboardText(text).map((row) => row.map((value) => parseDraft(value)))
       if (!rows.length) return
+      const width = rows.reduce((max, row) => Math.max(max, row.length), 0)
+      if (rows.length * width > 100_000) { setToast('That clipboard content is too large to paste at once.'); return }
       const origin = selection.focus
       mutateWorkbook((next) => {
         const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
         rows.forEach((rowCells, rowOffset) => rowCells.forEach((sourceCell, colOffset) => {
           const destination = { row: origin.row + rowOffset, col: origin.col + colOffset }
+          if (destination.row > 1_048_575 || destination.col > 16_383) return
           const address = addressOf(destination)
           const cell = structuredClone(sourceCell) as CellData
           if (internal && cell.formula) {
@@ -2666,7 +3078,7 @@ export default function App() {
           sheet.colCount = Math.max(sheet.colCount, destination.col + 1)
         }))
       })
-      setSelection({ anchor: origin, focus: { row: origin.row + rows.length - 1, col: origin.col + Math.max(0, ...rows.map((row) => row.length - 1)) } })
+      setSelection({ anchor: origin, focus: { row: Math.min(1_048_575, origin.row + rows.length - 1), col: Math.min(16_383, origin.col + Math.max(0, width - 1)) } })
     } catch (error) {
       setToast(errorMessage(error))
     }
@@ -2777,6 +3189,64 @@ export default function App() {
     }
   }, [activeSheet, mutateWorkbook, selection])
 
+  const sortSelectionRange = useCallback((direction: 'asc' | 'desc') => {
+    if (!activeSheet) return
+    const selected = selectionBounds(selection)
+    const bounds = selected.top === selected.bottom && selected.left === selected.right
+      ? contiguousRegionBounds(activeSheet, selection.focus)
+      : selected
+    if ((bounds.bottom - bounds.top + 1) * (bounds.right - bounds.left + 1) > 100_000) { setToast('That range is too large to sort at once.'); return }
+    if (bounds.top === bounds.bottom) { setToast('Select a range with at least two rows to sort.'); return }
+    if ((activeSheet.merges || []).some((range) => {
+      const merged = mergeBounds(range)
+      return Boolean(merged && merged.bottom >= bounds.top && merged.top <= bounds.bottom && merged.right >= bounds.left && merged.left <= bounds.right)
+    })) {
+      setToast('Sort is unavailable across merged cells. Unmerge them first.')
+      return
+    }
+    const sourceRows = Array.from({ length: bounds.bottom - bounds.top + 1 }, (_, offset) => bounds.top + offset)
+    const keyByRow = new Map(sourceRows.map((row) => {
+      const address = addressOf({ row, col: bounds.left })
+      const cell = activeSheet.cells[address]
+      const value = cell ? (cell.formula ? valueResolver(activeSheet.id, address) : cell.value) : undefined
+      return [row, value === undefined || value === null || value === '' ? null : value] as const
+    }))
+    const sortedRows = [...sourceRows].sort((a, b) => {
+      const left = keyByRow.get(a) ?? null
+      const right = keyByRow.get(b) ?? null
+      if (left === null || right === null) return left === right ? 0 : left === null ? 1 : -1
+      return direction === 'asc' ? compareCellScalars(left, right) : compareCellScalars(right, left)
+    })
+    if (sortedRows.every((row, index) => row === sourceRows[index])) { setToast('The range is already sorted.'); return }
+    const slices = new Map(sortedRows.map((row) => [row, Array.from({ length: bounds.right - bounds.left + 1 }, (_, offset) => {
+      const cell = activeSheet.cells[addressOf({ row, col: bounds.left + offset })]
+      return cell ? structuredClone(cell) as CellData : undefined
+    })] as const))
+    mutateWorkbook((next) => {
+      const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
+      sortedRows.forEach((sourceRow, index) => {
+        const targetRow = bounds.top + index
+        const cells = slices.get(sourceRow)!
+        cells.forEach((cell, offset) => {
+          const address = addressOf({ row: targetRow, col: bounds.left + offset })
+          if (cell?.formula && targetRow !== sourceRow) {
+            cell.formula = shiftFormulaReferences(cell.formula, targetRow - sourceRow, 0)
+            delete cell.formulaType
+            delete cell.formulaRange
+            delete cell.dynamicFormula
+            delete cell.result
+            delete cell.display
+          }
+          if (cell && hasCellContent(cell)) sheet.cells[address] = cell
+          else delete sheet.cells[address]
+        })
+      })
+    })
+    setSelection({ anchor: { row: bounds.top, col: bounds.left }, focus: { row: bounds.bottom, col: bounds.right } })
+    setEditing(null)
+    setToast(`Sorted ${rangeAddress(bounds)} ${direction === 'asc' ? 'A→Z' : 'Z→A'}`)
+  }, [activeSheet, mutateWorkbook, selection, valueResolver])
+
   const searchMatches = useMemo(() => {
     const query = searchQuery.trim().toLocaleLowerCase()
     if (!activeSheet || !query) return []
@@ -2813,8 +3283,53 @@ export default function App() {
   }, [activeAddress])
   const closeSearch = useCallback(() => {
     setSearchOpen(false)
+    setReplaceOpen(false)
     window.requestAnimationFrame(() => document.querySelector<HTMLElement>('.sheet-viewport')?.focus())
   }, [])
+
+  const openReplace = useCallback(() => {
+    setReplaceOpen(true)
+    openSearch()
+  }, [openSearch])
+
+  const replaceCurrentMatch = useCallback(() => {
+    if (!activeSheet || !searchMatches.length) return
+    const query = searchQuery.trim()
+    if (!query) return
+    const address = searchMatches[searchIndex < 0 ? 0 : Math.min(searchIndex, searchMatches.length - 1)]
+    const cell = activeSheet.cells[address]
+    const draft = cell ? replacementDraft(cell, query, replaceValue) : null
+    if (draft === null) { setToast('That match only appears in a formatted result and cannot be replaced.'); return }
+    searchOriginRef.current = address
+    mutateWorkbook((next) => {
+      const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
+      const updated = parseDraft(draft, sheet.cells[address])
+      if (hasCellContent(updated)) sheet.cells[address] = updated
+      else delete sheet.cells[address]
+    })
+  }, [activeSheet, mutateWorkbook, replaceValue, searchIndex, searchMatches, searchQuery])
+
+  const replaceAllMatches = useCallback(() => {
+    if (!activeSheet || !searchMatches.length) return
+    const query = searchQuery.trim()
+    if (!query) return
+    const updates: Array<{ address: string; draft: string }> = []
+    searchMatches.forEach((address) => {
+      const cell = activeSheet.cells[address]
+      const draft = cell ? replacementDraft(cell, query, replaceValue) : null
+      if (draft !== null) updates.push({ address, draft })
+    })
+    if (!updates.length) { setToast('No replaceable matches on this sheet.'); return }
+    mutateWorkbook((next) => {
+      const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
+      updates.forEach(({ address, draft }) => {
+        const updated = parseDraft(draft, sheet.cells[address])
+        if (hasCellContent(updated)) sheet.cells[address] = updated
+        else delete sheet.cells[address]
+      })
+    })
+    setToast(`Replaced matches in ${updates.length} ${updates.length === 1 ? 'cell' : 'cells'}`)
+  }, [activeSheet, mutateWorkbook, replaceValue, searchMatches, searchQuery])
 
   useEffect(() => {
     if (!searchOpen) return
@@ -2848,15 +3363,15 @@ export default function App() {
     setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
   }, [mutateWorkbook])
 
-  const renameSheet = useCallback((sheetId: string) => {
+  const renameSheet = useCallback(async (sheetId: string) => {
     if (!workbook) return
     const sheet = workbook.sheets.find((item) => item.id === sheetId)
     if (!sheet) return
-    const name = window.prompt('Rename sheet:', sheet.name)?.trim()
+    const name = (await askText({ title: 'Rename sheet', label: 'Sheet name', initialValue: sheet.name }))?.trim()
     if (!name || name === sheet.name) return
     if (workbook.sheets.some((item) => item.id !== sheetId && item.name.toLocaleLowerCase() === name.toLocaleLowerCase())) { setToast('Sheet names must be unique.'); return }
     mutateWorkbook((next) => { next.sheets.find((item) => item.id === sheetId)!.name = name.slice(0, 31) })
-  }, [mutateWorkbook, workbook])
+  }, [askText, mutateWorkbook, workbook])
 
   const deleteActiveSheet = useCallback(() => {
     if (!workbook || workbook.sheets.length <= 1) { setToast('A workbook needs at least one sheet.'); return }
@@ -2871,10 +3386,10 @@ export default function App() {
 
   const duplicateActiveSheet = useCallback(() => {
     if (!activeSheet) return
+    const copy = structuredClone(activeSheet) as SheetData
+    copy.id = makeId()
     mutateWorkbook((next) => {
       const sourceIndex = next.sheets.findIndex((sheet) => sheet.id === next.activeSheetId)
-      const copy = structuredClone(next.sheets[sourceIndex]) as SheetData
-      copy.id = makeId()
       const base = `${copy.name} copy`
       let name = base
       let suffix = 2
@@ -2903,6 +3418,38 @@ export default function App() {
       sheet.views = views
     })
   }, [mutateWorkbook])
+
+  const hideSelectedDimension = useCallback((axis: 'rows' | 'columns') => {
+    const bounds = selectionBounds(selection)
+    const start = axis === 'rows' ? bounds.top : bounds.left
+    const end = axis === 'rows' ? bounds.bottom : bounds.right
+    mutateWorkbook((next) => {
+      const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
+      const hidden = new Set((axis === 'rows' ? sheet.hiddenRows : sheet.hiddenCols) || [])
+      for (let index = start; index <= end; index += 1) hidden.add(index + 1)
+      const sorted = [...hidden].sort((a, b) => a - b)
+      if (axis === 'rows') sheet.hiddenRows = sorted
+      else sheet.hiddenCols = sorted
+    })
+  }, [mutateWorkbook, selection])
+
+  const unhideNearSelection = useCallback((axis: 'rows' | 'columns') => {
+    const bounds = selectionBounds(selection)
+    const start = axis === 'rows' ? bounds.top : bounds.left
+    const end = axis === 'rows' ? bounds.bottom : bounds.right
+    const hidden = new Set(((axis === 'rows' ? activeSheet?.hiddenRows : activeSheet?.hiddenCols) || []).map((value) => Number(value) - 1))
+    const reveal = new Set<number>()
+    hidden.forEach((index) => { if (index >= start && index <= end) reveal.add(index) })
+    for (let index = start - 1; hidden.has(index); index -= 1) reveal.add(index)
+    for (let index = end + 1; hidden.has(index); index += 1) reveal.add(index)
+    if (!reveal.size) { setToast(`No hidden ${axis} touch the selection.`); return }
+    mutateWorkbook((next) => {
+      const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
+      const kept = ((axis === 'rows' ? sheet.hiddenRows : sheet.hiddenCols) || []).filter((value) => !reveal.has(Number(value) - 1))
+      if (axis === 'rows') sheet.hiddenRows = kept
+      else sheet.hiddenCols = kept
+    })
+  }, [activeSheet, mutateWorkbook, selection])
 
   const hideActiveSheet = useCallback(() => {
     if (!workbook || !activeSheet) return
@@ -2939,9 +3486,29 @@ export default function App() {
     return () => document.removeEventListener('fullscreenchange', update)
   }, [])
 
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setStatsSelection(selection), 120)
+    return () => window.clearTimeout(timeout)
+  }, [selection])
+
+  useEffect(() => {
+    const press = (event: globalThis.PointerEvent) => { if (event.button === 0) setPointerDown(true) }
+    const release = () => setPointerDown(false)
+    window.addEventListener('pointerdown', press)
+    window.addEventListener('pointerup', release)
+    window.addEventListener('pointercancel', release)
+    window.addEventListener('blur', release)
+    return () => {
+      window.removeEventListener('pointerdown', press)
+      window.removeEventListener('pointerup', release)
+      window.removeEventListener('pointercancel', release)
+      window.removeEventListener('blur', release)
+    }
+  }, [])
+
   const selectionStats = useMemo(() => {
     if (!activeSheet) return { selected: 0, count: 0, numeric: 0, sum: 0, average: 0, minimum: 0, maximum: 0, numFmt: undefined as string | undefined }
-    const bounds = selectionBounds(selection)
+    const bounds = selectionBounds(statsSelection)
     const selected = (bounds.bottom - bounds.top + 1) * (bounds.right - bounds.left + 1)
     let count = 0
     let numeric = 0
@@ -2971,7 +3538,7 @@ export default function App() {
           includeCell(address, activeSheet.cells[address])
         }
       }
-    } else {
+    } else if (!pointerDown) {
       Object.entries(activeSheet.cells).forEach(([address, cell]) => {
         const coord = coordOf(address)
         if (!coord || coord.row < bounds.top || coord.row > bounds.bottom || coord.col < bounds.left || coord.col > bounds.right) return
@@ -2988,7 +3555,7 @@ export default function App() {
       maximum: numeric ? maximum : 0,
       numFmt: mixedNumFmt ? undefined : commonNumFmt,
     }
-  }, [activeSheet, selection, valueResolver])
+  }, [activeSheet, pointerDown, statsSelection, valueResolver])
 
   const aggregateValue = aggregateMode === 'count'
     ? selectionStats.count
@@ -3010,16 +3577,59 @@ export default function App() {
 
   const moveSelection = useCallback((rowDelta: number, colDelta: number, extend = false) => {
     const next = {
-      row: clamp(selection.focus.row + rowDelta, 0, 1_048_575),
-      col: clamp(selection.focus.col + colDelta, 0, 16_383),
+      row: stepPastHidden(selection.focus.row, rowDelta, 1_048_575, hiddenRowSet),
+      col: stepPastHidden(selection.focus.col, colDelta, 16_383, hiddenColSet),
     }
     setSelection((current) => ({ anchor: extend ? current.anchor : next, focus: next }))
-  }, [selection.focus.col, selection.focus.row])
+  }, [hiddenColSet, hiddenRowSet, selection.focus.col, selection.focus.row])
+
+  const jumpSelection = useCallback((rowDelta: number, colDelta: number, extend = false) => {
+    if (!activeSheet) return
+    const next = edgeJumpCoord(activeSheet, selection.focus, rowDelta, colDelta, rowDelta !== 0 ? hiddenRowSet : hiddenColSet)
+    setSelection((current) => ({ anchor: extend ? current.anchor : next, focus: next }))
+  }, [activeSheet, hiddenColSet, hiddenRowSet, selection.focus])
+
+  const commitNameBox = useCallback((raw: string) => {
+    const sheet = activeSheet
+    const parts = raw.trim().split(':')
+    const start = coordOf(parts[0] || '')
+    const end = parts.length === 2 ? coordOf(parts[1] || '') : start
+    if (!sheet || parts.length > 2 || !start || !end || Math.min(start.row, end.row) < 0) {
+      setNameBoxInvalid(true)
+      return false
+    }
+    const maxRow = clamp(Math.max(DEFAULT_ROWS, sheet.rowCount + 25), DEFAULT_ROWS, 1_048_576) - 1
+    const maxCol = clamp(Math.max(DEFAULT_COLS, sheet.colCount + 8), DEFAULT_COLS, 16_384) - 1
+    setSelection({
+      anchor: { row: clamp(start.row, 0, maxRow), col: clamp(start.col, 0, maxCol) },
+      focus: { row: clamp(end.row, 0, maxRow), col: clamp(end.col, 0, maxCol) },
+    })
+    setEditing(null)
+    setNameBoxDraft(null)
+    setNameBoxInvalid(false)
+    return true
+  }, [activeSheet])
+
+  useEffect(() => {
+    if (!nameBoxInvalid) return
+    const timeout = window.setTimeout(() => setNameBoxInvalid(false), 700)
+    return () => window.clearTimeout(timeout)
+  }, [nameBoxInvalid])
 
   const handleGridKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
     if (editing) return
     const control = event.ctrlKey || event.metaKey
     if (event.altKey && event.key === 'Enter' && activeCell?.hyperlink) { event.preventDefault(); openHyperlink(activeCell.hyperlink); return }
+    if (event.key === ' ' && (control || event.shiftKey)) {
+      event.preventDefault()
+      const bounds = selectionBounds(selection)
+      const lastRow = Math.max(0, (activeSheet?.rowCount || 1) - 1)
+      const lastCol = Math.max(0, (activeSheet?.colCount || 1) - 1)
+      if (control && event.shiftKey) setSelection({ anchor: { row: 0, col: 0 }, focus: { row: lastRow, col: lastCol } })
+      else if (event.shiftKey) setSelection({ anchor: { row: bounds.top, col: 0 }, focus: { row: bounds.bottom, col: lastCol } })
+      else setSelection({ anchor: { row: 0, col: bounds.left }, focus: { row: lastRow, col: bounds.right } })
+      return
+    }
     if (event.key === ' ' && activeSheet && activeCell) {
       const options = validationListOptions(validationForCell(activeSheet, activeAddress))
       const checkbox = activeCell.type === 'checkbox' || (options[0]?.toLocaleUpperCase() === 'TRUE' && options[1]?.toLocaleUpperCase() === 'FALSE')
@@ -3035,16 +3645,50 @@ export default function App() {
       setSelection({ anchor: { row: 0, col: 0 }, focus: { row: Math.max(0, (activeSheet?.rowCount || 1) - 1), col: Math.max(0, (activeSheet?.colCount || 1) - 1) } })
       return
     }
+    if (control && event.key === 'Home') {
+      event.preventDefault()
+      const home = {
+        row: hiddenRowSet.has(0) ? stepPastHidden(0, 1, 1_048_575, hiddenRowSet) : 0,
+        col: hiddenColSet.has(0) ? stepPastHidden(0, 1, 16_383, hiddenColSet) : 0,
+      }
+      setSelection((current) => ({ anchor: event.shiftKey ? current.anchor : home, focus: home }))
+      return
+    }
+    if (control && event.key === 'End') {
+      event.preventDefault()
+      const last = { row: 0, col: 0 }
+      Object.keys(activeSheet?.cells || {}).forEach((address) => {
+        const coord = coordOf(address)
+        if (!coord) return
+        last.row = Math.max(last.row, coord.row)
+        last.col = Math.max(last.col, coord.col)
+      })
+      setSelection((current) => ({ anchor: event.shiftKey ? current.anchor : last, focus: last }))
+      return
+    }
+    if (event.key === 'PageUp' || event.key === 'PageDown') {
+      event.preventDefault()
+      const direction = event.key === 'PageDown' ? 1 : -1
+      const importedDefaults = Boolean(workbookRef.current?.metadata?.sourceName)
+      if (event.altKey) {
+        const pageColumns = Math.max(1, Math.floor((event.currentTarget.clientWidth - HEADER_WIDTH) / ((importedDefaults ? IMPORTED_COL_WIDTH : DEFAULT_COL_WIDTH) * zoom)))
+        moveSelection(0, direction * pageColumns, event.shiftKey)
+      } else {
+        const pageRows = Math.max(1, Math.floor((event.currentTarget.clientHeight - HEADER_HEIGHT) / ((importedDefaults ? IMPORTED_ROW_HEIGHT : DEFAULT_ROW_HEIGHT) * zoom)))
+        moveSelection(direction * pageRows, 0, event.shiftKey)
+      }
+      return
+    }
     if (event.key === 'F2') { event.preventDefault(); beginEdit(); return }
     if (event.key === 'Enter') { event.preventDefault(); beginEdit(); return }
     if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); clearSelection(); return }
-    if (event.key === 'ArrowUp') { event.preventDefault(); moveSelection(-1, 0, event.shiftKey); return }
-    if (event.key === 'ArrowDown') { event.preventDefault(); moveSelection(1, 0, event.shiftKey); return }
-    if (event.key === 'ArrowLeft') { event.preventDefault(); moveSelection(0, -1, event.shiftKey); return }
-    if (event.key === 'ArrowRight') { event.preventDefault(); moveSelection(0, 1, event.shiftKey); return }
+    if (event.key === 'ArrowUp') { event.preventDefault(); if (control) jumpSelection(-1, 0, event.shiftKey); else moveSelection(-1, 0, event.shiftKey); return }
+    if (event.key === 'ArrowDown') { event.preventDefault(); if (control) jumpSelection(1, 0, event.shiftKey); else moveSelection(1, 0, event.shiftKey); return }
+    if (event.key === 'ArrowLeft') { event.preventDefault(); if (control) jumpSelection(0, -1, event.shiftKey); else moveSelection(0, -1, event.shiftKey); return }
+    if (event.key === 'ArrowRight') { event.preventDefault(); if (control) jumpSelection(0, 1, event.shiftKey); else moveSelection(0, 1, event.shiftKey); return }
     if (event.key === 'Tab') { event.preventDefault(); moveSelection(0, event.shiftKey ? -1 : 1); return }
     if (!control && !event.altKey && event.key.length === 1) { event.preventDefault(); beginEdit(event.key) }
-  }, [activeAddress, activeCell, activeSheet, beginEdit, clearSelection, copySelection, editing, fillSelectedRange, moveSelection, openHyperlink, pasteSelection, setCellValue])
+  }, [activeAddress, activeCell, activeSheet, beginEdit, clearSelection, copySelection, editing, fillSelectedRange, hiddenColSet, hiddenRowSet, jumpSelection, moveSelection, openHyperlink, pasteSelection, selection, setCellValue, zoom])
 
   useEffect(() => {
     const handleKey = (event: globalThis.KeyboardEvent) => {
@@ -3055,27 +3699,24 @@ export default function App() {
       if (control && event.key.toLocaleLowerCase() === 'z' && !typing) { event.preventDefault(); undo(); return }
       if (control && event.key.toLocaleLowerCase() === 'y' && !typing) { event.preventDefault(); redo(); return }
       if (control && event.key.toLocaleLowerCase() === 'f') { event.preventDefault(); openSearch(); return }
-      if (control && event.key.toLocaleLowerCase() === 'k' && !typing) { event.preventDefault(); insertLink(); return }
+      if (control && event.key.toLocaleLowerCase() === 'h') { event.preventDefault(); openReplace(); return }
+      if (control && event.key.toLocaleLowerCase() === 'k' && !typing) { event.preventDefault(); void insertLink(); return }
       if (control && (event.key === '`' || event.key === '~') && !typing) { event.preventDefault(); setShowFormulas((value) => !value); return }
       if (control && event.key === '\\' && !typing) { event.preventDefault(); clearFormatting(); return }
       if (control && event.key.toLocaleLowerCase() === 'b' && !typing) { event.preventDefault(); applyStyle((style) => { style.font = { ...(style.font || {}), bold: !activeCell?.style?.font?.bold } }); return }
       if (control && event.key.toLocaleLowerCase() === 'i' && !typing) { event.preventDefault(); applyStyle((style) => { style.font = { ...(style.font || {}), italic: !activeCell?.style?.font?.italic } }); return }
       if (control && event.key.toLocaleLowerCase() === 'u' && !typing) { event.preventDefault(); applyStyle((style) => { style.font = { ...(style.font || {}), underline: !activeCell?.style?.font?.underline } }); return }
       if (event.altKey && event.shiftKey && event.key === '5' && !typing) { event.preventDefault(); applyStyle((style) => { style.font = { ...(style.font || {}), strike: !activeCell?.style?.font?.strike } }); return }
-      if (event.ctrlKey && event.altKey && event.key.toLocaleLowerCase() === 'm' && !typing) { event.preventDefault(); editAnnotation('comment'); return }
-      if (event.shiftKey && event.key === 'F2' && !typing) { event.preventDefault(); editAnnotation('note'); return }
+      if (event.ctrlKey && event.altKey && event.key.toLocaleLowerCase() === 'm' && !typing) { event.preventDefault(); void editAnnotation('comment'); return }
+      if (event.shiftKey && event.key === 'F2' && !typing) { event.preventDefault(); void editAnnotation('note'); return }
       if (event.shiftKey && event.key === 'F11' && !typing) { event.preventDefault(); addSheet(); return }
     }
     window.addEventListener('keydown', handleKey)
     return () => window.removeEventListener('keydown', handleKey)
-  }, [activeCell, addSheet, applyStyle, clearFormatting, editAnnotation, insertLink, openSearch, openWorkbook, redo, saveWorkbook, undo])
+  }, [activeCell, addSheet, applyStyle, clearFormatting, editAnnotation, insertLink, openReplace, openSearch, openWorkbook, redo, saveWorkbook, undo])
 
   const removeRecent = useCallback((filePath: string) => {
-    setRecent((current) => {
-      const next = current.filter((item) => item.path !== filePath)
-      localStorage.setItem(RECENT_KEY, JSON.stringify(next))
-      return next
-    })
+    setRecent((current) => current.filter((item) => item.path !== filePath))
   }, [])
 
   const titleBar = <TitleBar fileName={documentFile?.name} dirty={dirty} onClose={closeWindow} />
@@ -3165,11 +3806,11 @@ export default function App() {
         {
           id: 'insert-function', label: 'Function', separatorBefore: true, icon: <FunctionSquare size={13} />, children: ['SUM', 'AVERAGE', 'COUNT', 'COUNTA', 'MIN', 'MAX', 'IF'].map((name) => ({ id: `function-${name.toLocaleLowerCase()}`, label: name, action: () => insertFunction(name) })),
         },
-        { id: 'insert-link', label: 'Link', shortcut: 'Ctrl+K', icon: <Link size={13} />, action: insertLink },
+        { id: 'insert-link', label: 'Link', shortcut: 'Ctrl+K', icon: <Link size={13} />, action: () => { void insertLink() } },
         { id: 'insert-checkbox', label: 'Checkbox', separatorBefore: true, icon: <CheckSquare size={13} />, action: insertCheckboxes },
-        { id: 'insert-dropdown', label: 'Dropdown', icon: <ListPlus size={13} />, action: insertDropdown },
-        { id: 'insert-comment', label: 'Comment', shortcut: 'Ctrl+Alt+M', separatorBefore: true, icon: <MessageSquarePlus size={13} />, action: () => editAnnotation('comment') },
-        { id: 'insert-note', label: 'Note', shortcut: 'Shift+F2', icon: <StickyNote size={13} />, action: () => editAnnotation('note') },
+        { id: 'insert-dropdown', label: 'Dropdown', icon: <ListPlus size={13} />, action: () => { void insertDropdown() } },
+        { id: 'insert-comment', label: 'Comment', shortcut: 'Ctrl+Alt+M', separatorBefore: true, icon: <MessageSquarePlus size={13} />, action: () => { void editAnnotation('comment') } },
+        { id: 'insert-note', label: 'Note', shortcut: 'Shift+F2', icon: <StickyNote size={13} />, action: () => { void editAnnotation('note') } },
       ],
     },
     {
@@ -3239,6 +3880,14 @@ export default function App() {
             { id: 'borders-clear', label: 'Clear borders', action: () => setBorderPreset('clear'), separatorBefore: true },
           ],
         },
+        {
+          id: 'format-hide', label: 'Hide & unhide', separatorBefore: true, icon: <EyeOff size={13} />, children: [
+            { id: 'hide-rows', label: selectedRowCount === 1 ? `Hide row ${bounds.top + 1}` : `Hide rows ${bounds.top + 1}–${bounds.bottom + 1}`, action: () => hideSelectedDimension('rows') },
+            { id: 'hide-columns', label: selectedColumnCount === 1 ? `Hide column ${columnName(bounds.left)}` : `Hide columns ${columnName(bounds.left)}–${columnName(bounds.right)}`, action: () => hideSelectedDimension('columns') },
+            { id: 'unhide-rows', label: 'Unhide rows near selection', separatorBefore: true, disabled: !(activeSheet.hiddenRows || []).length, action: () => unhideNearSelection('rows') },
+            { id: 'unhide-columns', label: 'Unhide columns near selection', disabled: !(activeSheet.hiddenCols || []).length, action: () => unhideNearSelection('columns') },
+          ],
+        },
         { id: 'format-alternating', label: 'Alternating colors', separatorBefore: true, action: applyAlternatingColors },
         { id: 'format-clear', label: 'Clear formatting', shortcut: 'Ctrl+\\', icon: <Eraser size={13} />, action: clearFormatting },
       ],
@@ -3247,8 +3896,10 @@ export default function App() {
       id: 'data',
       label: 'Data',
       items: [
-        { id: 'data-checkbox', label: 'Add checkbox validation', icon: <CheckSquare size={13} />, action: insertCheckboxes },
-        { id: 'data-dropdown', label: 'Add dropdown validation', icon: <ListPlus size={13} />, action: insertDropdown },
+        { id: 'data-sort-asc', label: 'Sort range A→Z', icon: <ArrowDownAZ size={13} />, action: () => sortSelectionRange('asc') },
+        { id: 'data-sort-desc', label: 'Sort range Z→A', icon: <ArrowUpZA size={13} />, action: () => sortSelectionRange('desc') },
+        { id: 'data-checkbox', label: 'Add checkbox validation', separatorBefore: true, icon: <CheckSquare size={13} />, action: insertCheckboxes },
+        { id: 'data-dropdown', label: 'Add dropdown validation', icon: <ListPlus size={13} />, action: () => { void insertDropdown() } },
         { id: 'data-remove-validation', label: 'Remove validation', separatorBefore: true, action: removeValidation },
       ],
     },
@@ -3257,10 +3908,71 @@ export default function App() {
       label: 'Tools',
       items: [
         { id: 'tools-find', label: 'Find in this sheet', shortcut: 'Ctrl+F', icon: <Search size={13} />, action: openSearch },
+        { id: 'tools-replace', label: 'Find and replace', shortcut: 'Ctrl+H', icon: <Replace size={13} />, action: openReplace },
         { id: 'tools-show-formulas', label: 'Show formulas', shortcut: 'Ctrl+~', checked: showFormulas, icon: <FunctionSquare size={13} />, action: () => setShowFormulas((value) => !value) },
       ],
     },
   ]
+  const contextMenuItems: SpreadsheetMenuItem[] = (() => {
+    if (!contextMenu) return []
+    if (contextMenu.kind === 'sheet-tab') {
+      const sheetId = contextMenu.sheetId || workbook.activeSheetId
+      return [
+        { id: 'context-rename-sheet', label: 'Rename sheet', icon: <Pencil size={13} />, action: () => { void renameSheet(sheetId) } },
+        { id: 'context-duplicate-sheet', label: 'Duplicate sheet', icon: <Copy size={13} />, action: duplicateActiveSheet },
+        { id: 'context-hide-sheet', label: 'Hide sheet', icon: <EyeOff size={13} />, action: hideActiveSheet },
+        { id: 'context-delete-sheet', label: 'Delete sheet', separatorBefore: true, icon: <Trash2 size={13} />, action: deleteActiveSheet },
+      ]
+    }
+    const clipboardItems: SpreadsheetMenuItem[] = [
+      { id: 'context-cut', label: 'Cut', shortcut: 'Ctrl+X', icon: <Scissors size={13} />, action: () => { void copySelection().then(clearSelection) } },
+      { id: 'context-copy', label: 'Copy', shortcut: 'Ctrl+C', icon: <Copy size={13} />, action: () => { void copySelection() } },
+      { id: 'context-paste', label: 'Paste', shortcut: 'Ctrl+V', icon: <ClipboardPaste size={13} />, action: () => { void pasteSelection() } },
+      { id: 'context-clear', label: 'Clear contents', shortcut: 'Delete', icon: <Eraser size={13} />, action: clearSelection },
+    ]
+    const sortItems: SpreadsheetMenuItem[] = [
+      { id: 'context-sort-asc', label: 'Sort range A→Z', separatorBefore: true, icon: <ArrowDownAZ size={13} />, action: () => sortSelectionRange('asc') },
+      { id: 'context-sort-desc', label: 'Sort range Z→A', icon: <ArrowUpZA size={13} />, action: () => sortSelectionRange('desc') },
+    ]
+    const insertRowItems: SpreadsheetMenuItem[] = [
+      { id: 'context-insert-rows-above', label: `Insert ${selectedRowCount === 1 ? 'row' : `${selectedRowCount} rows`} above`, separatorBefore: true, icon: <Rows3 size={13} />, action: () => applyStructureCommand('insert-rows-above') },
+      { id: 'context-insert-rows-below', label: `Insert ${selectedRowCount === 1 ? 'row' : `${selectedRowCount} rows`} below`, action: () => applyStructureCommand('insert-rows-below') },
+    ]
+    const insertColumnItems: SpreadsheetMenuItem[] = [
+      { id: 'context-insert-columns-left', label: `Insert ${selectedColumnCount === 1 ? 'column' : `${selectedColumnCount} columns`} left`, separatorBefore: contextMenu.kind === 'column-header', icon: <Columns3 size={13} />, action: () => applyStructureCommand('insert-columns-left') },
+      { id: 'context-insert-columns-right', label: `Insert ${selectedColumnCount === 1 ? 'column' : `${selectedColumnCount} columns`} right`, action: () => applyStructureCommand('insert-columns-right') },
+    ]
+    const deleteRowItem: SpreadsheetMenuItem = { id: 'context-delete-rows', label: `Delete selected ${selectedRowCount === 1 ? 'row' : 'rows'}`, separatorBefore: true, icon: <Trash2 size={13} />, action: () => applyStructureCommand('delete-rows') }
+    const deleteColumnItem: SpreadsheetMenuItem = { id: 'context-delete-columns', label: `Delete selected ${selectedColumnCount === 1 ? 'column' : 'columns'}`, icon: <Trash2 size={13} />, action: () => applyStructureCommand('delete-columns') }
+    if (contextMenu.kind === 'row-header') {
+      return [
+        ...clipboardItems,
+        ...insertRowItems,
+        deleteRowItem,
+        { id: 'context-hide-rows', label: selectedRowCount === 1 ? `Hide row ${bounds.top + 1}` : `Hide rows ${bounds.top + 1}–${bounds.bottom + 1}`, separatorBefore: true, icon: <EyeOff size={13} />, action: () => hideSelectedDimension('rows') },
+        { id: 'context-unhide-rows', label: 'Unhide rows near selection', disabled: !(activeSheet.hiddenRows || []).length, action: () => unhideNearSelection('rows') },
+        ...sortItems,
+      ]
+    }
+    if (contextMenu.kind === 'column-header') {
+      return [
+        ...clipboardItems,
+        ...insertColumnItems,
+        { ...deleteColumnItem, separatorBefore: true },
+        { id: 'context-hide-columns', label: selectedColumnCount === 1 ? `Hide column ${columnName(bounds.left)}` : `Hide columns ${columnName(bounds.left)}–${columnName(bounds.right)}`, separatorBefore: true, icon: <EyeOff size={13} />, action: () => hideSelectedDimension('columns') },
+        { id: 'context-unhide-columns', label: 'Unhide columns near selection', disabled: !(activeSheet.hiddenCols || []).length, action: () => unhideNearSelection('columns') },
+        ...sortItems,
+      ]
+    }
+    return [
+      ...clipboardItems,
+      ...insertRowItems,
+      ...insertColumnItems,
+      deleteRowItem,
+      deleteColumnItem,
+      ...sortItems,
+    ]
+  })()
   return (
     <div className={`app-root workbook-app${immersive ? ' is-fullscreen' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
       {titleBar}
@@ -3364,8 +4076,8 @@ export default function App() {
               <option value="0">None</option><option value="45">Tilt up</option><option value="-45">Tilt down</option><option value="vertical">Vertical</option>
             </select>
           </label>
-          <IconButton label="Insert link (Ctrl+K)" onClick={insertLink}><Link size={15} /></IconButton>
-          <IconButton label="Add note (Shift+F2)" onClick={() => editAnnotation('note')}><StickyNote size={15} /></IconButton>
+          <IconButton label="Insert link (Ctrl+K)" onClick={() => { void insertLink() }}><Link size={15} /></IconButton>
+          <IconButton label="Add note (Shift+F2)" onClick={() => { void editAnnotation('note') }}><StickyNote size={15} /></IconButton>
           <label className="toolbar-icon-select" title="Insert function">
             <Sigma size={15} />
             <select aria-label="Insert function" value="" onChange={(event) => { if (event.target.value) insertFunction(event.target.value); event.target.value = '' }}>
@@ -3387,22 +4099,50 @@ export default function App() {
       )}
 
       {(showFormulaBar || searchOpen) && <div className={`formula-bar${showFormulaBar ? '' : ' is-search-only'}`}>
-        <div className="name-box">{activeAddress}</div>
+        <input
+          className={`name-box${nameBoxInvalid ? ' is-invalid' : ''}`}
+          aria-label="Name box"
+          spellCheck={false}
+          value={nameBoxDraft ?? rangeAddress(bounds)}
+          onChange={(event) => setNameBoxDraft(event.target.value)}
+          onFocus={(event) => event.currentTarget.select()}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault()
+              if (commitNameBox(event.currentTarget.value)) document.querySelector<HTMLElement>('.sheet-viewport')?.focus()
+            } else if (event.key === 'Escape') {
+              event.preventDefault()
+              setNameBoxDraft(null)
+              setNameBoxInvalid(false)
+              event.currentTarget.blur()
+            }
+          }}
+          onBlur={() => setNameBoxDraft(null)}
+        />
         <Sigma size={14} />
         <input
           aria-label="Formula bar"
           value={formulaDraft}
-          onChange={(event) => setFormulaDraft(event.target.value)}
+          onChange={(event) => {
+            setFormulaDraft(event.target.value)
+            formulaBarDirtyRef.current = { sheetId: activeSheet.id, address: activeAddress, draft: event.target.value }
+          }}
           onKeyDown={(event) => {
-            if (event.key === 'Enter') { event.preventDefault(); commitCell(activeAddress, formulaDraft); (event.currentTarget as HTMLInputElement).blur() }
-            else if (event.key === 'Escape') { setFormulaDraft(rawCellValue(activeCell)); (event.currentTarget as HTMLInputElement).blur() }
+            if (event.key === 'Enter') { event.preventDefault(); formulaBarDirtyRef.current = null; commitCell(activeAddress, formulaDraft); moveSelection(event.shiftKey ? -1 : 1, 0); document.querySelector<HTMLElement>('.sheet-viewport')?.focus() }
+            else if (event.key === 'Escape') { formulaBarDirtyRef.current = null; setFormulaDraft(rawCellValue(activeCell)); (event.currentTarget as HTMLInputElement).blur() }
+          }}
+          onBlur={() => {
+            const pending = formulaBarDirtyRef.current
+            if (!pending) return
+            formulaBarDirtyRef.current = null
+            if (pending.sheetId === workbookRef.current?.activeSheetId) commitCell(pending.address, pending.draft)
           }}
         />
         {searchOpen && (
           <div
-            className="search-panel"
+            className={`search-panel${replaceOpen ? ' has-replace' : ''}`}
             role="search"
-            aria-label="Find in this sheet"
+            aria-label={replaceOpen ? 'Find and replace in this sheet' : 'Find in this sheet'}
             onKeyDown={(event) => {
               if (event.key === 'Escape') { event.preventDefault(); closeSearch() }
             }}
@@ -3423,7 +4163,23 @@ export default function App() {
             </span>
             <button type="button" aria-label="Previous match" title="Previous match (Shift+Enter)" disabled={!searchMatches.length} onClick={() => moveSearch(-1)}>↑</button>
             <button type="button" aria-label="Next match" title="Next match (Enter)" disabled={!searchMatches.length} onClick={() => moveSearch(1)}>↓</button>
+            <button type="button" className={replaceOpen ? 'is-active' : undefined} aria-label="Toggle replace" aria-pressed={replaceOpen} title="Replace (Ctrl+H)" onClick={() => setReplaceOpen((value) => !value)}><Replace size={13} /></button>
             <button type="button" aria-label="Close find" title="Close (Esc)" onClick={closeSearch}><X size={13} /></button>
+            {replaceOpen && (
+              <div className="search-replace-row">
+                <input
+                  aria-label="Replace with"
+                  placeholder="Replace with"
+                  value={replaceValue}
+                  onChange={(event) => setReplaceValue(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') { event.preventDefault(); replaceCurrentMatch() }
+                  }}
+                />
+                <button type="button" disabled={!searchMatches.length} onClick={replaceCurrentMatch}>Replace</button>
+                <button type="button" disabled={!searchMatches.length} onClick={replaceAllMatches}>Replace all</button>
+              </div>
+            )}
           </div>
         )}
       </div>}
@@ -3437,10 +4193,17 @@ export default function App() {
         showGridlines={gridlinesVisible}
         showNotes={showNotes}
         displayValue={displayValue}
-        onSelection={(next) => { setSelection(next); if (editing) setEditing(null) }}
+        staleValue={staleValue}
+        onSelection={handleGridSelection}
         onBeginEdit={beginEdit}
         onDraft={(draft) => setEditing((current) => current ? { ...current, draft } : current)}
-        onCommitEdit={() => { if (editing) commitCell(editing.address, editing.draft) }}
+        onCommitEdit={(direction) => {
+          if (editing) commitCell(editing.address, editing.draft)
+          if (direction === 'down') moveSelection(1, 0)
+          else if (direction === 'up') moveSelection(-1, 0)
+          else if (direction === 'right') moveSelection(0, 1)
+          else if (direction === 'left') moveSelection(0, -1)
+        }}
         onCancelEdit={() => setEditing(null)}
         onFill={autofillSelection}
         onCellValue={setCellValue}
@@ -3449,6 +4212,7 @@ export default function App() {
         onRowResize={resizeRow}
         onFreeze={setFreeze}
         onKeyDown={handleGridKeyDown}
+        onContextTarget={openGridContextMenu}
       />
 
       <div className="sheet-strip">
@@ -3466,7 +4230,16 @@ export default function App() {
                 setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
                 setEditing(null)
               }}
-              onDoubleClick={() => renameSheet(sheet.id)}
+              onDoubleClick={() => { void renameSheet(sheet.id) }}
+              onContextMenu={(event) => {
+                event.preventDefault()
+                if (workbook.activeSheetId !== sheet.id) {
+                  setWorkbook((current) => current ? { ...current, activeSheetId: sheet.id } : current)
+                  setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+                  setEditing(null)
+                }
+                setContextMenu({ kind: 'sheet-tab', sheetId: sheet.id, x: event.clientX, y: event.clientY })
+              }}
               title="Double-click to rename"
             >{sheet.name}</button>
           ))}
@@ -3502,6 +4275,16 @@ export default function App() {
         </div>
       </footer>
 
+      {contextMenu && (
+        <SpreadsheetContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={contextMenu.kind === 'sheet-tab' ? 'Sheet menu' : contextMenu.kind === 'row-header' ? 'Row menu' : contextMenu.kind === 'column-header' ? 'Column menu' : 'Cell menu'}
+          items={contextMenuItems}
+          onClose={closeContextMenu}
+        />
+      )}
+      {textPrompt && <TextPromptDialog key={textPrompt.id} request={textPrompt} onClose={(value) => { setTextPrompt(null); textPrompt.resolve(value) }} />}
       {busy && <div className="busy-overlay"><div className="busy-card"><span className="spinner" />{busy}</div></div>}
       {toast && <div className="toast"><span>{toast}</span><button type="button" aria-label="Dismiss" onClick={() => setToast('')}><X size={13} /></button></div>}
       <span className="history-signal" aria-hidden="true">{historyTick}</span>

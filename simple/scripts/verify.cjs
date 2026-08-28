@@ -52,6 +52,13 @@ function sourceFingerprint(sourceRoot) {
   return hash.digest('hex')
 }
 
+function sourceExtensionSet(relativeSourcePath) {
+  const source = fs.readFileSync(path.join(WORKSPACE, relativeSourcePath), 'utf8')
+  const declaration = /SUPPORTED_EXTENSIONS = new Set\(\[([\s\S]*?)\]\)/.exec(source)
+  assert.ok(declaration, `${relativeSourcePath} must declare SUPPORTED_EXTENSIONS.`)
+  return new Set(declaration[1].match(/\.[a-z0-9]+/g) || [])
+}
+
 assert.equal(modeForPath('Report.DOCX'), 'docs')
 assert.equal(modeForPath('archive.PDF'), 'pdf')
 assert.equal(modeForPath('photo.JPEG'), 'image')
@@ -65,6 +72,7 @@ assert.equal(modeForPath('README'), null)
 assert.equal(explicitMode(['--simple-mode=CALC']), 'calc')
 assert.equal(explicitMode(['--anything']), null)
 assert.deepEqual(supportedPaths(['simple.exe', 'a.docx', 'b.xlsx', 'a.docx', '--flag']), ['a.docx', 'b.xlsx'])
+assert.deepEqual(supportedPaths(['--inspect=trap.pdf', '-trap.png', 'real.pdf']), ['real.pdf'])
 assert.deepEqual([...groupPathsByMode(['a.docx', 'b.xlsx', 'c.pdf']).keys()], ['docs', 'calc', 'pdf'])
 
 const flattened = Object.values(EXTENSIONS_BY_MODE).flat()
@@ -75,6 +83,15 @@ const imageSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.image,
 const videoSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.video, 'electron', 'routing.cjs')).SUPPORTED_EXTENSIONS
 assert.deepEqual(new Set(imageSourceExtensions), new Set(EXTENSIONS_BY_MODE.image), 'Image routing must match the image source.')
 assert.deepEqual(new Set(videoSourceExtensions), new Set(EXTENSIONS_BY_MODE.video), 'Video routing must match the video source.')
+
+const pdfSourceExtensions = sourceExtensionSet(path.join(SOURCE_BY_MODE.pdf, 'electron', 'main.cjs'))
+const calcSourceExtensions = sourceExtensionSet(path.join(SOURCE_BY_MODE.calc, 'electron', 'workbooks.cjs'))
+for (const extension of EXTENSIONS_BY_MODE.pdf) {
+  assert.ok(pdfSourceExtensions.has(extension), `PDF routing sends ${extension} to a source that no longer accepts it.`)
+}
+for (const extension of EXTENSIONS_BY_MODE.calc) {
+  assert.ok(calcSourceExtensions.has(extension), `Calc routing sends ${extension} to a source that no longer accepts it.`)
+}
 
 const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 const associated = packageJson.build.fileAssociations.flatMap((item) => Array.isArray(item.ext) ? item.ext : [item.ext]).map((ext) => `.${ext}`)

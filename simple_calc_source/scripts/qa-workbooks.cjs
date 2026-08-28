@@ -107,6 +107,55 @@ async function main() {
     assert.equal(csvOpened.workbook.sheets[0].cells.A2.value, 'alpha')
     assert.equal(csvOpened.workbook.sheets[0].cells.B2.value, 42)
 
+    const euCsv = await workbookPayloadFromBytes('euro.csv', Buffer.from('name;value;price\r\nwidget;1,5;1.234,56\r\ngadget;2;00123', 'utf8'))
+    const euSheet = euCsv.workbook.sheets[0]
+    assert.equal(euCsv.workbook.metadata.delimiter, ';')
+    assert.equal(euSheet.cells.C1.value, 'price')
+    assert.equal(euSheet.cells.B2.value, 1.5)
+    assert.equal(euSheet.cells.B2.display, '1,5')
+    assert.equal(euSheet.cells.C2.value, 1234.56)
+    assert.equal(euSheet.cells.B3.value, 2)
+    assert.equal(euSheet.cells.C3.value, '00123')
+    assert.equal(euSheet.cells.C3.numFmt, '@')
+    const euTsv = await serializeWorkbook(euCsv.workbook, 'tsv')
+    assert.match(euTsv.toString('utf8'), /widget\t1\.5\t1,234\.56/)
+
+    const usCsv = await workbookPayloadFromBytes('us.csv', Buffer.from('label,qty,price,pct\r\nwidget,42,"1,234.5",20%', 'utf8'))
+    const usSheet = usCsv.workbook.sheets[0]
+    assert.equal(usCsv.workbook.metadata.delimiter, ',')
+    assert.equal(usSheet.cells.B2.value, 42)
+    assert.equal(usSheet.cells.C2.value, 1234.5)
+    assert.equal(usSheet.cells.C2.display, '1,234.5')
+    assert.equal(usSheet.cells.D2.value, 0.2)
+
+    const pipeTxt = await workbookPayloadFromBytes('pipes.txt', Buffer.from('a|b|c\r\n1|2|3\r\n4|5|6', 'utf8'))
+    assert.equal(pipeTxt.workbook.metadata.delimiter, '|')
+    assert.equal(pipeTxt.workbook.sheets[0].cells.C2.value, 3)
+
+    const isoSerial = (Date.UTC(2024, 0, 15) - Date.UTC(1899, 11, 30)) / 86_400_000
+    const idsCsv = await workbookPayloadFromBytes('ids.csv', Buffer.from('id,when\r\n00123,2024-01-15\r\n42,1/15/2024', 'utf8'))
+    const idsSheet = idsCsv.workbook.sheets[0]
+    assert.equal(idsSheet.cells.A2.value, '00123')
+    assert.equal(idsSheet.cells.A2.numFmt, '@')
+    assert.equal(idsSheet.cells.B2.value, isoSerial)
+    assert.equal(idsSheet.cells.B2.numFmt, 'yyyy-mm-dd')
+    assert.equal(idsSheet.cells.A3.value, 42)
+    assert.equal(idsSheet.cells.B3.value, isoSerial)
+    const idsExported = await serializeWorkbook(idsCsv.workbook, 'csv')
+    assert.match(idsExported.toString('utf8'), /\r\n00123,2024-01-15\r\n/)
+    const idsReopened = await workbookPayloadFromBytes('ids-roundtrip.csv', idsExported)
+    assert.equal(idsReopened.workbook.sheets[0].cells.A2.value, '00123')
+    assert.equal(idsReopened.workbook.sheets[0].cells.B2.value, isoSerial)
+
+    const encrypted = Buffer.concat([
+      Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),
+      Buffer.alloc(504),
+      Buffer.from('EncryptedPackage', 'utf16le'),
+    ])
+    for (const name of ['secret.xlsx', 'secret.xls', 'secret.xlsb']) {
+      await assert.rejects(workbookPayloadFromBytes(name, encrypted), /password-protected/)
+    }
+
     process.stdout.write(`Workbook QA passed: ${opened.stats.cells} cells, ${opened.stats.formulas} formulas, XLSX/XLS/ODS/CSV/TSV.\n`)
   } finally {
     await fs.rm(directory, { recursive: true, force: true })

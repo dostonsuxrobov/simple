@@ -732,17 +732,32 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
           opacity: 0,
         })
       } else {
-        const y = overlay.style === 'strikeout'
-          ? rect.y + rect.height * 0.48
-          : rect.y + Math.max(0.8, rect.height * 0.04)
-        page.drawLine({
-          start: { x: rect.x, y },
-          end: { x: rect.x + rect.width, y },
-          thickness,
-          color: rgb(r, g, b),
-          opacity,
-          lineCap: LineCapStyle.Round,
-        })
+        // The rect is stored in unrotated PDF space; the line must still sit
+        // under (or through) the text as it read on the rotated screen.
+        const displayRotation = (((Number(overlay.displayRotation) || 0) % 360) + 360) % 360
+        if (displayRotation === 90 || displayRotation === 270) {
+          const inset = overlay.style === 'strikeout' ? rect.width * 0.48 : Math.max(0.8, rect.width * 0.04)
+          const x = displayRotation === 90 ? rect.x + rect.width - inset : rect.x + inset
+          page.drawLine({
+            start: { x, y: rect.y },
+            end: { x, y: rect.y + rect.height },
+            thickness,
+            color: rgb(r, g, b),
+            opacity,
+            lineCap: LineCapStyle.Round,
+          })
+        } else {
+          const inset = overlay.style === 'strikeout' ? rect.height * 0.48 : Math.max(0.8, rect.height * 0.04)
+          const y = displayRotation === 180 ? rect.y + rect.height - inset : rect.y + inset
+          page.drawLine({
+            start: { x: rect.x, y },
+            end: { x: rect.x + rect.width, y },
+            thickness,
+            color: rgb(r, g, b),
+            opacity,
+            lineCap: LineCapStyle.Round,
+          })
+        }
       }
     }
 
@@ -753,6 +768,13 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
       let scaleX = Math.max(0.25, Math.min(4, Number(overlay.scaleX) || 1))
       const letterSpacing = Math.max(-4, Math.min(24, Number(overlay.letterSpacing) || 0))
       const angle = Number.isFinite(overlay.angle) ? Number(overlay.angle) : 0
+      // Text typed on a rotated page reads along the rotated axes. Lay lines
+      // out in the displayed box (reading width × stacked height) and map the
+      // result back into the unrotated rect below.
+      const displayRotation = (((Number(overlay.displayRotation) || 0) % 360) + 360) % 360
+      const sideways = displayRotation === 90 || displayRotation === 270
+      const boxWidth = sideways ? rect.height : rect.width
+      const boxHeight = sideways ? rect.width : rect.height
       const sourceRect = validRect(overlay.originalRect)
       if (sourceRect && overlay.originalText && overlay.fontData?.byteLength && hasReliableWindowsFontMatch(overlay.fontFamily)) {
         // PDF.js sometimes exposes a decoded browser font whose glyph outlines
@@ -846,30 +868,45 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
         const replacementWidth = sourceSpaceAdvance === null
           ? textWidthAtSize(font, overlay.text, size, letterSpacing, scaleX)
           : separatedTextWidth(font, overlay.text, size, letterSpacing, scaleX, sourceSpaceAdvance)
-        if (replacementWidth > rect.width && replacementWidth > 0) {
-          const fit = rect.width / replacementWidth
+        if (replacementWidth > boxWidth && replacementWidth > 0) {
+          const fit = boxWidth / replacementWidth
           scaleX = Math.max(0.25, scaleX * fit)
           if (sourceSpaceAdvance !== null) sourceSpaceAdvance *= fit
         }
       }
       const lines = nativeSingleLine
         ? [String(overlay.text || '')]
-        : wrapText(overlay.text, font, size, Math.max(4, rect.width / scaleX))
+        : wrapText(overlay.text, font, size, Math.max(4, boxWidth / scaleX))
       const lineHeight = Math.max(size * 0.8, Number(overlay.lineHeight) || size * 1.18)
-      let textY = Number.isFinite(overlay.baselineOffset)
-        ? rect.y + Number(overlay.baselineOffset)
-        : rect.y + Math.max(0, rect.height - size)
+      // Baseline distance measured downward from the displayed top of the box.
+      let baselineV = Number.isFinite(overlay.baselineOffset)
+        ? boxHeight - Number(overlay.baselineOffset)
+        : Math.min(size, boxHeight)
       for (const line of lines) {
-        if (textY < rect.y - lineHeight) break
+        if (baselineV > boxHeight + lineHeight) break
         const lineWidth = sourceSpaceAdvance === null
           ? textWidthAtSize(font, line, size, letterSpacing, scaleX)
           : separatedTextWidth(font, line, size, letterSpacing, scaleX, sourceSpaceAdvance)
         const align = overlay.align === 'center' || overlay.align === 'right' ? overlay.align : 'left'
-        const textX = align === 'center'
-          ? rect.x + Math.max(0, (rect.width - lineWidth) / 2)
+        const lineU = align === 'center'
+          ? Math.max(0, (boxWidth - lineWidth) / 2)
           : align === 'right'
-            ? rect.x + Math.max(0, rect.width - lineWidth)
-            : rect.x
+            ? Math.max(0, boxWidth - lineWidth)
+            : 0
+        const textX = displayRotation === 90
+          ? rect.x + baselineV
+          : displayRotation === 180
+            ? rect.x + rect.width - lineU
+            : displayRotation === 270
+              ? rect.x + rect.width - baselineV
+              : rect.x + lineU
+        const textY = displayRotation === 90
+          ? rect.y + lineU
+          : displayRotation === 180
+            ? rect.y + baselineV
+            : displayRotation === 270
+              ? rect.y + rect.height - lineU
+              : rect.y + boxHeight - baselineV
         const drawOptions = {
           x: textX,
           y: textY,
@@ -877,11 +914,11 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
           color: [r, g, b],
           scaleX,
           letterSpacing,
-          angle,
+          angle: angle + displayRotation * Math.PI / 180,
         }
         if (sourceSpaceAdvance === null) drawStyledTextLine(page, font, line, drawOptions)
         else drawStyledSeparatedLine(page, font, line, drawOptions, sourceSpaceAdvance)
-        textY -= lineHeight
+        baselineV += lineHeight
       }
     }
 
@@ -972,6 +1009,61 @@ async function printPdfBytes(data, documentName, ownerWindow) {
   }
 }
 
+function printerCapabilityHints(options = {}) {
+  const flattened = Object.entries(options)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(' ')
+    .toLowerCase()
+  return {
+    supportsDuplex: /duplex|two[-_ ]?sided|sides[-_]supported/.test(flattened),
+    supportsColor: /(^|\W)colou?r/.test(flattened) || !/monochrome|black[-_ ]?and[-_ ]?white/.test(flattened),
+  }
+}
+
+async function printPdfDirect(data, documentName, options = {}) {
+  const printDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-print-'))
+  const printPath = path.join(printDirectory, `${safeBaseName(documentName || 'Document')}.pdf`)
+  let printWindow = null
+  try {
+    const indices = Array.isArray(options.pageIndices) && options.pageIndices.length ? options.pageIndices : null
+    const printBytes = indices ? await exportedPages(data, indices, documentName || 'Document') : data
+    await fs.writeFile(printPath, toBytes(printBytes))
+    printWindow = new BrowserWindow({
+      width: 800,
+      height: 600,
+      show: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        plugins: true,
+        devTools: false,
+      },
+    })
+    await printWindow.loadURL(pathToFileURL(printPath).href)
+    // Chromium's PDF viewer keeps parsing after did-finish-load; printing
+    // immediately produces blank pages, so give it a moment to settle.
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    return await new Promise((resolve) => {
+      printWindow.webContents.print({
+        silent: true,
+        ...(options.deviceName ? { deviceName: String(options.deviceName) } : {}),
+        copies: Math.max(1, Math.trunc(Number(options.copies) || 1)),
+        ...(typeof options.landscape === 'boolean' ? { landscape: options.landscape } : {}),
+        color: options.color !== false,
+        ...(options.duplexMode ? { duplexMode: options.duplexMode } : {}),
+        collate: options.collate !== false,
+        margins: { marginType: 'default' },
+      }, (success, failureReason) => resolve({ success, failureReason: failureReason || '' }))
+    })
+  } catch (error) {
+    return { success: false, failureReason: error instanceof Error ? error.message : String(error) }
+  } finally {
+    if (printWindow && !printWindow.isDestroyed()) printWindow.destroy()
+    await fs.rm(printDirectory, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
 function createWindow(openPath = null) {
   const browserWindow = new BrowserWindow({
     icon: path.join(__dirname, '..', 'build', 'icon.ico'),
@@ -999,6 +1091,7 @@ function createWindow(openPath = null) {
   }
 
   browserWindow.once('ready-to-show', () => browserWindow.show())
+  browserWindow.webContents.on('will-navigate', (event) => event.preventDefault())
   browserWindow.webContents.once('did-finish-load', () => {
     if (openPath) {
       // The preload buffers this event until React subscribes, so launching the
@@ -1142,8 +1235,9 @@ function registerIpc() {
 
   ipcMain.handle('pdf:start-page-drag', async (event, data, indices, suggestedName) => {
     if (!dragExportDirectory) dragExportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-page-drag-'))
+    const dragDirectory = await fs.mkdtemp(path.join(dragExportDirectory, 'drag-'))
     const fileName = `${safeBaseName(suggestedName || 'Exported page')}.pdf`
-    const targetPath = path.join(dragExportDirectory, fileName)
+    const targetPath = path.join(dragDirectory, fileName)
     await atomicWrite(targetPath, await exportedPages(data, indices, fileName))
     const iconPath = path.join(__dirname, '..', 'build', 'icon.ico')
     const icon = nativeImage.createFromPath(iconPath)
@@ -1152,6 +1246,18 @@ function registerIpc() {
   })
 
   ipcMain.handle('pdf:print', async (event, data, documentName) => printPdfBytes(data, documentName, callingWindow(event)))
+
+  ipcMain.handle('print:list-printers', async (event) => {
+    const printers = await event.sender.getPrintersAsync()
+    return printers.map((printer) => ({
+      name: printer.name,
+      displayName: printer.displayName || printer.name,
+      isDefault: Boolean(printer.isDefault),
+      ...printerCapabilityHints(printer.options),
+    }))
+  })
+
+  ipcMain.handle('pdf:print-direct', async (_event, data, documentName, options) => printPdfDirect(data, documentName, options))
 
   ipcMain.handle('pdf:save', async (event, input) => {
     let targetPath = input.forceDialog ? null : input.path

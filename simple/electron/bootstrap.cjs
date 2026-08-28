@@ -3,7 +3,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { app } = require('electron')
-const { explicitMode, groupPathsByMode, MODES, supportedPaths } = require('./routing.cjs')
+const { explicitMode, groupPathsByMode, MODES, modeForPath, supportedPaths } = require('./routing.cjs')
 const { launchDetached } = require('./launch.cjs')
 
 const APP_USER_MODEL_ID = 'com.simple.unified'
@@ -41,6 +41,23 @@ if (selfTest) {
     if (!fs.existsSync(moduleMain)) {
       throw new Error(`The ${mode} module has not been built. Run npm run sync first.`)
     }
+    // Modules re-parse argv with their own broader extension lists, so a path
+    // routed to another mode must never reach them. The second-instance relay
+    // carries the raw command line of the new instance (not its filtered
+    // process.argv), and every listener shares one argv array, so splicing it
+    // here runs before the module's own handler sees it.
+    const foreignPath = (argument) => {
+      if (typeof argument !== 'string' || argument.startsWith('-')) return false
+      const owner = modeForPath(argument)
+      return Boolean(owner) && owner !== mode
+    }
+    process.argv = process.argv.filter((argument) => !foreignPath(argument))
+    app.on('second-instance', (_event, argv) => {
+      if (!Array.isArray(argv)) return
+      for (let index = argv.length - 1; index >= 0; index -= 1) {
+        if (foreignPath(argv[index])) argv.splice(index, 1)
+      }
+    })
     require(moduleMain)
     // Calc changes the app name synchronously and Docs sets a legacy taskbar ID
     // when ready. Re-apply unified branding after their startup hooks run.

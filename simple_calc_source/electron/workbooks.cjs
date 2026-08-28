@@ -1299,6 +1299,326 @@ function compatibilityWarnings(format) {
   return warnings
 }
 
+const DELIMITED_TEXT_FORMATS = new Set(['csv', 'tsv', 'tab', 'txt', 'prn'])
+const DELIMITER_CANDIDATES = [',', ';', '\t', '|']
+const ISO_DATE_RE = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+const YMD_SLASH_RE = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/
+const SLASH_DATE_RE = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/
+const EU_DECIMAL_RE = /^-?\d+,\d+$/
+const EU_GROUPED_RE = /^-?\d{1,3}(?:\.\d{3})+(?:,\d+)?$/
+const US_DECIMAL_RE = /^-?\d+\.\d+$/
+const US_GROUPED_RE = /^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/
+
+function decodeDelimitedText(buffer) {
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return buffer.subarray(3).toString('utf8')
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return buffer.subarray(2).toString('utf16le')
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    return Buffer.from(buffer.subarray(2)).swap16().toString('utf16le')
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+  } catch {
+    // BOM-less non-UTF-8 text falls back to the classic Windows codepage.
+  }
+  try {
+    return new TextDecoder('windows-1252').decode(buffer)
+  } catch {
+    return buffer.toString('latin1')
+  }
+}
+
+function countDelimitersOutsideQuotes(line, delimiter) {
+  let count = 0
+  let quoted = false
+  for (const character of line) {
+    if (character === '"') quoted = !quoted
+    else if (!quoted && character === delimiter) count += 1
+  }
+  return count
+}
+
+function sniffDelimiter(text, extensionDefault) {
+  const lines = text.split(/\r\n|[\r\n]/).filter((line) => line.trim() !== '').slice(0, 50)
+  if (!lines.length) return extensionDefault
+  let best
+  for (const delimiter of DELIMITER_CANDIDATES) {
+    const counts = lines.map((line) => countDelimitersOutsideQuotes(line, delimiter))
+    const tally = new Map()
+    for (const count of counts) {
+      if (count > 0) tally.set(count, (tally.get(count) || 0) + 1)
+    }
+    let mode = 0
+    let modeLines = 0
+    for (const [count, occurrences] of tally) {
+      if (occurrences > modeLines || (occurrences === modeLines && count > mode)) {
+        mode = count
+        modeLines = occurrences
+      }
+    }
+    if (!mode) continue
+    const consistency = modeLines / counts.length
+    if (consistency < 0.5) continue
+    const score = consistency * 1_000_000 + (delimiter === extensionDefault ? 1_000 : 0) + Math.min(mode, 999)
+    if (!best || score > best.score) best = { delimiter, score }
+  }
+  return best ? best.delimiter : extensionDefault
+}
+
+function parseDelimitedRecords(text, delimiter) {
+  const records = []
+  let record = []
+  let field = ''
+  let quoted = false
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]
+    if (quoted) {
+      if (character === '"') {
+        if (text[index + 1] === '"') {
+          field += '"'
+          index += 1
+        } else {
+          quoted = false
+        }
+      } else {
+        field += character
+      }
+    } else if (character === '"') {
+      quoted = true
+    } else if (character === delimiter) {
+      record.push(field)
+      field = ''
+    } else if (character === '\n' || character === '\r') {
+      if (character === '\r' && text[index + 1] === '\n') index += 1
+      record.push(field)
+      records.push(record)
+      field = ''
+      record = []
+    } else {
+      field += character
+    }
+  }
+  if (field !== '' || record.length) {
+    record.push(field)
+    records.push(record)
+  }
+  return records
+}
+
+function detectDecimalComma(records, delimiter) {
+  if (delimiter === ';') return true
+  let euSignals = 0
+  let usSignals = 0
+  let scanned = 0
+  for (const record of records) {
+    for (const rawField of record) {
+      if (scanned >= 50_000) return euSignals > 0 && euSignals > usSignals
+      scanned += 1
+      const field = rawField.trim().replace(/%$/, '')
+      if (!field) continue
+      const eu = EU_DECIMAL_RE.test(field) || EU_GROUPED_RE.test(field)
+      const us = US_DECIMAL_RE.test(field) || US_GROUPED_RE.test(field)
+      if (eu && !us) euSignals += 1
+      else if (us && !eu) usSignals += 1
+    }
+  }
+  return euSignals > 0 && euSignals > usSignals
+}
+
+function parseDelimitedNumber(rawText, decimalComma) {
+  let text = rawText
+  let sign = 1
+  const parenthesized = /^\((.+)\)$/.exec(text)
+  if (parenthesized) {
+    text = parenthesized[1]
+    sign = -1
+  }
+  let percent = false
+  if (text.endsWith('%')) {
+    percent = true
+    text = text.slice(0, -1)
+  }
+  const currency = text.includes('$')
+  if (currency) text = text.replace(/\$/g, '')
+  text = text.trim()
+  if (!text) return undefined
+  let normalized = text
+  let grouped = false
+  let euStyled = false
+  if (decimalComma) {
+    if (EU_GROUPED_RE.test(text)) {
+      grouped = true
+      euStyled = true
+      normalized = text.replace(/\./g, '').replace(',', '.')
+    } else if (EU_DECIMAL_RE.test(text)) {
+      euStyled = true
+      normalized = text.replace(',', '.')
+    }
+  } else if (US_GROUPED_RE.test(text)) {
+    grouped = true
+    normalized = text.replace(/,/g, '')
+  }
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(normalized)) return undefined
+  const value = Number(normalized)
+  if (!Number.isFinite(value)) return undefined
+  const result = { value: sign * (percent ? value / 100 : value) }
+  if (euStyled && !percent && !currency) {
+    const decimalMatch = /\.(\d+)$/.exec(normalized)
+    const decimals = decimalMatch ? Math.min(decimalMatch[1].length, 10) : 0
+    if (grouped) result.numFmt = `#,##0${decimals ? `.${'0'.repeat(decimals)}` : ''}`
+    else if (decimals) result.numFmt = `0.${'0'.repeat(decimals)}`
+  }
+  return result
+}
+
+function delimitedDateSerial(year, month, day, hours = 0, minutes = 0, seconds = 0) {
+  if (year < 1900 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31) return null
+  if (hours > 23 || minutes > 59 || seconds > 59) return null
+  const utc = Date.UTC(year, month - 1, day, hours, minutes, seconds)
+  const check = new Date(utc)
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null
+  return (utc - Date.UTC(1899, 11, 30)) / 86_400_000
+}
+
+function delimitedFieldToModelCell(field, decimalComma) {
+  if (field === '') return undefined
+  const trimmed = field.trim()
+  if (!trimmed) return { value: field, display: field }
+  if (trimmed.startsWith('=') && trimmed.length > 1) {
+    return { formula: trimmed.slice(1), result: field, display: field }
+  }
+  if (trimmed === 'TRUE' || trimmed === 'FALSE') return { value: trimmed === 'TRUE', display: field }
+  if (ERROR_TEXT_TO_CODE[trimmed] != null) return { value: trimmed, type: 'error', display: field }
+  // Leading-zero identifiers and digit runs beyond double precision must stay
+  // text; coercing them to numbers silently corrupts the source data.
+  if (/^0\d+$/.test(trimmed) || /^-?\d{16,}$/.test(trimmed)) {
+    return { value: trimmed, display: field, numFmt: '@' }
+  }
+  const isoMatch = ISO_DATE_RE.exec(trimmed)
+  if (isoMatch) {
+    const serial = delimitedDateSerial(
+      Number(isoMatch[1]),
+      Number(isoMatch[2]),
+      Number(isoMatch[3]),
+      Number(isoMatch[4] || 0),
+      Number(isoMatch[5] || 0),
+      Number(isoMatch[6] || 0),
+    )
+    if (serial != null) {
+      const numFmt = isoMatch[6] != null ? 'yyyy-mm-dd hh:mm:ss' : isoMatch[4] != null ? 'yyyy-mm-dd hh:mm' : 'yyyy-mm-dd'
+      return { value: serial, display: field, numFmt }
+    }
+  }
+  const ymdMatch = YMD_SLASH_RE.exec(trimmed)
+  if (ymdMatch) {
+    const serial = delimitedDateSerial(Number(ymdMatch[1]), Number(ymdMatch[2]), Number(ymdMatch[3]))
+    if (serial != null) return { value: serial, display: field, numFmt: 'yyyy-mm-dd' }
+  }
+  const slashMatch = SLASH_DATE_RE.exec(trimmed)
+  if (slashMatch) {
+    const first = Number(slashMatch[1])
+    const second = Number(slashMatch[2])
+    let year = Number(slashMatch[3])
+    if (slashMatch[3].length <= 2) year = year < 50 ? 2000 + year : 1900 + year
+    let month
+    let day
+    let numFmt = 'm/d/yy'
+    if (decimalComma && second <= 12) {
+      day = first
+      month = second
+      numFmt = 'd/m/yy'
+    } else if (first <= 12) {
+      month = first
+      day = second
+    }
+    if (month != null) {
+      const serial = delimitedDateSerial(year, month, day)
+      if (serial != null) return { value: serial, display: field, numFmt }
+    }
+  }
+  const parsed = parseDelimitedNumber(trimmed, decimalComma)
+  if (parsed) {
+    const modelCell = { value: parsed.value, display: field }
+    if (parsed.numFmt) modelCell.numFmt = parsed.numFmt
+    return modelCell
+  }
+  return { value: field, display: field }
+}
+
+function importDelimitedText(buffer, sourceName, sourceFormat, warnings) {
+  if (!buffer.length) return undefined
+  const text = decodeDelimitedText(buffer)
+  const head = text.slice(0, 2_048).replace(/^[\s\uFEFF]+/, '')
+  // XML/HTML tables, SYLK, and DIF sources keep using the SheetJS readers.
+  if (/^</.test(head) || /^ID;P/i.test(head) || /^TABLE\r?\n/.test(head)) return undefined
+  const extensionDefault = sourceFormat === 'csv' ? ',' : sourceFormat === 'prn' ? undefined : '\t'
+  const delimiter = sniffDelimiter(text, extensionDefault)
+  if (!delimiter) return undefined
+  const records = parseDelimitedRecords(text, delimiter)
+  const decimalComma = detectDecimalComma(records, delimiter)
+  const stats = initialStats(buffer.length)
+  const cells = {}
+  let maxRow = 0
+  let maxCol = 0
+  let truncated = false
+  records.forEach((record, rowIndex) => {
+    if (rowIndex >= MAX_METADATA_ROWS) {
+      truncated = true
+      return
+    }
+    record.forEach((field, colIndex) => {
+      if (colIndex >= MAX_METADATA_COLS) {
+        truncated = true
+        return
+      }
+      const modelCell = delimitedFieldToModelCell(field, decimalComma)
+      if (!modelCell) return
+      cells[XLSX.utils.encode_cell({ r: rowIndex, c: colIndex })] = modelCell
+      maxRow = Math.max(maxRow, rowIndex + 1)
+      maxCol = Math.max(maxCol, colIndex + 1)
+      updateStatsForCell(stats, modelCell, rowIndex + 1, colIndex + 1)
+    })
+  })
+  if (truncated) warnings.push('Some rows or columns beyond modern spreadsheet limits were dropped from this delimited text file.')
+  const sheet = {
+    ...blankSheetModel(),
+    sourceSheetName: 'Sheet1',
+    sourceSheetIndex: 0,
+    rowCount: Math.max(1, maxRow),
+    colCount: Math.max(1, maxCol),
+    cells,
+    columnProperties: {},
+    rowProperties: {},
+  }
+  stats.sheetCount = 1
+  stats.sheets = 1
+  return {
+    model: {
+      version: 1,
+      name: path.parse(sourceName).name || 'Workbook',
+      activeSheetId: sheet.id,
+      sheets: [sheet],
+      definedNames: [],
+      metadata: {
+        importedWith: 'delimited-text',
+        delimiter,
+        decimalComma,
+        properties: {},
+        date1904: false,
+        sourceDate1904: false,
+        workbookProperties: {},
+        workbookViews: [],
+        calcProperties: {},
+        definedNames: [],
+      },
+    },
+    stats,
+  }
+}
+
 function importWithSheetJS(buffer, sourceName, sourceFormat, warnings) {
   let sheetWorkbook
   if (!buffer.length && ['csv', 'tsv', 'tab', 'txt', 'prn'].includes(sourceFormat)) {
@@ -1400,11 +1720,22 @@ function finalizePayload(sourceName, sourceFormat, imported, warnings) {
   }
 }
 
+const CFB_SIGNATURE = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+const ENCRYPTED_STREAM_MARKERS = [Buffer.from('EncryptedPackage', 'utf16le'), Buffer.from('EncryptionInfo', 'utf16le')]
+const ENCRYPTED_WORKBOOK_MESSAGE = 'This workbook is password-protected; encrypted files are not supported.'
+
+function isEncryptedWorkbook(buffer) {
+  if (buffer.length < 8 || !buffer.subarray(0, 8).equals(CFB_SIGNATURE)) return false
+  // Standard and agile OOXML encryption both store these CFB stream names.
+  return ENCRYPTED_STREAM_MARKERS.some((marker) => buffer.includes(marker))
+}
+
 async function workbookPayloadFromBytes(name, data) {
   const extension = ensureSupportedExtension(name)
   const sourceFormat = extension.slice(1)
   const sourceName = path.basename(name)
   const buffer = bytesToBuffer(data)
+  if (isEncryptedWorkbook(buffer)) throw new Error(ENCRYPTED_WORKBOOK_MESSAGE)
   const warnings = compatibilityWarnings(sourceFormat)
 
   let imported
@@ -1430,9 +1761,7 @@ async function workbookPayloadFromBytes(name, data) {
     }
   } else if (sourceFormat === MODERN_FORMAT) {
     if (!hasZipSignature) {
-      const hasCompoundFileSignature =
-        buffer.length >= 8 &&
-        buffer.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]))
+      const hasCompoundFileSignature = buffer.length >= 8 && buffer.subarray(0, 8).equals(CFB_SIGNATURE)
       if (hasCompoundFileSignature) {
         throw new Error(`Unable to open ${sourceName}: password-protected modern Excel workbooks are not supported.`)
       }
@@ -1440,8 +1769,20 @@ async function workbookPayloadFromBytes(name, data) {
     }
   } else {
     try {
-      imported = importWithSheetJS(buffer, sourceName, sourceFormat, warnings)
+      if (DELIMITED_TEXT_FORMATS.has(sourceFormat)) {
+        try {
+          imported = importDelimitedText(buffer, sourceName, sourceFormat, warnings)
+        } catch {
+          warnings.push('The delimited-text reader could not parse this file; the compatibility reader was used instead.')
+        }
+      }
+      if (!imported) imported = importWithSheetJS(buffer, sourceName, sourceFormat, warnings)
     } catch (error) {
+      if (/password|encrypt/i.test(String(error && error.message))) {
+        const wrapped = new Error(ENCRYPTED_WORKBOOK_MESSAGE)
+        wrapped.cause = error
+        throw wrapped
+      }
       const wrapped = new Error(`Unable to open ${sourceName}: ${error.message || 'invalid or damaged spreadsheet'}`)
       wrapped.cause = error
       throw wrapped

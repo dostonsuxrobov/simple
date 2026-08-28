@@ -44,6 +44,8 @@ contextBridge.exposeInMainWorld('simple', {
   exportPages: (data, indices, suggestedName) => ipcRenderer.invoke('pdf:export-pages', data, indices, suggestedName),
   startPageDrag: (data, indices, suggestedName) => ipcRenderer.invoke('pdf:start-page-drag', data, indices, suggestedName),
   printPdf: (data, documentName) => ipcRenderer.invoke('pdf:print', data, documentName),
+  listPrinters: () => ipcRenderer.invoke('print:list-printers'),
+  printPdfDirect: (data, documentName, options) => ipcRenderer.invoke('pdf:print-direct', data, documentName, options),
   savePdf: (input) => ipcRenderer.invoke('pdf:save', input),
   showItem: (filePath) => ipcRenderer.invoke('shell:show-item', filePath),
   openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),

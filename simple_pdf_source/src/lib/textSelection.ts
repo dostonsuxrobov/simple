@@ -189,7 +189,9 @@ export function caretOffsetAtPoint(span: HTMLSpanElement, clientX: number, clien
   // caretPositionFromPoint can be a few characters off inside transformed PDF
   // spans (especially during a portable build's cold font load). Projecting
   // character centres onto the run's baseline is deterministic for horizontal,
-  // vertical, rotated, LTR, and RTL text and needs only O(log n) range reads.
+  // vertical, rotated, LTR, and RTL text; items are short, so scanning every
+  // glyph midpoint stays cheap and keeps bidi runs (whose projections are not
+  // monotonic along the axis) correct.
   const angle = Number(span.dataset.textAngle) || 0
   const axisX = Math.cos(angle)
   const axisY = Math.sin(angle)
@@ -211,20 +213,34 @@ export function caretOffsetAtPoint(span: HTMLSpanElement, clientX: number, clien
   }
 
   if (text.length) {
-    const first = characterProjection(0)
-    const last = characterProjection(text.length - 1)
-    if (Number.isFinite(first) && Number.isFinite(last)) {
-      const ascending = text.length === 1 || last >= first
-      let low = 0
-      let high = text.length
-      while (low < high) {
-        const middle = Math.floor((low + high) / 2)
-        const projected = characterProjection(middle)
-        if (!Number.isFinite(projected)) break
-        if (ascending ? pointerProjection < projected : pointerProjection > projected) high = middle
-        else low = middle + 1
+    const projections: number[] = []
+    for (let offset = 0; offset < text.length; offset += 1) projections.push(characterProjection(offset))
+    let nearest = -1
+    let nearestDistance = Number.POSITIVE_INFINITY
+    for (let offset = 0; offset < text.length; offset += 1) {
+      if (!Number.isFinite(projections[offset])) continue
+      const distance = Math.abs(pointerProjection - projections[offset])
+      if (distance < nearestDistance) {
+        nearest = offset
+        nearestDistance = distance
       }
-      if (low === high) return low
+    }
+    if (nearest >= 0) {
+      // The local run direction decides which side of the nearest glyph maps
+      // to the next logical offset; an RTL glyph's start edge is its right.
+      let forward: boolean | null = null
+      for (let offset = nearest + 1; offset < text.length && forward === null; offset += 1) {
+        if (Number.isFinite(projections[offset]) && projections[offset] !== projections[nearest]) {
+          forward = projections[offset] > projections[nearest]
+        }
+      }
+      for (let offset = nearest - 1; offset >= 0 && forward === null; offset -= 1) {
+        if (Number.isFinite(projections[offset]) && projections[offset] !== projections[nearest]) {
+          forward = projections[nearest] > projections[offset]
+        }
+      }
+      if (forward === null) forward = span.dir !== 'rtl'
+      return (pointerProjection > projections[nearest]) === forward ? nearest + 1 : nearest
     }
   }
 
@@ -263,7 +279,12 @@ export function caretOffsetAtPoint(span: HTMLSpanElement, clientX: number, clien
  * the gap between two spans. Requiring a real span hit keeps the focus caret on
  * the last glyph the pointer touched until it reaches another text item.
  */
-export function textCaretAtPoint(container: HTMLElement, clientX: number, clientY: number): TextCaretPoint | null {
+export function textCaretAtPoint(
+  container: HTMLElement,
+  clientX: number,
+  clientY: number,
+  previousSpan?: HTMLSpanElement | null,
+): TextCaretPoint | null {
   const candidates: Array<{ span: HTMLSpanElement; rect: DOMRect }> = []
   const seen = new Set<HTMLSpanElement>()
 
@@ -281,22 +302,39 @@ export function textCaretAtPoint(container: HTMLElement, clientX: number, client
   }
 
   if (!candidates.length) return null
-  // Transformed PDF spans can overlap slightly. The line whose visual centre
-  // is closest to the pointer is the one the user is actually hovering.
-  candidates.sort((a, b) => {
+
+  const caretAt = (span: HTMLSpanElement, rect: DOMRect): TextCaretPoint | null => {
+    const node = span.firstChild
+    if (!(node instanceof Text)) return null
+    const x = Math.max(rect.left + 0.01, Math.min(rect.right - 0.01, clientX))
+    const y = Math.max(rect.top + 0.01, Math.min(rect.bottom - 0.01, clientY))
+    return { node, offset: caretOffsetAtPoint(span, x, y), span }
+  }
+
+  // Hysteresis: while the pointer is still inside the previous focus span's
+  // vertical band (with a small margin), keep that span instead of letting an
+  // overlapping neighbour steal the caret mid-drag.
+  if (previousSpan?.isConnected && container.contains(previousSpan)) {
+    const rect = candidates.find((candidate) => candidate.span === previousSpan)?.rect
+      ?? previousSpan.getBoundingClientRect()
+    const margin = Math.max(1, rect.height * 0.25)
+    if (rect.width >= 0.5 && rect.height >= 1
+      && clientX >= rect.left - 0.75 && clientX <= rect.right + 0.75
+      && clientY >= rect.top - margin && clientY <= rect.bottom + margin) {
+      const caret = caretAt(previousSpan, rect)
+      if (caret) return caret
+    }
+  }
+
+  // Transformed PDF spans can overlap slightly. Prefer the spans whose band
+  // actually contains the pointer; only rank by normalized centre distance
+  // beyond that, because that ranking alone flip-flops in overlap bands.
+  const banded = candidates.filter(({ rect }) => clientY >= rect.top && clientY <= rect.bottom)
+  const pool = banded.length ? banded : candidates
+  pool.sort((a, b) => {
     const aDistance = Math.abs(clientY - (a.rect.top + a.rect.bottom) / 2) / a.rect.height
     const bDistance = Math.abs(clientY - (b.rect.top + b.rect.bottom) / 2) / b.rect.height
     return aDistance - bDistance || a.rect.height - b.rect.height
   })
-
-  const { span, rect } = candidates[0]
-  const node = span.firstChild
-  if (!(node instanceof Text)) return null
-  const x = Math.max(rect.left + 0.01, Math.min(rect.right - 0.01, clientX))
-  const y = Math.max(rect.top + 0.01, Math.min(rect.bottom - 0.01, clientY))
-  return {
-    node,
-    offset: caretOffsetAtPoint(span, x, y),
-    span,
-  }
+  return caretAt(pool[0].span, pool[0].rect)
 }
