@@ -128,6 +128,16 @@ async function main() {
     assert.equal(usSheet.cells.C2.display, '1,234.5')
     assert.equal(usSheet.cells.D2.value, 0.2)
 
+    // Quoted "n,n" text pairs must not flip a comma-delimited US file to
+    // decimal-comma parsing (1.234 stays 1.234 and "6,8" stays text), while
+    // unambiguous EU grouped values still enable it.
+    const pairsCsv = await workbookPayloadFromBytes('pairs.csv', Buffer.from('sku,sizes,weight\r\nA1,"6,8",1.234\r\nB2,"8,10",2.5\r\nC3,"10,12",0.75', 'utf8'))
+    const pairsSheet = pairsCsv.workbook.sheets[0]
+    assert.equal(pairsSheet.cells.C2.value, 1.234)
+    assert.equal(pairsSheet.cells.B2.value, '6,8')
+    const euGroupedCsv = await workbookPayloadFromBytes('grouped.csv', Buffer.from('a,b\r\nx,"1.234,56"', 'utf8'))
+    assert.equal(euGroupedCsv.workbook.sheets[0].cells.B2.value, 1234.56)
+
     const pipeTxt = await workbookPayloadFromBytes('pipes.txt', Buffer.from('a|b|c\r\n1|2|3\r\n4|5|6', 'utf8'))
     assert.equal(pipeTxt.workbook.metadata.delimiter, '|')
     assert.equal(pipeTxt.workbook.sheets[0].cells.C2.value, 3)

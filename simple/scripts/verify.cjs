@@ -54,9 +54,10 @@ function sourceFingerprint(sourceRoot) {
 
 function sourceExtensionSet(relativeSourcePath) {
   const source = fs.readFileSync(path.join(WORKSPACE, relativeSourcePath), 'utf8')
-  const declaration = /SUPPORTED_EXTENSIONS = new Set\(\[([\s\S]*?)\]\)/.exec(source)
+  const declaration = /SUPPORTED_EXTENSIONS\s*=\s*(?:\/\*[\s\S]*?\*\/\s*)?new Set\(\s*\[([\s\S]*?)\]\s*\)/.exec(source)
   assert.ok(declaration, `${relativeSourcePath} must declare SUPPORTED_EXTENSIONS.`)
-  return new Set(declaration[1].match(/\.[a-z0-9]+/g) || [])
+  const body = declaration[1].replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+  return new Set(body.match(/\.[a-z0-9]+/g) || [])
 }
 
 assert.equal(modeForPath('Report.DOCX'), 'docs')

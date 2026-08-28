@@ -23,7 +23,8 @@ interface SignaturePanelProps {
 
 type CreateMode = 'draw' | 'type'
 
-const SIGNATURES_KEY = 'simple.pdf.signatures'
+const SIGNATURES_KEY = 'folio:signatures:v1'
+const LEGACY_SIGNATURES_KEY = 'simple.pdf.signatures'
 const MAX_SIGNATURES = 10
 const DRAW_WIDTH = 400
 const DRAW_HEIGHT = 140
@@ -42,7 +43,17 @@ const SCRIPT_FONTS = [
 
 function readStoredSignatures(): StoredSignature[] {
   try {
-    const value = JSON.parse(localStorage.getItem(SIGNATURES_KEY) || '[]')
+    let raw = localStorage.getItem(SIGNATURES_KEY)
+    if (raw === null) {
+      // One-time migration from the key shipped before the app-wide
+      // 'folio:' prefix convention was applied here.
+      raw = localStorage.getItem(LEGACY_SIGNATURES_KEY)
+      if (raw !== null) {
+        localStorage.setItem(SIGNATURES_KEY, raw)
+        localStorage.removeItem(LEGACY_SIGNATURES_KEY)
+      }
+    }
+    const value = JSON.parse(raw || '[]')
     return Array.isArray(value)
       ? value
         .filter((item) => item

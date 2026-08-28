@@ -218,6 +218,33 @@ async function rotateImageData(dataUrl: string, direction: 'left' | 'right') {
   return canvas.toDataURL('image/png')
 }
 
+/**
+ * Rotate an upright (as-displayed) image by -displayRotation so the stored
+ * pixels sit in unrotated PDF orientation — the same convention captureRect
+ * uses — keeping the saver's axis-aligned draw correct on rotated pages.
+ */
+async function normalizeImageOrientation(dataUrl: string, displayRotation: number) {
+  const rotation = ((displayRotation % 360) + 360) % 360
+  if (!rotation) return dataUrl
+  const source = new Image()
+  await new Promise<void>((resolve, reject) => {
+    source.onload = () => resolve()
+    source.onerror = () => reject(new Error('The image could not be rotated.'))
+    source.src = dataUrl
+  })
+  const width = source.naturalWidth || source.width
+  const height = source.naturalHeight || source.height
+  const canvas = document.createElement('canvas')
+  canvas.width = rotation % 180 ? height : width
+  canvas.height = rotation % 180 ? width : height
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('The image could not be rotated.')
+  context.translate(canvas.width / 2, canvas.height / 2)
+  context.rotate(-rotation * Math.PI / 180)
+  context.drawImage(source, -width / 2, -height / 2, width, height)
+  return canvas.toDataURL('image/png')
+}
+
 export default function App() {
   const [documentFile, setDocumentFile] = useState<OpenDocument | null>(null)
   const [bytes, setBytes] = useState<Uint8Array | null>(null)
@@ -1115,11 +1142,18 @@ export default function App() {
       const dimensions = await imageDimensions(picked.dataUrl)
       const page = await pdf.getPage(pageIndex + 1)
       const pageViewport = page.getViewport({ scale: 1 })
-      const maxWidth = pageViewport.width * 0.48
-      const maxHeight = pageViewport.height * 0.48
+      // The rect lives in unrotated PDF space; size and orient the image
+      // against the page edges the user sees so it reads correctly as
+      // displayed, and store its pixels in unrotated PDF orientation.
+      const displayRotation = (((((page.rotate || 0) + (pageRotations[pageIndex] || 0)) % 360) + 360) % 360) as DisplayRotation
+      const sideways = displayRotation === 90 || displayRotation === 270
+      const maxWidth = (sideways ? pageViewport.height : pageViewport.width) * 0.48
+      const maxHeight = (sideways ? pageViewport.width : pageViewport.height) * 0.48
       const scale = Math.min(1, maxWidth / dimensions.width, maxHeight / dimensions.height)
-      const width = Math.max(36, dimensions.width * scale)
-      const height = Math.max(36, dimensions.height * scale)
+      const displayedWidth = Math.max(36, dimensions.width * scale)
+      const displayedHeight = Math.max(36, dimensions.height * scale)
+      const width = sideways ? displayedHeight : displayedWidth
+      const height = sideways ? displayedWidth : displayedHeight
       const left = (pageViewport.width - width) / 2
       const top = (pageViewport.height - height) / 2
       const rect = viewportRectToPdf(pageViewport, { left, top, right: left + width, bottom: top + height })
@@ -1127,9 +1161,10 @@ export default function App() {
         pageIndex,
         kind: 'image',
         rect,
-        dataUrl: picked.dataUrl,
+        dataUrl: await normalizeImageOrientation(picked.dataUrl, displayRotation),
         opacity: 1,
         cover: false,
+        displayRotation,
         label: picked.name,
         modified: true,
       })
@@ -1141,7 +1176,6 @@ export default function App() {
   async function placeSignature(targetPageIndex: number, point: { x: number; y: number }, displayRotation: DisplayRotation) {
     const signature = pendingSignature
     if (!pdf || !signature) return
-    setPendingSignature(null)
     try {
       const page = await pdf.getPage(targetPageIndex + 1)
       const view = page.view
@@ -1167,13 +1201,20 @@ export default function App() {
           width,
           height,
         },
-        dataUrl: signature.dataUrl,
+        // The signature pixels are upright as displayed; store them rotated
+        // into unrotated PDF orientation so the saver's axis-aligned draw
+        // matches the axis-swapped rect above on rotated pages.
+        dataUrl: await normalizeImageOrientation(signature.dataUrl, displayRotation),
         opacity: 1,
         cover: false,
         displayRotation,
         label: 'Signature',
         modified: true,
       })
+      // Cleared only now, batched with beginObjectEdit's tool switch: clearing
+      // before the awaits would mount the signature panel for a frame on every
+      // placement (tool still 'sign' with no pending signature).
+      setPendingSignature(null)
     } catch (error) {
       showToast(errorMessage(error))
     }
@@ -1184,7 +1225,15 @@ export default function App() {
     try {
       const picked = await window.simple.pickImage()
       if (!picked) return
-      setObjectEdit({ ...objectEdit, dataUrl: picked.dataUrl, kind: 'image', label: picked.name, modified: true })
+      setObjectEdit({
+        ...objectEdit,
+        // The picked pixels are upright as displayed; store them in unrotated
+        // PDF orientation like every other object image.
+        dataUrl: await normalizeImageOrientation(picked.dataUrl, objectEdit.displayRotation || 0),
+        kind: 'image',
+        label: picked.name,
+        modified: true,
+      })
     } catch (error) {
       showToast(errorMessage(error))
     }
@@ -1459,6 +1508,13 @@ export default function App() {
       // The dialog owns Escape and Enter itself; ignore every other shortcut
       // so typing a range or tabbing between fields cannot switch tools.
       if (event.key === 'Escape') { event.preventDefault(); setPrintDialogOpen(false) }
+      return
+    }
+    if (tool === 'sign' && pdf && !pendingSignature) {
+      // The signature dialog owns Escape/Enter/Tab while focus sits inside it;
+      // ignore every other shortcut so a stray tool key cannot close the
+      // dialog and silently discard an unsaved drawing.
+      if (event.key === 'Escape') { event.preventDefault(); setTool('select') }
       return
     }
     const typing = isTypingTarget(event.target)

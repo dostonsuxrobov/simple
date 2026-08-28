@@ -49,7 +49,10 @@ export interface FormulaRangeBounds {
  * 100,000 cells evaluate to #VALUE!. `resolveDefinedName` maps a workbook
  * name to a reference/range string (interpreted as A1) or a literal value;
  * without it unknown identifiers evaluate to #NAME?. `currentCell` backs
- * zero-argument ROW()/COLUMN().
+ * zero-argument ROW()/COLUMN(). `isFormulaCell` reports whether a cell holds
+ * a formula, for hosts whose resolver returns computed values rather than
+ * formula text; without it ISFORMULA falls back to inspecting the raw
+ * resolver result.
  */
 export interface FormulaEvaluationHooks {
   getUsedRange?: (
@@ -62,6 +65,7 @@ export interface FormulaEvaluationHooks {
   ) => void;
   resolveDefinedName?: (name: string) => FormulaPrimitive;
   currentCell?: { row: number; column: number };
+  isFormulaCell?: (sheetId: string, address: string) => boolean;
 }
 
 /** Public scalar result. Errors are returned as spreadsheet-style strings. */
@@ -1004,6 +1008,10 @@ function resolveSparseRectangle(
   if (!forEachCellInRange) return evaluationError("#VALUE!");
 
   const { sheetId, firstRow, lastRow, firstColumn, lastColumn } = bounds;
+  // Hosts may visit populated cells in insertion order; collect coordinates
+  // first and sort them row-major so order-sensitive consumers (TEXTJOIN,
+  // NPV, ...) see cells in sheet order.
+  const coordinates: Array<{ row: number; column: number }> = [];
   const values: EvaluationScalar[] = [];
   let overflowed = false;
   try {
@@ -1015,27 +1023,31 @@ function resolveSparseRectangle(
         if (row < firstRow || row > lastRow || column < firstColumn || column > lastColumn) {
           return;
         }
-        if (values.length >= MAX_RANGE_CELLS) {
+        if (coordinates.length >= MAX_RANGE_CELLS) {
           overflowed = true;
           return;
         }
-        values.push(
-          resolveReference(
-            {
-              kind: "reference",
-              sheet: sheetId,
-              address: { row, column, rowAbsolute: false, columnAbsolute: false },
-            },
-            currentSheetId,
-            context,
-          ),
-        );
+        coordinates.push({ row, column });
       },
     );
+    if (overflowed) return evaluationError("#VALUE!");
+    coordinates.sort((a, b) => a.row - b.row || a.column - b.column);
+    for (const { row, column } of coordinates) {
+      values.push(
+        resolveReference(
+          {
+            kind: "reference",
+            sheet: sheetId,
+            address: { row, column, rowAbsolute: false, columnAbsolute: false },
+          },
+          currentSheetId,
+          context,
+        ),
+      );
+    }
   } catch {
     return evaluationError("#REF!");
   }
-  if (overflowed) return evaluationError("#VALUE!");
   return {
     kind: "evaluationRange",
     values,
@@ -2919,6 +2931,14 @@ const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
       const sheetId = target.sheet ?? call.currentSheetId;
       const address = addressWithoutAnchors(target.address);
       if (address.startsWith("#")) return evaluationError("#REF!");
+      const hook = call.context.hooks.isFormulaCell;
+      if (hook) {
+        try {
+          return Boolean(hook(sheetId, address));
+        } catch {
+          return evaluationError("#REF!");
+        }
+      }
       try {
         const resolved = call.context.resolver(sheetId, address);
         if (typeof resolved === "string") return resolved.startsWith("=");

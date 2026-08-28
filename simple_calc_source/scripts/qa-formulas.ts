@@ -247,6 +247,12 @@ assert.equal(formula('ISNA(NA())'), true)
 assert.equal(formula('ISNA(1/0)'), false)
 assert.equal(formula('ISFORMULA(F5)'), true)
 assert.equal(formula('ISFORMULA(A1)'), false)
+// Hosts whose resolvers return computed values report formulas via the hook.
+const formulaCellHooked = (source: string) => evaluateFormula(source, 'Sheet1', resolver, {
+  isFormulaCell: (_sheet, address) => address === 'F5',
+})
+assert.equal(formulaCellHooked('ISFORMULA(F5)'), true)
+assert.equal(formulaCellHooked('ISFORMULA(A1)'), false)
 assert.equal(formula('F5'), 42)
 
 // IFNA / NA.

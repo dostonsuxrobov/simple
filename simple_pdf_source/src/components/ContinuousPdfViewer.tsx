@@ -69,16 +69,6 @@ function selectionNodeIsPdfText(root: HTMLElement, node: Node | null) {
   return Boolean(element?.closest('.text-layer'))
 }
 
-function selectionIntersectsNode(node: Node) {
-  const selection = window.getSelection()
-  if (!selection || selection.isCollapsed || selection.rangeCount < 1) return false
-  try {
-    return selection.getRangeAt(0).intersectsNode(node)
-  } catch {
-    return false
-  }
-}
-
 function closestCenteredPage(
   entries: Map<number, IntersectionObserverEntry>,
   root: HTMLElement,
@@ -341,20 +331,26 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
 
     // All spans on the clicked span's visual line, matched with the same
     // baseline clustering rule the text layer used to order them: flow-axis
-    // distance within 40% of the font height, at a comparable angle.
+    // distance within 40% of the font height, at a comparable angle. Spans in
+    // a side-by-side column share that flow band, so the candidates are then
+    // split at reading-axis gaps of an em or more and only the run around the
+    // clicked span survives — triple-click never selects the other column.
     const lineRangeForSpan = (span: HTMLSpanElement): { start: SelectionPoint; end: SelectionPoint } | null => {
       const layer = span.closest<HTMLElement>('.text-layer')
       const anchorAngle = Number(span.dataset.textAngle) || 0
       const flowX = -Math.sin(anchorAngle)
       const flowY = Math.cos(anchorAngle)
+      const readX = Math.cos(anchorAngle)
+      const readY = Math.sin(anchorAngle)
       const flowOf = (item: HTMLSpanElement) => Number(item.dataset.textBaselineX) * flowX + Number(item.dataset.textBaselineY) * flowY
+      const readOf = (item: HTMLSpanElement) => Number(item.dataset.textBaselineX) * readX + Number(item.dataset.textBaselineY) * readY
+      const advanceOf = (item: HTMLSpanElement) => Number(item.dataset.textAdvance) || 0
       const heightOf = (item: HTMLSpanElement) => Number.parseFloat(item.style.fontSize) || 0
       const anchorFlow = flowOf(span)
       if (!layer || !Number.isFinite(anchorFlow)) return null
-      const nodes: Text[] = []
+      const candidates: HTMLSpanElement[] = []
       for (const item of layer.querySelectorAll<HTMLSpanElement>('[data-text-item="true"]')) {
-        const node = item.firstChild
-        if (!(node instanceof Text)) continue
+        if (!(item.firstChild instanceof Text)) continue
         if (item !== span) {
           const angle = Number(item.dataset.textAngle) || 0
           const turn = Math.atan2(Math.sin(angle - anchorAngle), Math.cos(angle - anchorAngle))
@@ -362,11 +358,23 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
           if (Math.abs(turn) > 0.26 || !Number.isFinite(flow)
             || Math.abs(flow - anchorFlow) > Math.max(1, Math.max(heightOf(span), heightOf(item)) * 0.4)) continue
         }
-        nodes.push(node)
+        candidates.push(item)
       }
-      const first = nodes[0]
-      const last = nodes.at(-1)
-      return first && last ? { start: { node: first, offset: 0 }, end: { node: last, offset: last.length } } : null
+      candidates.sort((a, b) => readOf(a) - readOf(b))
+      let segment: HTMLSpanElement[] = []
+      for (const [index, item] of candidates.entries()) {
+        const previous = candidates[index - 1]
+        if (previous && readOf(item) - (readOf(previous) + advanceOf(previous)) > Math.max(heightOf(previous), heightOf(item))) {
+          if (segment.includes(span)) break
+          segment = []
+        }
+        segment.push(item)
+      }
+      const first = segment[0]?.firstChild
+      const last = segment.at(-1)?.firstChild
+      return first instanceof Text && last instanceof Text
+        ? { start: { node: first, offset: 0 }, end: { node: last, offset: last.length } }
+        : null
     }
 
     const applySelection = (
@@ -588,11 +596,11 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
             renderIntersectingPagesRef.current.delete(index)
             // Removing any node between a native Selection's anchor and focus
             // makes Chromium repaint the grey selection at a different range
-            // (or collapse it completely). While a selection is live, keep the
-            // pages it actually spans mounted; unmount the rest normally.
-            const retainedBySelection = nativeTextSelectionActiveRef.current
-              && selectionIntersectsNode(entry.target)
-            if (!retainedBySelection
+            // (or collapse it completely) — and a shift-click may yet extend
+            // the selection across pages scrolled past in between. Keep every
+            // traversed page mounted until the user clears that selection,
+            // then prune in one pass (finishSelection).
+            if (!nativeTextSelectionActiveRef.current
               && index !== currentPageRef.current
               && !pinnedPagesRef.current.includes(index)) next.delete(index)
           }

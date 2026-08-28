@@ -419,7 +419,11 @@ export const PdfPage = memo(function PdfPage({
     let cancelled = false
     const layer = textLayerRef.current
     const viewportSignature = textViewportSignature(currentViewport)
-    if (liveSelectionIntersectsTextLayer(layer)) {
+    // The deferral below protects a live Range against node REMOVAL only.
+    // Populating an empty layer that sits between the range's endpoints (a
+    // page remounting inside a multi-page selection) merely inserts nodes and
+    // leaves both boundary points untouched, so build it right away.
+    if (layer.childElementCount > 0 && liveSelectionIntersectsTextLayer(layer)) {
       // The canvas underneath has already re-rendered. While the rebuild is
       // deferred, never leave spans built for a different viewport visible
       // floating over the new orientation.
@@ -501,6 +505,7 @@ export const PdfPage = memo(function PdfPage({
         span.dir = item.dir || 'ltr'
         span.dataset.textItem = 'true'
         span.dataset.textId = `text-${pageIndex}-${itemIndex}`
+        span.dataset.textItemIndex = String(itemIndex)
         span.dataset.fontSize = String(pdfFontSize || fontHeight / zoom)
         span.dataset.fontFamily = fontFamily
         span.dataset.fontWeight = String(fontTraits.weight)
@@ -547,9 +552,11 @@ export const PdfPage = memo(function PdfPage({
             // Fall back to the untransformed DOM width after insertion.
           }
         }
+        const advanceWidth = (style.vertical ? item.height : item.width) * currentViewport.scale
+        span.dataset.textAdvance = String(advanceWidth)
         spans.push({
           span,
-          width: (style.vertical ? item.height : item.width) * currentViewport.scale,
+          width: advanceWidth,
           angle,
           measured,
           flow: tx[4] * flowAxis.x + tx[5] * flowAxis.y,
@@ -566,12 +573,72 @@ export const PdfPage = memo(function PdfPage({
       const lines: Array<{ flow: number; fontHeight: number; items: typeof spans }> = []
       for (const item of [...spans].sort((a, b) => a.flow - b.flow)) {
         const line = lines.at(-1)
-        if (line && Math.abs(item.flow - line.flow) <= Math.max(1, Math.max(item.fontHeight, line.fontHeight) * 0.4)) line.items.push(item)
-        else lines.push({ flow: item.flow, fontHeight: item.fontHeight, items: [item] })
+        if (line && Math.abs(item.flow - line.flow) <= Math.max(1, Math.max(item.fontHeight, line.fontHeight) * 0.4)) {
+          line.items.push(item)
+        } else if (line && line.fontHeight < item.fontHeight * 0.85 && item.flow - line.flow <= item.fontHeight * 0.8) {
+          // A superscript is raised (and shrunk) beyond the baseline rule
+          // above, yet still overlaps the ascent of the taller run following
+          // it. Merge them and let the taller run take over as the reference.
+          line.items.push(item)
+          line.flow = item.flow
+          line.fontHeight = item.fontHeight
+        } else {
+          lines.push({ flow: item.flow, fontHeight: item.fontHeight, items: [item] })
+        }
+      }
+      // Side-by-side columns share flow clusters, so emitting whole clusters
+      // would interleave the columns row by row. Split each cluster at reading
+      // gaps of an em or more and pool the runs into column bands; every flush
+      // emits complete bands left to right, keeping each column's lines
+      // contiguous. Single-column pages form one band and come out unchanged.
+      const bands: Array<{ start: number; end: number; lastFlow: number; items: typeof spans }> = []
+      const overlappingBands = (segment: { start: number; end: number }) =>
+        bands.filter((band) => segment.start <= band.end && band.start <= segment.end)
+      const flushBands = () => {
+        for (const band of [...bands].sort((a, b) => a.start - b.start)) {
+          for (const entry of band.items) fragment.appendChild(entry.span)
+        }
+        bands.length = 0
       }
       for (const line of lines) {
-        for (const entry of [...line.items].sort((a, b) => a.read - b.read)) fragment.appendChild(entry.span)
+        const segments: Array<{ start: number; end: number; items: typeof spans }> = []
+        for (const item of [...line.items].sort((a, b) => a.read - b.read)) {
+          const segment = segments.at(-1)
+          const previous = segment?.items.at(-1)
+          if (segment && previous && item.read - (previous.read + previous.width) <= Math.max(previous.fontHeight, item.fontHeight)) {
+            segment.items.push(item)
+            segment.end = Math.max(segment.end, item.read + item.width)
+          } else {
+            segments.push({ start: item.read, end: item.read + item.width, items: [item] })
+          }
+        }
+        // A clear vertical break ends the current column layout; so does a run
+        // bridging several bands (a full-width heading between column regions)
+        // or two runs of one line landing in a single band (columns starting
+        // beneath full-width text). Emit the finished bands before continuing.
+        if (bands.length && bands.every((band) => line.flow - band.lastFlow > Math.max(1, line.fontHeight) * 3)) flushBands()
+        const claimed = new Set<(typeof bands)[number]>()
+        for (const segment of segments) {
+          const overlapping = overlappingBands(segment)
+          if (overlapping.length > 1 || (overlapping.length === 1 && claimed.has(overlapping[0]))) {
+            flushBands()
+            break
+          }
+          if (overlapping.length === 1) claimed.add(overlapping[0])
+        }
+        for (const segment of segments) {
+          const band = overlappingBands(segment)[0]
+          if (band) {
+            band.start = Math.min(band.start, segment.start)
+            band.end = Math.max(band.end, segment.end)
+            band.lastFlow = line.flow
+            band.items.push(...segment.items)
+          } else {
+            bands.push({ start: segment.start, end: segment.end, lastFlow: line.flow, items: segment.items })
+          }
+        }
       }
+      flushBands()
 
       layer.appendChild(fragment)
       layer.dataset.viewportSignature = viewportSignature
@@ -1236,6 +1303,22 @@ export const PdfPage = memo(function PdfPage({
 
   const activeTextBox = activeText ? pdfRectToViewport(viewport, activeText.rect) : null
   const activeObjectBox = activeObject ? pdfRectToViewport(viewport, activeObject.rect) : null
+  // Object pixels are stored in unrotated PDF orientation (captureRect and the
+  // signature/image placement normalize them), so on a rotated page the raw
+  // <img> must be turned by the current display rotation to match the canvas
+  // and the axis-aligned draw the saver performs.
+  const objectImageStyle = (box: { width: number; height: number }): CSSProperties | undefined => {
+    if (!displayRotation) return undefined
+    if (displayRotation === 180) return { transform: 'rotate(180deg)' }
+    return {
+      position: 'absolute',
+      left: '50%',
+      top: '50%',
+      width: box.height,
+      height: box.width,
+      transform: `translate(-50%, -50%) rotate(${displayRotation}deg)`,
+    }
+  }
   const rememberedTextVisual = textVisualStyleRef.current
   const activeTextVisual = activeText
     && rememberedTextVisual?.pageIndex === pageIndex
@@ -1402,7 +1485,7 @@ export const PdfPage = memo(function PdfPage({
                           modified: false,
                         })
                       }}
-                    ><img src={overlay.dataUrl} alt="Edited PDF object" draggable={false} /></button>
+                    ><img src={overlay.dataUrl} alt="Edited PDF object" draggable={false} style={objectImageStyle(box)} /></button>
                   )}
                 </div>
               )
@@ -1607,7 +1690,7 @@ export const PdfPage = memo(function PdfPage({
         )}
         {activeObject && activeObjectBox && (
           <div className={cx('object-edit-frame', activeObject.candidateId && !activeObject.modified && 'is-native-selection')} data-edit-ui="true" style={activeObjectBox}>
-            {activeObject.dataUrl && (!activeObject.candidateId || activeObject.modified) && <img src={activeObject.dataUrl} alt={activeObject.label} draggable={false} style={{ opacity: activeObject.opacity }} />}
+            {activeObject.dataUrl && (!activeObject.candidateId || activeObject.modified) && <img src={activeObject.dataUrl} alt={activeObject.label} draggable={false} style={{ opacity: activeObject.opacity, ...objectImageStyle(activeObjectBox) }} />}
             <span
               role="presentation"
               className="selection-move-handle"

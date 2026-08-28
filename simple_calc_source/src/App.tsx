@@ -328,13 +328,21 @@ function compareCellScalars(a: CellScalar, b: CellScalar) {
 
 function replaceAllOccurrences(source: string, query: string, replacement: string) {
   if (!query) return source
-  const haystack = source.toLocaleLowerCase()
+  // Compare per candidate position instead of index-mapping across a
+  // lowercased copy: toLocaleLowerCase can change string length (e.g. 'İ'),
+  // which would scatter haystack indices across the original source.
   const needle = query.toLocaleLowerCase()
   let output = ''
   let position = 0
-  for (let found = haystack.indexOf(needle); found >= 0; found = haystack.indexOf(needle, position)) {
-    output += source.slice(position, found) + replacement
-    position = found + needle.length
+  let index = 0
+  while (index + query.length <= source.length) {
+    if (source.slice(index, index + query.length).toLocaleLowerCase() === needle) {
+      output += source.slice(position, index) + replacement
+      index += query.length
+      position = index
+    } else {
+      index += 1
+    }
   }
   return output + source.slice(position)
 }
@@ -714,6 +722,11 @@ function createValueResolver(workbook: WorkbookModel) {
       if (entry) return entry.ranges?.[0] || entry.ref
       const metadataEntry = workbook.metadata?.definedNames?.find((item) => item.name.toLocaleLowerCase() === wanted)
       return metadataEntry ? metadataEntry.ranges || metadataEntry.formula : undefined
+    },
+    isFormulaCell: (sheetReference, address) => {
+      const sheet = resolveSheet(sheetReference)
+      if (!sheet) return false
+      return Boolean(sheet.cells[address.replace(/\$/g, '').toUpperCase()]?.formula)
     },
   }
 
@@ -3204,6 +3217,20 @@ export default function App() {
       setToast('Sort is unavailable across merged cells. Unmerge them first.')
       return
     }
+    const overlapsBounds = (range: { top: number; bottom: number; left: number; right: number }) => (
+      range.bottom >= bounds.top && range.top <= bounds.bottom && range.right >= bounds.left && range.left <= bounds.right
+    )
+    if (Object.entries(activeSheet.cells).some(([address, cell]) => {
+      const extended = cell as CellData & { sharedFormulaMaster?: string }
+      if (!(cell.formulaType === 'array' || cell.formulaType === 'shared' || cell.formulaRange || cell.dynamicFormula || extended.sharedFormulaMaster)) return false
+      const formulaBounds = cell.formulaRange ? mergeBounds(cell.formulaRange) : null
+      if (formulaBounds) return overlapsBounds(formulaBounds)
+      const coord = coordOf(address)
+      return Boolean(coord && overlapsBounds({ top: coord.row, bottom: coord.row, left: coord.col, right: coord.col }))
+    })) {
+      setToast('Sort is unavailable across array or shared formulas.')
+      return
+    }
     const sourceRows = Array.from({ length: bounds.bottom - bounds.top + 1 }, (_, offset) => bounds.top + offset)
     const keyByRow = new Map(sourceRows.map((row) => {
       const address = addressOf({ row, col: bounds.left })
@@ -3235,7 +3262,9 @@ export default function App() {
             delete cell.formulaRange
             delete cell.dynamicFormula
             delete cell.result
+            delete cell.resultType
             delete cell.display
+            delete (cell as CellData & { sharedFormulaMaster?: string }).sharedFormulaMaster
           }
           if (cell && hasCellContent(cell)) sheet.cells[address] = cell
           else delete sheet.cells[address]

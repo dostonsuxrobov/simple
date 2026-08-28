@@ -1419,7 +1419,12 @@ function detectDecimalComma(records, delimiter) {
       scanned += 1
       const field = rawField.trim().replace(/%$/, '')
       if (!field) continue
-      const eu = EU_DECIMAL_RE.test(field) || EU_GROUPED_RE.test(field)
+      // In a comma-delimited file a bare "n,n" field can only come from a
+      // quoted field, where it is as likely a text pair ("6,8") as an EU
+      // decimal; only the unambiguous grouped form ("1.234,56") counts.
+      const eu = delimiter === ','
+        ? EU_GROUPED_RE.test(field)
+        : EU_DECIMAL_RE.test(field) || EU_GROUPED_RE.test(field)
       const us = US_DECIMAL_RE.test(field) || US_GROUPED_RE.test(field)
       if (eu && !us) euSignals += 1
       else if (us && !eu) usSignals += 1
@@ -1488,7 +1493,7 @@ function delimitedFieldToModelCell(field, decimalComma) {
   const trimmed = field.trim()
   if (!trimmed) return { value: field, display: field }
   if (trimmed.startsWith('=') && trimmed.length > 1) {
-    return { formula: trimmed.slice(1), result: field, display: field }
+    return { formula: trimmed.slice(1) }
   }
   if (trimmed === 'TRUE' || trimmed === 'FALSE') return { value: trimmed === 'TRUE', display: field }
   if (ERROR_TEXT_TO_CODE[trimmed] != null) return { value: trimmed, type: 'error', display: field }

@@ -45,7 +45,12 @@ function normalizeMappedFragment(value: string) {
  * space between spans is important for phrase matches.
  */
 function mapTextLayer(layer: HTMLElement): NormalizedTextMap {
+  // The text layer appends spans in visual reading order, but occurrence
+  // indices are counted against getTextContent's content-stream order
+  // (Sidebar searches pages that have no text layer mounted). Restore stream
+  // order here so the k-th counted occurrence resolves to the k-th mapped one.
   const nodes = Array.from(layer.querySelectorAll<HTMLElement>('[data-text-item="true"]'))
+    .sort((a, b) => Number(a.dataset.textItemIndex || 0) - Number(b.dataset.textItemIndex || 0))
     .map((span) => span.firstChild)
     .filter((node): node is Text => node instanceof Text && Boolean(node.data))
   const output: string[] = []
@@ -130,22 +135,43 @@ export function findTextLayerSearchRects(
   const mapped = mapTextLayer(textLayer)
   const matchOffset = occurrenceOffset(mapped.text, needle, occurrenceIndex)
   if (matchOffset < 0) return []
-  const start = mapped.starts[matchOffset]
-  const end = mapped.ends[matchOffset + needle.length - 1]
-  if (!start || !end) return []
 
-  const range = document.createRange()
-  range.setStart(start.node, start.offset)
-  range.setEnd(end.node, end.offset)
+  // A match's nodes may be far apart — or even reversed — in DOM order, since
+  // the mapping runs in stream order while the layer is laid out visually.
+  // Measure one single-node Range per touched text node instead of a single
+  // start-to-end Range, which would collapse or cover interposed spans.
+  // Virtual inter-node spaces have differing start/end nodes and no ink.
+  const nodeIntervals = new Map<Text, { start: number; end: number }>()
+  for (let index = matchOffset; index < matchOffset + needle.length; index += 1) {
+    const start = mapped.starts[index]
+    const end = mapped.ends[index]
+    if (!start || !end || start.node !== end.node) continue
+    const interval = nodeIntervals.get(start.node)
+    if (interval) {
+      interval.start = Math.min(interval.start, start.offset)
+      interval.end = Math.max(interval.end, end.offset)
+    } else {
+      nodeIntervals.set(start.node, { start: start.offset, end: end.offset })
+    }
+  }
+
   const surfaceBounds = pageSurface.getBoundingClientRect()
-  const rectangles = Array.from(range.getClientRects())
-    .filter((rect) => rect.width > 0.25 && rect.height > 0.25)
-    .map((rect) => ({
-      left: rect.left - surfaceBounds.left,
-      top: rect.top - surfaceBounds.top,
-      width: rect.width,
-      height: rect.height,
-    }))
+  const rectangles: SearchMatchRect[] = []
+  const range = document.createRange()
+  for (const [node, interval] of nodeIntervals) {
+    range.setStart(node, interval.start)
+    range.setEnd(node, interval.end)
+    for (const rect of range.getClientRects()) {
+      if (rect.width > 0.25 && rect.height > 0.25) {
+        rectangles.push({
+          left: rect.left - surfaceBounds.left,
+          top: rect.top - surfaceBounds.top,
+          width: rect.width,
+          height: rect.height,
+        })
+      }
+    }
+  }
   range.detach()
   return rectangles
 }

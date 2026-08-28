@@ -474,6 +474,10 @@ function applyEnvelope(ctx: RibbonActionContext, size: (typeof ENVELOPE_SIZES)[n
 function createEnvelope() {
   const ctx = envelopeContext;
   if (!ctx) return;
+  if (saving) {
+    notify("A save is in progress. Try again when it finishes.", "error");
+    return;
+  }
   const sizeId = $<HTMLSelectElement>("envelope-size").value;
   const size = ENVELOPE_SIZES.find((candidate) => candidate.id === sizeId) ?? ENVELOPE_SIZES[0];
   if (documentOpen && (dirty || !documentIsEmpty(ctx)) && !window.confirm(`Replace "${documentName}" with the envelope? Unsaved changes will be lost.`)) return;
