@@ -50,8 +50,13 @@ async function waitFor(expression, label) {
 
 await waitFor(`Boolean(document.querySelector('.continuous-page-slot.is-current .page-canvas'))`, 'page canvas')
 await waitFor(`Array.from(document.querySelectorAll('.continuous-page-slot.is-current [data-text-item="true"]')).some((item) => item.textContent.startsWith('Select only'))`, 'source text')
+if (process.env.SIMPLE_EDITOR_ROTATION === '90') {
+  await evaluate(`document.querySelector('button[aria-label="Rotate page 1 right"]').click()`)
+  await waitFor(`Array.from(document.querySelectorAll('.continuous-page-slot.is-current [data-text-item="true"]')).some((item) => item.textContent.startsWith('Select only') && Math.abs(Number(item.dataset.textAngle) - Math.PI / 2) < 0.01)`, 'rotated source text')
+}
 await evaluate(`document.querySelector('button[aria-label="Edit text (E)"]').click()`)
 await waitFor(`Boolean(document.querySelector('.continuous-page-slot.is-current .page-surface.tool-edit'))`, 'edit mode')
+await waitFor(`Array.from(document.querySelectorAll('.continuous-page-slot.is-current [data-text-item="true"]')).some((item) => item.textContent.startsWith('Select only'))`, 'source text after edit-mode layout')
 
 const opened = await evaluate(`(() => {
   const span = Array.from(document.querySelectorAll('.continuous-page-slot.is-current [data-text-item="true"]')).find((item) => item.textContent.startsWith('Select only'))
@@ -70,6 +75,13 @@ const opened = await evaluate(`(() => {
 })()`)
 await waitFor(`document.querySelector('.inline-pdf-text-editor')?.value === ${JSON.stringify(opened.itemText)}`, 'whole-run text editor')
 await waitFor(`document.querySelector('.inline-pdf-text-editor')?.selectionStart === ${opened.start} && document.querySelector('.inline-pdf-text-editor')?.selectionEnd === ${opened.end}`, 'selected substring in whole run')
+if (process.env.SIMPLE_EDITOR_ROTATION === '90') {
+  const transform = await evaluate(`getComputedStyle(document.querySelector('.inline-pdf-text-editor')).transform`)
+  const entries = transform.match(/matrix\(([^)]+)\)/)?.[1].split(',').map(Number)
+  if (!entries || Math.abs(entries[0]) > 0.01 || Math.abs(entries[1]) < 0.1) {
+    throw new Error(`Native text editor did not follow the rotated page: ${transform}`)
+  }
+}
 
 const firstReplacement = opened.itemText.replace('only these four', 'exactly four')
 const finalReplacement = firstReplacement.replace('exactly four', 'precisely four')

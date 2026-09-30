@@ -1,20 +1,32 @@
 {
   "name": "simple-docs",
   "version": "1.0.0",
-  "description": "A fast, local-first DOCX editor for Windows.",
+  "description": "A fast, local-first Word editor for DOCX and legacy DOC files on Windows.",
   "author": "Simple Docs",
   "license": "MIT",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
+    "postinstall": "node scripts/patch-wordcanvas.cjs",
+    "pretest": "node scripts/patch-wordcanvas.cjs",
+    "prebuild:web": "node scripts/patch-wordcanvas.cjs",
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build:web": "vite build",
-    "build": "npm run build:web && node scripts/prepare-portable-build.cjs && electron-builder --win portable --x64",
-    "build:dir": "npm run build:web && electron-builder --win dir --x64",
-    "typecheck": "tsc --noEmit"
+    "build": "npm run test && npm run build:web && node scripts/prepare-portable-build.cjs && electron-builder --win portable --x64",
+    "build:dir": "npm run test && npm run build:web && electron-builder --win dir --x64",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node --test tests/*.test.cjs && node scripts/test-wordcanvas-patch.mjs",
+    "test:print:ui": "node scripts/run-print-dialog-smoke.mjs",
+    "test:print:host": "electron scripts/run-print-host-smoke.cjs",
+    "test:fidelity": "node scripts/run-document-fidelity-smoke.mjs",
+    "test:editor:stress": "node scripts/run-editor-stress.mjs"
   },
   "dependencies": {
-    "@forevka/wordcanvas": "0.12.0"
+    "@forevka/wordcanvas": "0.12.0",
+    "cfb": "1.2.2",
+    "jszip": "^3.10.1",
+    "pdf-lib": "1.17.1",
+    "word-extractor": "^1.0.4"
   },
   "devDependencies": {
     "@types/node": "22.10.2",
@@ -30,7 +42,9 @@
     "appId": "com.simple.docs",
     "productName": "Simple Docs",
     "asar": true,
-    "electronLanguages": ["en-US"],
+    "electronLanguages": [
+      "en-US"
+    ],
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -48,14 +62,19 @@
       "target": [
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "artifactName": "Simple-Docs-${version}-portable.${ext}"
     },
     "fileAssociations": [
       {
-        "ext": "docx",
+        "ext": [
+          "docx",
+          "doc"
+        ],
         "name": "Word document",
         "description": "Word document",
         "role": "Editor",

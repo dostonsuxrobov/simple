@@ -1,15 +1,25 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, shell, protocol, net } = require('electron')
 const fs = require('node:fs/promises')
+const { constants: fsConstants } = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
+const { MAX_FILE_BYTES, validateDocxBytes } = require('./docx-files.cjs')
+const { validateLegacyDocBytes } = require('./legacy-doc.cjs')
+const { SUPPORTED_EXTENSIONS, convertLegacyDocToDocx, isSupportedDocumentPath } = require('./document-files.cjs')
+const { needsOfficeLayout } = require('./document-layout.cjs')
+const { exportFormat, validateExportBytes } = require('./export-files.cjs')
+const { isStalePrintDirectory, loadPdfForPrinting, printWebContentsSilently, PRINT_DIRECTORY_PREFIX } = require('./print-host.cjs')
+const { composePrintPdf, nativePrintOptions, resolvePrinter, validatePdfBytes } = require('./print-layout.cjs')
+const { installedDocumentFonts } = require('./document-fonts.cjs')
+const { findOfficeConverter, convertOfficeBytes } = require('./office-converter.cjs')
+const JSZip = require('jszip')
 
-const DOCX_EXTENSION = '.docx'
-const MAX_FILE_BYTES = 256 * 1024 * 1024
-const MAX_ZIP_ENTRIES = 20_000
-const MAX_ZIP_ENTRY_BYTES = 512 * 1024 * 1024
-const MAX_ZIP_TOTAL_BYTES = 1024 * 1024 * 1024
+protocol.registerSchemesAsPrivileged([{ scheme: 'simple-font', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }])
+let documentFontsPromise
+function documentFonts() { return documentFontsPromise ||= installedDocumentFonts() }
+
 const closeApprovedWindows = new WeakSet()
 
 function callingWindow(event) {
@@ -34,71 +44,6 @@ function safeStem(value) {
 
 function ensureExtension(filePath, extension) {
   return filePath.toLowerCase().endsWith(extension) ? filePath : `${filePath}${extension}`
-}
-
-function validateDocxPackage(bytes) {
-  const minimumEocdOffset = Math.max(0, bytes.length - 65_557)
-  let eocdOffset = -1
-  for (let offset = bytes.length - 22; offset >= minimumEocdOffset; offset -= 1) {
-    if (bytes.readUInt32LE(offset) === 0x06054b50) {
-      eocdOffset = offset
-      break
-    }
-  }
-  if (eocdOffset < 0) throw new Error('This DOCX archive is incomplete.')
-
-  const entryCount = bytes.readUInt16LE(eocdOffset + 10)
-  const centralSize = bytes.readUInt32LE(eocdOffset + 12)
-  const centralOffset = bytes.readUInt32LE(eocdOffset + 16)
-  if (entryCount === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) {
-    throw new Error('This DOCX uses an unsupported ZIP64 layout.')
-  }
-  if (!entryCount || entryCount > MAX_ZIP_ENTRIES || centralOffset + centralSize > bytes.length) {
-    throw new Error('This DOCX archive has an unsafe directory structure.')
-  }
-
-  let cursor = centralOffset
-  let totalUncompressed = 0
-  let hasContentTypes = false
-  let hasMainDocument = false
-  for (let index = 0; index < entryCount; index += 1) {
-    if (cursor + 46 > bytes.length || bytes.readUInt32LE(cursor) !== 0x02014b50) {
-      throw new Error('This DOCX archive has a damaged file directory.')
-    }
-    const flags = bytes.readUInt16LE(cursor + 8)
-    const compressedSize = bytes.readUInt32LE(cursor + 20)
-    const uncompressedSize = bytes.readUInt32LE(cursor + 24)
-    const nameLength = bytes.readUInt16LE(cursor + 28)
-    const extraLength = bytes.readUInt16LE(cursor + 30)
-    const commentLength = bytes.readUInt16LE(cursor + 32)
-    const nextCursor = cursor + 46 + nameLength + extraLength + commentLength
-    if (nextCursor > bytes.length || compressedSize === 0xffffffff || uncompressedSize === 0xffffffff) {
-      throw new Error('This DOCX archive contains an unsupported entry.')
-    }
-    if ((flags & 0x1) !== 0) throw new Error('Password-protected DOCX files are not supported.')
-    if (uncompressedSize > MAX_ZIP_ENTRY_BYTES) throw new Error('This DOCX contains an entry that is too large.')
-    totalUncompressed += uncompressedSize
-    if (totalUncompressed > MAX_ZIP_TOTAL_BYTES) throw new Error('This DOCX expands beyond the safe size limit.')
-
-    const entryName = bytes.subarray(cursor + 46, cursor + 46 + nameLength).toString('utf8').replace(/\\/g, '/')
-    if (entryName.startsWith('/') || entryName.split('/').includes('..')) {
-      throw new Error('This DOCX contains an unsafe file path.')
-    }
-    if (entryName === '[Content_Types].xml') hasContentTypes = true
-    if (entryName === 'word/document.xml') hasMainDocument = true
-    cursor = nextCursor
-  }
-  if (cursor > centralOffset + centralSize || !hasContentTypes || !hasMainDocument) {
-    throw new Error('This archive does not contain a complete Word document.')
-  }
-}
-
-function validateDocxBytes(data) {
-  const bytes = toBytes(data)
-  if (bytes.byteLength < 4 || bytes.byteLength > MAX_FILE_BYTES) throw new Error('The DOCX file is empty or too large.')
-  if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) throw new Error('This is not a valid DOCX file.')
-  validateDocxPackage(bytes)
-  return bytes
 }
 
 async function atomicWrite(targetPath, data) {
@@ -145,14 +90,85 @@ async function addRecent(filePath) {
   await writeJson('recent-files.json', next)
 }
 
+async function loadDocumentBytes(data, name, sourcePath = null) {
+  const fileName = path.basename(String(name || ''))
+  const extension = path.extname(fileName).toLowerCase()
+  if (!SUPPORTED_EXTENSIONS.has(extension)) throw new Error('Simple Docs opens .docx and legacy .doc files.')
+  const bytes = toBytes(data)
+  if (!bytes.byteLength || bytes.byteLength > MAX_FILE_BYTES) throw new Error('The Word document is empty or too large.')
+
+  if (extension === '.doc') {
+    if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+      const validated = validateDocxBytes(bytes)
+      return {
+        data: new Uint8Array(validated),
+        name: `${safeStem(fileName)}.docx`,
+        path: null,
+        sourcePath,
+        size: validated.byteLength,
+        convertedFrom: 'docx-renamed',
+        requiresSaveAs: true,
+      }
+    }
+    // Prepare the reading/printing view while the editable conversion runs.
+    // The bounded engine cache makes the later preview request reuse this work.
+    if (await findOfficeConverter()) void convertOfficeBytes({ bytes, inputExtension: 'doc', outputExtension: 'pdf', filter: 'writer_pdf_Export' }).catch(() => {})
+    const converted = await convertLegacyDocToDocx(bytes, { title: fileName })
+    return {
+      data: new Uint8Array(converted.data),
+      name: converted.conversionMethod === 'layout' ? fileName : `${safeStem(fileName)}.docx`,
+      path: converted.conversionMethod === 'layout' ? sourcePath : null,
+      format: converted.conversionMethod === 'layout' ? 'doc' : 'docx',
+      sourceData: converted.conversionMethod === 'layout' ? new Uint8Array(bytes) : undefined,
+      sourceHash: sourcePath ? crypto.createHash('sha256').update(bytes).digest('hex') : undefined,
+      sourcePath,
+      size: converted.data.byteLength,
+      convertedFrom: 'doc',
+      conversionMethod: converted.conversionMethod,
+      ...(converted.conversionMethod === 'layout' ? { originalLayout: { data: new Uint8Array(bytes), extension: 'doc' } } : {}),
+      requiresSaveAs: converted.conversionMethod !== 'layout' || !sourcePath,
+      conversionWarnings: converted.warnings,
+    }
+  }
+
+  const validated = validateDocxBytes(bytes)
+  let originalLayout
+  // Anchored objects and floating tables need a full Office page-layout engine.
+  // Preserve their original rendered view rather than pretending canvas reflow
+  // has retained their positions.
+  if (await findOfficeConverter()) {
+    try {
+      const zip = await JSZip.loadAsync(validated)
+      const parts = Object.keys(zip.files).filter((name) => /^word\/(document|header\d+|footer\d+)\.xml$/.test(name))
+      for (const name of parts) {
+        const xml = await zip.file(name)?.async('string')
+        if (xml && needsOfficeLayout(xml, name)) {
+          originalLayout = { data: new Uint8Array(validated), extension: 'docx' }
+          break
+        }
+      }
+    } catch { /* The validated document can still open in the editor. */ }
+  }
+  return {
+    data: new Uint8Array(validated),
+    name: fileName,
+    path: sourcePath,
+    sourcePath,
+    size: validated.byteLength,
+    requiresSaveAs: !sourcePath,
+    originalLayout,
+    sourceHash: sourcePath ? crypto.createHash('sha256').update(bytes).digest('hex') : undefined,
+  }
+}
+
 async function loadDocument(filePath) {
   const resolved = path.resolve(filePath)
-  if (path.extname(resolved).toLowerCase() !== DOCX_EXTENSION) throw new Error('Simple Docs opens .docx files.')
+  if (!isSupportedDocumentPath(resolved)) throw new Error('Simple Docs opens .docx and legacy .doc files.')
   const stat = await fs.stat(resolved)
-  if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw new Error('The DOCX file is too large.')
-  const data = validateDocxBytes(await fs.readFile(resolved))
+  if (!stat.isFile() || !stat.size || stat.size > MAX_FILE_BYTES) throw new Error('The Word document is empty or too large.')
+  const payload = await loadDocumentBytes(await fs.readFile(resolved), path.basename(resolved), resolved)
   await addRecent(resolved)
-  return { data: new Uint8Array(data), name: path.basename(resolved), path: resolved, size: data.byteLength }
+  return payload
 }
 
 function showOpenDialogFor(event, options) {
@@ -165,22 +181,49 @@ function showSaveDialogFor(event, options) {
   return owner ? dialog.showSaveDialog(owner, options) : dialog.showSaveDialog(options)
 }
 
-async function printPdf(data, name, owner) {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-docs-print-'))
-  const pdfPath = path.join(directory, `${safeStem(name)}.pdf`)
+function printerCapabilityHints(options = {}) {
+  const flattened = Object.entries(options)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(' ')
+    .toLowerCase()
+  return {
+    supportsDuplex: /duplex|two[-_ ]?sided|sides[-_]supported/.test(flattened),
+    supportsColor: /(^|\W)colou?r/.test(flattened) || !/monochrome|black[-_ ]?and[-_ ]?white/.test(flattened),
+  }
+}
+
+function printerSummary(printer) {
+  return {
+    name: printer.name,
+    displayName: printer.displayName || printer.name,
+    ...printerCapabilityHints(printer.options),
+  }
+}
+
+async function printPdf(input, owner, contents) {
+  let printers
+  try {
+    printers = await contents.getPrintersAsync()
+  } catch (error) {
+    return { success: false, failureReason: `Simple could not read the Windows printers: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  let printer
+  try {
+    printer = resolvePrinter(printers, input?.deviceName)
+  } catch (error) {
+    return { success: false, failureReason: error instanceof Error ? error.message : String(error) }
+  }
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), PRINT_DIRECTORY_PREFIX))
+  const pdfPath = path.join(directory, `${safeStem(input?.name)}.pdf`)
   let printWindow = null
   const cleanup = () => fs.rm(directory, { recursive: true, force: true }).catch(() => {})
   try {
-    await fs.writeFile(pdfPath, toBytes(data))
+    await fs.writeFile(pdfPath, validatePdfBytes(input?.data))
     printWindow = new BrowserWindow({
       ...(owner ? { parent: owner } : {}),
-      width: 1040,
-      height: 820,
-      minWidth: 720,
-      minHeight: 540,
       show: false,
-      title: `Print preview — ${safeStem(name)}`,
-      backgroundColor: '#f2f2f2',
+      title: `Printing — ${safeStem(input?.name)}`,
+      backgroundColor: '#ffffff',
       webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, plugins: true, devTools: false },
     })
     printWindow.removeMenu()
@@ -191,10 +234,16 @@ async function printPdf(data, name, owner) {
     printWindow.webContents.on('will-navigate', (event, url) => {
       if (url !== pathToFileURL(pdfPath).href) event.preventDefault()
     })
-    printWindow.on('closed', cleanup)
-    await printWindow.loadURL(pathToFileURL(pdfPath).href)
-    printWindow.show()
-    return true
+    await loadPdfForPrinting(printWindow, pathToFileURL(pdfPath).href)
+    const options = nativePrintOptions({ ...input, deviceName: printer.name })
+    const printed = await printWebContentsSilently(printWindow.webContents, options)
+    if (printWindow && !printWindow.isDestroyed()) printWindow.destroy()
+    await cleanup()
+    return {
+      ...printed,
+      printerName: printer.name,
+      printerLabel: printer.displayName || printer.name,
+    }
   } catch (error) {
     if (printWindow && !printWindow.isDestroyed()) printWindow.destroy()
     await cleanup()
@@ -207,8 +256,14 @@ async function cleanupStalePrintDirectories() {
   let entries = []
   try { entries = await fs.readdir(temporaryRoot, { withFileTypes: true }) } catch { return }
   await Promise.all(entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith('simple-docs-print-'))
-    .map((entry) => fs.rm(path.join(temporaryRoot, entry.name), { recursive: true, force: true }).catch(() => {})))
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(PRINT_DIRECTORY_PREFIX))
+    .map(async (entry) => {
+      const target = path.join(temporaryRoot, entry.name)
+      try {
+        const stats = await fs.stat(target)
+        if (isStalePrintDirectory(entry.name, stats)) await fs.rm(target, { recursive: true, force: true })
+      } catch {}
+    }))
 }
 
 function createWindow(openPath = null) {
@@ -226,10 +281,19 @@ function createWindow(openPath = null) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      plugins: true,
       devTools: !app.isPackaged,
     },
   })
   window.removeMenu()
+  window.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown' || !(input.control || input.meta) || input.alt) return
+    const key = String(input.key).toLowerCase()
+    const action = key === 'p' ? 'print' : key === 's' ? input.shift ? 'save-as' : 'save' : key === 'e' && input.shift ? 'export' : null
+    if (!action) return
+    event.preventDefault()
+    window.webContents.send('document:shortcut', action)
+  })
   if (!app.isPackaged) {
     window.webContents.on('did-fail-load', (_event, code, description, url) => {
       console.error(`[load:${code}] ${description} ${url}`)
@@ -263,47 +327,69 @@ function createWindow(openPath = null) {
 }
 
 function registerIpc() {
+  ipcMain.handle('document:fonts', async () => (await documentFonts()).fonts)
+  ipcMain.handle('document:original-pdf', async (_event, input) => {
+    const extension = input?.extension
+    if (!['doc', 'docx'].includes(extension)) throw new Error('Unsupported original document format.')
+    const bytes = toBytes(input?.data)
+    if (!bytes.length || bytes.length > MAX_FILE_BYTES) throw new Error('The original document is empty or too large.')
+    return new Uint8Array(validatePdfBytes(await convertOfficeBytes({ bytes, inputExtension: extension, outputExtension: 'pdf', filter: 'writer_pdf_Export' })))
+  })
   ipcMain.handle('file:open-dialog', async (event) => {
     const result = await showOpenDialogFor(event, {
       title: 'Open a Word document',
       properties: ['openFile'],
-      filters: [{ name: 'Word documents', extensions: ['docx'] }],
+      filters: [{ name: 'Word documents', extensions: ['docx', 'doc'] }],
     })
     if (result.canceled || !result.filePaths[0]) return null
     return loadDocument(result.filePaths[0])
   })
   ipcMain.handle('file:open-path', (_event, filePath) => loadDocument(filePath))
+  ipcMain.handle('file:open-bytes', (_event, input) => loadDocumentBytes(input?.data, input?.name))
   ipcMain.handle('file:open-in-new-window', async (event, requestedPath = null) => {
     let selectedPath = requestedPath
     if (!selectedPath) {
       const result = await showOpenDialogFor(event, {
-        title: 'Open a Word document', properties: ['openFile'], filters: [{ name: 'Word documents', extensions: ['docx'] }],
+        title: 'Open a Word document', properties: ['openFile'], filters: [{ name: 'Word documents', extensions: ['docx', 'doc'] }],
       })
       if (result.canceled || !result.filePaths[0]) return false
       selectedPath = result.filePaths[0]
     }
-    if (path.extname(selectedPath).toLowerCase() !== DOCX_EXTENSION) throw new Error('Simple Docs opens .docx files.')
+    if (!isSupportedDocumentPath(selectedPath)) throw new Error('Simple Docs opens .docx and legacy .doc files.')
     await fs.access(selectedPath)
     createWindow(path.resolve(selectedPath))
     return true
   })
   ipcMain.handle('app:new-window', () => { createWindow(); return true })
   ipcMain.handle('file:save-docx', async (event, input) => {
-    const data = validateDocxBytes(input.data)
+    const format = input.format === 'doc' && !input.forceDialog ? 'doc' : 'docx'
+    const extension = `.${format}`
+    let data = validateDocxBytes(input.data)
     let target = input.forceDialog ? null : input.path
     if (!target) {
       const result = await showSaveDialogFor(event, {
         title: input.forceDialog ? 'Save document as' : 'Save document',
-        defaultPath: ensureExtension(safeStem(input.name), '.docx'),
-        filters: [{ name: 'Word document', extensions: ['docx'] }],
+        defaultPath: ensureExtension(safeStem(input.name), extension),
+        filters: [{ name: format === 'doc' ? 'Word 97–2003 document' : 'Word document', extensions: [format] }],
       })
       if (result.canceled || !result.filePath) return null
-      target = ensureExtension(result.filePath, '.docx')
+      target = ensureExtension(result.filePath, extension)
     }
-    target = ensureExtension(path.resolve(target), '.docx')
+    target = ensureExtension(path.resolve(target), extension)
+    if (format === 'doc') data = input.sourceData
+      ? validateLegacyDocBytes(input.sourceData)
+      : validateLegacyDocBytes(await convertOfficeBytes({ bytes: data, inputExtension: 'docx', outputExtension: 'doc', filter: 'MS Word 97' }))
+    if (!input.forceDialog && input.path && input.expectedHash) {
+      const existing = await fs.readFile(target).catch(() => null)
+      if (!existing || crypto.createHash('sha256').update(existing).digest('hex') !== input.expectedHash) throw new Error('This file changed outside Simple Docs. Use Save as to keep both versions.')
+    }
+    if (!input.forceDialog && input.path && input.protectOriginal) {
+      const backupPath = path.join(path.dirname(target), `${path.basename(target, path.extname(target))}.before-simple-edit${path.extname(target)}`)
+      try { await fs.copyFile(target, backupPath, fsConstants.COPYFILE_EXCL) } catch (error) { if (!['ENOENT', 'EEXIST'].includes(error.code)) throw error }
+    }
     await atomicWrite(target, data)
     await addRecent(target)
-    return { path: target, name: path.basename(target) }
+    return { path: target, name: path.basename(target), format, sourceHash: crypto.createHash('sha256').update(data).digest('hex'), ...(format === 'doc' ? { sourceData: new Uint8Array(data) } : {}) }
   })
   ipcMain.handle('file:save-pdf', async (event, input) => {
     const result = await showSaveDialogFor(event, {
@@ -314,7 +400,23 @@ function registerIpc() {
     await atomicWrite(target, input.data)
     return { path: target, name: path.basename(target) }
   })
-  ipcMain.handle('file:print-pdf', (event, input) => printPdf(input.data, input.name, callingWindow(event)))
+  ipcMain.handle('file:save-export', async (event, input) => {
+    const definition = exportFormat(input?.format)
+    let data = validateExportBytes(input?.data)
+    if (definition.id === 'docx') data = validateDocxBytes(data)
+    const result = await showSaveDialogFor(event, {
+      title: `Export as ${definition.label}`,
+      defaultPath: `${safeStem(input?.name)}${definition.extension}`,
+      filters: [{ name: definition.label, extensions: [definition.extension.slice(1)] }],
+    })
+    if (result.canceled || !result.filePath) return null
+    const target = ensureExtension(path.resolve(result.filePath), definition.extension)
+    await atomicWrite(target, data)
+    return { path: target, name: path.basename(target) }
+  })
+  ipcMain.handle('file:compose-print-pdf', (_event, input) => composePrintPdf(input))
+  ipcMain.handle('print:list-printers', async (event) => (await event.sender.getPrintersAsync()).map(printerSummary))
+  ipcMain.handle('file:print-pdf', (event, input) => printPdf(input, callingWindow(event), event.sender))
   ipcMain.handle('recent:list', async () => {
     const recents = await readJson('recent-files.json', [])
     const valid = []
@@ -387,15 +489,15 @@ function registerIpc() {
   })
 }
 
-function incomingDocxPaths(argv) {
-  return [...new Set(argv.filter((argument) => path.extname(argument).toLowerCase() === DOCX_EXTENSION).map((argument) => path.resolve(argument)))]
+function incomingDocumentPaths(argv) {
+  return [...new Set(argv.filter((argument) => isSupportedDocumentPath(argument)).map((argument) => path.resolve(argument)))]
 }
 
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) app.quit()
 else {
   app.on('second-instance', (_event, argv) => {
-    const incoming = incomingDocxPaths(argv)
+    const incoming = incomingDocumentPaths(argv)
     if (incoming.length) incoming.forEach((filePath) => createWindow(filePath))
     else {
       const window = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
@@ -405,9 +507,17 @@ else {
   })
   app.whenReady().then(() => {
     app.setAppUserModelId('com.simple.docs')
+    protocol.handle('simple-font', async (request) => {
+      const url = new URL(request.url)
+      const filePath = url.hostname === 'installed' && /^\/\d+$/.test(url.pathname)
+        ? (await documentFonts()).files.get(url.pathname.slice(1)) : null
+      if (!filePath) return new Response('Font not found', { status: 404 })
+      const response = await net.fetch(pathToFileURL(filePath).href)
+      return new Response(response.body, { headers: { 'Content-Type': 'font/ttf', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=86400' } })
+    })
     registerIpc()
     void cleanupStalePrintDirectories().finally(() => {
-      const incoming = incomingDocxPaths(process.argv)
+      const incoming = incomingDocumentPaths(process.argv)
       if (incoming.length) incoming.forEach((filePath) => createWindow(filePath))
       else createWindow()
     })

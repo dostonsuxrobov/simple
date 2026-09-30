@@ -260,7 +260,9 @@ async function main() {
     assert.equal(reopenedSheet.cells.B2.value, 15)
     assert.equal(reopenedSheet.cells.C2.formula, 'B2*2')
     assert.equal(reopenedSheet.cells.A1.style.fill.fgColor.argb, 'FF476B57')
-    assert(reopened.warnings.some((warning) => /validation|conditional|table|image/i.test(warning)))
+    // Pictures are now modelled (shown and editable), so they need no compatibility warning.
+    assert(!reopened.warnings.some((warning) => /images/i.test(warning)))
+    assert(reopenedSheet.images && reopenedSheet.images.length > 0, 'pictures are loaded into the editor')
 
     process.stdout.write('Fidelity QA passed: source-backed XLSX overlay retained styles, formulas, structure, validations, conditional formatting, tables, images, and print/view settings.\n')
   } finally {

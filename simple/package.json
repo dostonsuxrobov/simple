@@ -11,7 +11,9 @@
     "sync": "node scripts/sync-build.cjs",
     "build": "npm run sync && npm test && node scripts/prepare-portable-build.cjs && electron-builder --win portable --x64",
     "build:dir": "npm run sync && electron-builder --win dir --x64",
-    "test": "node scripts/verify.cjs",
+    "test": "node scripts/verify.cjs && node --test tests/*.test.cjs",
+    "smoke:export": "node scripts/export-smoke.cjs",
+    "smoke:print": "node scripts/print-smoke.cjs",
     "watch": "node scripts/watch-and-build.cjs",
     "icon": "python scripts/make-icon.py"
   },
@@ -25,6 +27,7 @@
     "productName": "simple",
     "executableName": "simple",
     "asar": true,
+    "asarUnpack": ["modules/shared/combine-worker.cjs"],
     "compression": "normal",
     "electronLanguages": [
       "en-US"
@@ -57,7 +60,10 @@
     },
     "fileAssociations": [
       {
-        "ext": "docx",
+        "ext": [
+          "docx",
+          "doc"
+        ],
         "name": "simple document",
         "description": "Document opened by simple",
         "role": "Editor",
@@ -67,8 +73,7 @@
         "ext": [
           "pdf",
           "txt",
-          "md",
-          "doc"
+          "md"
         ],
         "name": "simple readable file",
         "description": "Readable file opened by simple",

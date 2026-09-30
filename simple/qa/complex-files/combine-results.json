@@ -1,0 +1,92 @@
+{
+  "passed": true,
+  "worker": "C:\\Users\\dosto\\Documents\\simple\\simple\\modules\\shared\\combine-worker.cjs",
+  "inputs": [
+    {
+      "id": "sheet",
+      "path": "C:\\Users\\dosto\\Documents\\simple\\simple_calc_source\\tmp\\complex-stress\\created.xlsx",
+      "sha256": "cd988def6e27344adb7f815b935b844445c493917f80e0221dd90e04e927847d"
+    },
+    {
+      "id": "sheetPdf",
+      "path": "C:\\Users\\dosto\\Documents\\simple\\simple_calc_source\\tmp\\complex-stress\\export.pdf",
+      "sha256": "a6c314b6fa561402c1806ee2e6afe52b408698692b8e0a70e4985146adc34c99"
+    },
+    {
+      "id": "doc",
+      "path": "C:\\Users\\dosto\\Documents\\simple\\simple_doc_source\\tmp\\editor-stress\\created.docx",
+      "sha256": "228abf9995cdc7a711e05e74d7facb12274d3d0a7bd60b325612fe7db6c53db6"
+    },
+    {
+      "id": "docPdf",
+      "path": "C:\\Users\\dosto\\Documents\\simple\\simple_doc_source\\tmp\\editor-stress\\created.pdf",
+      "sha256": "5d51641106ae355cc42d646e7b45477db17aafcee07865563da8445b37ab653c"
+    },
+    {
+      "id": "book",
+      "path": "C:\\Users\\dosto\\Documents\\simple\\.codex-tmp\\books-stress-20260905\\final\\garamond.pdf",
+      "sha256": "64bb51f75b7f9f15cf0977e6396adaae629dd78950be29b0e44d42fc988177e9"
+    },
+    {
+      "id": "png",
+      "path": "C:\\Users\\dosto\\Documents\\simple\\simple\\tmp\\combine-complex-stress\\transparent-composition.png",
+      "sha256": "88e765ceb8596a7bc9e100666036279911681a8fbef63e3cd014ffa296eb85fd"
+    },
+    {
+      "id": "jpeg",
+      "path": "C:\\Users\\dosto\\Documents\\simple\\simple\\tmp\\combine-complex-stress\\oriented-photo.jpg",
+      "sha256": "59bbe1bc07143b060f66c715a2292ec3bc2be648ca17f1375c555f3568cae1b0"
+    }
+  ],
+  "formulaResults": {
+    "count": 200,
+    "net": 16490,
+    "tax": 1236.95,
+    "gross": 17726.95,
+    "north": 4133.75
+  },
+  "nativePages": {
+    "sheet": 5,
+    "doc": 6,
+    "book": 1,
+    "png": 1,
+    "jpeg": 1,
+    "total": 14
+  },
+  "exportedPdfPages": {
+    "sheet": 5,
+    "doc": 6,
+    "totalSelected": 6
+  },
+  "comparisons": [
+    {
+      "label": "sheet",
+      "width": 596,
+      "height": 842,
+      "changedChannelsOver8": 0,
+      "maxDelta": 0
+    },
+    {
+      "label": "doc-landscape",
+      "width": 792,
+      "height": 612,
+      "changedChannelsOver8": 0,
+      "maxDelta": 0
+    },
+    {
+      "label": "book",
+      "width": 612,
+      "height": 792,
+      "changedChannelsOver8": 0,
+      "maxDelta": 0
+    }
+  ],
+  "headerColorTokenVisible": false,
+  "inputHashesUnchanged": true,
+  "rangeRejectionAndRecovery": true,
+  "sourceAndWorkerBothPassed": true,
+  "conversionMilliseconds": 11201.830899999999,
+  "workerMilliseconds": 1492.3178000000007,
+  "fixedMilliseconds": 1466.3315000000002,
+  "outputBytes": 283093
+}

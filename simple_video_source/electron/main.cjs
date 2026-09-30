@@ -1,18 +1,35 @@
 'use strict'
 
-const { app, BrowserWindow, dialog, ipcMain, session, shell } = require('electron')
+const { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, session, shell } = require('electron')
 const crypto = require('node:crypto')
 const fs = require('node:fs/promises')
+const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { SUPPORTED_EXTENSIONS, isSupportedVideoPath, supportedPaths } = require('./routing.cjs')
 const { mergeRecent, sanitizeRecents } = require('./recent-files.cjs')
+const {
+  FRAME_FORMATS,
+  assertCopyTarget,
+  assertFrameTarget,
+  suggestedCopyName,
+  suggestedFrameName,
+  validateFrameBytes,
+} = require('./video-export.cjs')
+const {
+  createVideoPrintDocument,
+  ensurePrinterAvailable,
+  pngDimensions,
+  runSilentPrintJob,
+} = require('./video-print.cjs')
 
 const MAX_VIDEO_BYTES = 1024 * 1024 * 1024 * 1024
 const RECENT_FILE = 'video-recents.json'
 let ready = false
 const pendingMacPaths = []
 let recentMutations = Promise.resolve()
+const printSessions = new Map()
+const PRINT_SESSION_MAX_AGE = 15 * 60 * 1000
 
 function callingWindow(event) {
   const window = BrowserWindow.fromWebContents(event.sender)
@@ -69,7 +86,7 @@ async function addRecent(filePath) {
   await mutateRecents((current) => mergeRecent(current, filePath))
 }
 
-async function videoPayload(filePath) {
+async function checkedVideo(filePath) {
   if (typeof filePath !== 'string' || !isSupportedVideoPath(filePath)) {
     throw new Error('Simple Video does not support this file type.')
   }
@@ -78,6 +95,11 @@ async function videoPayload(filePath) {
   if (!stat.isFile()) throw new Error('The selected item is not a video file.')
   if (stat.size <= 0) throw new Error('This video file is empty.')
   if (stat.size > MAX_VIDEO_BYTES) throw new Error('This video file is too large to open safely.')
+  return { resolved, stat }
+}
+
+async function videoPayload(filePath) {
+  const { resolved, stat } = await checkedVideo(filePath)
   await addRecent(resolved)
   return {
     path: resolved,
@@ -115,6 +137,8 @@ function createWindow(openPath = null) {
     const current = window.webContents.getURL()
     if (current && destination !== current) event.preventDefault()
   })
+  const ownerId = window.webContents.id
+  window.webContents.once('destroyed', () => clearPrintSessionsForOwner(ownerId))
   window.once('ready-to-show', () => window.show())
   window.on('maximize', () => window.webContents.send('window:maximized', true))
   window.on('unmaximize', () => window.webContents.send('window:maximized', false))
@@ -135,6 +159,156 @@ function createWindow(openPath = null) {
 function showOpenDialogFor(event, options) {
   const owner = callingWindow(event)
   return owner ? dialog.showOpenDialog(owner, options) : dialog.showOpenDialog(options)
+}
+
+async function showSaveDialogFor(event, options) {
+  const qaDirectory = process.env.SIMPLE_VIDEO_QA_EXPORT_DIRECTORY
+  if (!app.isPackaged && qaDirectory && options?.defaultPath) {
+    const directory = path.resolve(qaDirectory)
+    await fs.mkdir(directory, { recursive: true })
+    return { canceled: false, filePath: path.join(directory, path.basename(options.defaultPath)) }
+  }
+  const owner = callingWindow(event)
+  return owner ? dialog.showSaveDialog(owner, options) : dialog.showSaveDialog(options)
+}
+
+async function replaceFileAtomically(targetPath, writeTemporary) {
+  const token = crypto.randomUUID()
+  const temporary = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.${token}.tmp`)
+  const backup = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.${token}.bak`)
+  let backedUp = false
+  let committed = false
+
+  await writeTemporary(temporary)
+  try {
+    try {
+      await fs.rename(targetPath, backup)
+      backedUp = true
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+    await fs.rename(temporary, targetPath)
+    committed = true
+    if (backedUp) await fs.rm(backup, { force: true }).catch(() => {})
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => {})
+    if (backedUp && !committed) await fs.rename(backup, targetPath).catch(() => {})
+    throw error
+  }
+}
+
+function clearPrintSessionsForOwner(ownerId) {
+  for (const [sessionId, value] of printSessions) {
+    if (value.ownerId === ownerId) printSessions.delete(sessionId)
+  }
+}
+
+function expirePrintSessions() {
+  const cutoff = Date.now() - PRINT_SESSION_MAX_AGE
+  for (const [sessionId, value] of printSessions) {
+    if (value.createdAt < cutoff) printSessions.delete(sessionId)
+  }
+}
+
+function printSessionFor(event, sessionId) {
+  expirePrintSessions()
+  if (typeof sessionId !== 'string' || sessionId.length > 100) throw new Error('The print session is invalid.')
+  const value = printSessions.get(sessionId)
+  if (!value || value.ownerId !== event.sender.id) throw new Error('This captured frame is no longer available. Open Print again.')
+  value.createdAt = Date.now()
+  return value
+}
+
+function publicPrintPreview(printDocument) {
+  return {
+    html: printDocument.html,
+    title: printDocument.title,
+    page: printDocument.page,
+    frame: printDocument.frame,
+    placement: printDocument.placement,
+    options: printDocument.options,
+  }
+}
+
+async function printVideoFrame(printDocument, owner) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-video-print-'))
+  const htmlPath = path.join(directory, 'video-frame.html')
+  let printWindow = null
+  try {
+    await fs.writeFile(htmlPath, printDocument.html, 'utf8')
+    printWindow = new BrowserWindow({
+      ...(owner && !owner.isDestroyed() ? { parent: owner } : {}),
+      show: false,
+      title: `Printing — ${printDocument.title}`,
+      backgroundColor: '#ffffff',
+      webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, devTools: false },
+    })
+    printWindow.removeMenu()
+    await printWindow.loadFile(htmlPath)
+    const decodedFrame = await printWindow.webContents.executeJavaScript(`(() => {
+      const image = document.querySelector('.frame-slot img')
+      if (!image) throw new Error('The printable video frame is missing.')
+      return image.decode().then(() => new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve({
+          width: image.naturalWidth,
+          height: image.naturalHeight,
+        })))
+      }))
+    })()`)
+    if (decodedFrame?.width !== printDocument.frame.width || decodedFrame?.height !== printDocument.frame.height) {
+      throw new Error('The printable video frame did not decode at the expected size.')
+    }
+
+    const qaDirectory = process.env.SIMPLE_VIDEO_QA_PRINT_DIRECTORY
+    const qaDelay = !app.isPackaged ? Math.max(0, Math.min(2_000, Number(process.env.SIMPLE_VIDEO_QA_PRINT_DELAY_MS) || 0)) : 0
+    if (qaDelay) await new Promise((resolve) => setTimeout(resolve, qaDelay))
+    if (!app.isPackaged && qaDirectory) {
+      const targetDirectory = path.resolve(qaDirectory)
+      await fs.mkdir(targetDirectory, { recursive: true })
+      const pdf = await printWindow.webContents.printToPDF({
+        printBackground: true,
+        landscape: printDocument.options.orientation === 'landscape',
+        preferCSSPageSize: true,
+        generateTaggedPDF: true,
+      })
+      const targetPath = path.join(targetDirectory, 'video-frame-print.pdf')
+      await fs.writeFile(targetPath, pdf)
+      return { printed: true, canceled: false, path: targetPath }
+    }
+
+    await ensurePrinterAvailable(printWindow.webContents)
+    const outcome = await new Promise((resolve, reject) => {
+      let settled = false
+      const finish = (callback) => {
+        if (settled) return
+        settled = true
+        callback()
+      }
+      printWindow.once('closed', () => finish(() => reject(new Error('The print window closed before the job was started.'))))
+      runSilentPrintJob(printWindow.webContents, printDocument)
+        .then((result) => finish(() => resolve(result)))
+        .catch((error) => finish(() => reject(error)))
+    })
+    return outcome
+  } finally {
+    if (printWindow && !printWindow.isDestroyed()) printWindow.destroy()
+    await fs.rm(directory, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+async function cleanupStalePrintDirectories() {
+  let entries = []
+  try { entries = await fs.readdir(os.tmpdir(), { withFileTypes: true }) } catch { return }
+  const cutoff = Date.now() - 24 * 60 * 60 * 1_000
+  await Promise.all(entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('simple-video-print-'))
+    .map(async (entry) => {
+      const target = path.join(os.tmpdir(), entry.name)
+      try {
+        const stat = await fs.stat(target)
+        if (stat.mtimeMs < cutoff) await fs.rm(target, { recursive: true, force: true })
+      } catch {}
+    }))
 }
 
 function registerIpc() {
@@ -176,6 +350,85 @@ function registerIpc() {
   ipcMain.handle('shell:show-item', (_event, filePath) => {
     if (typeof filePath !== 'string' || !isSupportedVideoPath(filePath)) return false
     shell.showItemInFolder(path.resolve(filePath))
+    return true
+  })
+
+  ipcMain.handle('export:copy-original', async (event, filePath) => {
+    const { resolved } = await checkedVideo(filePath)
+    const extension = path.extname(resolved)
+    const result = await showSaveDialogFor(event, {
+      title: 'Export As — Original video copy',
+      defaultPath: path.join(path.dirname(resolved), suggestedCopyName(resolved)),
+      filters: [{ name: `${extension.slice(1).toUpperCase()} video`, extensions: [extension.slice(1)] }],
+    })
+    if (result.canceled || !result.filePath) return { canceled: true }
+    const targetPath = path.resolve(result.filePath)
+    assertCopyTarget(resolved, targetPath)
+    await replaceFileAtomically(targetPath, (temporary) => fs.copyFile(resolved, temporary))
+    return { canceled: false, path: targetPath, name: path.basename(targetPath) }
+  })
+
+  ipcMain.handle('export:frame', async (event, payload) => {
+    if (!payload || typeof payload !== 'object') throw new Error('The video frame export request is invalid.')
+    const { resolved } = await checkedVideo(payload.sourcePath)
+    const format = String(payload.format || '').toLowerCase()
+    const definition = FRAME_FORMATS[format]
+    if (!definition) throw new Error('Choose PNG or JPEG for a video frame.')
+    const bytes = validateFrameBytes(payload.bytes, format)
+    const result = await showSaveDialogFor(event, {
+      title: `Export As — ${definition.label}`,
+      defaultPath: path.join(path.dirname(resolved), suggestedFrameName(resolved, format, Number(payload.seconds))),
+      filters: [{ name: definition.label, extensions: format === 'jpeg' ? ['jpg', 'jpeg'] : ['png'] }],
+    })
+    if (result.canceled || !result.filePath) return { canceled: true }
+    const targetPath = path.resolve(result.filePath)
+    assertFrameTarget(targetPath, format)
+    await replaceFileAtomically(targetPath, (temporary) => fs.writeFile(temporary, bytes))
+    return { canceled: false, path: targetPath, name: path.basename(targetPath) }
+  })
+
+  ipcMain.handle('clipboard:write-frame', (event, value) => {
+    if (!callingWindow(event)) throw new Error('This clipboard request did not come from the video workspace.')
+    const frame = pngDimensions(value)
+    const image = nativeImage.createFromBuffer(frame.bytes)
+    if (image.isEmpty()) throw new Error('The copied video frame could not be decoded.')
+    clipboard.writeImage(image)
+    return { width: frame.width, height: frame.height }
+  })
+
+  ipcMain.handle('print:start', async (event, payload) => {
+    if (!payload || typeof payload !== 'object') throw new Error('The video print request is invalid.')
+    const { resolved } = await checkedVideo(payload.sourcePath)
+    const frame = pngDimensions(payload.bytes)
+    clearPrintSessionsForOwner(event.sender.id)
+    const sessionId = crypto.randomUUID()
+    const seconds = Math.max(0, Number(payload.seconds) || 0)
+    printSessions.set(sessionId, {
+      ownerId: event.sender.id,
+      createdAt: Date.now(),
+      bytes: frame.bytes,
+      sourceName: path.basename(resolved),
+      seconds,
+    })
+    return { sessionId, width: frame.width, height: frame.height, seconds, sourceName: path.basename(resolved) }
+  })
+
+  ipcMain.handle('print:preview', (event, payload) => {
+    if (!payload || typeof payload !== 'object') throw new Error('The print preview request is invalid.')
+    const captured = printSessionFor(event, payload.sessionId)
+    return publicPrintPreview(createVideoPrintDocument({ ...captured, options: payload.options }))
+  })
+
+  ipcMain.handle('print:run', async (event, payload) => {
+    if (!payload || typeof payload !== 'object') throw new Error('The print request is invalid.')
+    const captured = printSessionFor(event, payload.sessionId)
+    const printDocument = createVideoPrintDocument({ ...captured, options: payload.options })
+    return printVideoFrame(printDocument, callingWindow(event))
+  })
+
+  ipcMain.handle('print:end', (event, sessionId) => {
+    const captured = typeof sessionId === 'string' ? printSessions.get(sessionId) : null
+    if (captured?.ownerId === event.sender.id) printSessions.delete(sessionId)
     return true
   })
 
@@ -222,10 +475,11 @@ if (!gotLock) {
     else pendingMacPaths.push(path.resolve(filePath))
   })
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     ready = true
     app.setAppUserModelId('com.simple.video')
     session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
+    await cleanupStalePrintDirectories()
     registerIpc()
 
     const incoming = [...pendingMacPaths, ...supportedPaths(process.argv)]

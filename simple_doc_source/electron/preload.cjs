@@ -9,12 +9,23 @@ ipcRenderer.on('file:open-external', (_event, filePath) => {
 })
 
 contextBridge.exposeInMainWorld('simpleDocs', {
+  getDocumentFonts: () => ipcRenderer.invoke('document:fonts'),
+  getOriginalLayoutPdf: (input) => ipcRenderer.invoke('document:original-pdf', input),
+  onDocumentShortcut: (callback) => {
+    const listener = (_event, action) => callback(action)
+    ipcRenderer.on('document:shortcut', listener)
+    return () => ipcRenderer.removeListener('document:shortcut', listener)
+  },
   openFile: () => ipcRenderer.invoke('file:open-dialog'),
   openPath: (filePath) => ipcRenderer.invoke('file:open-path', filePath),
+  openBytes: (input) => ipcRenderer.invoke('file:open-bytes', input),
   openInNewWindow: (filePath) => ipcRenderer.invoke('file:open-in-new-window', filePath),
   newWindow: () => ipcRenderer.invoke('app:new-window'),
   saveDocx: (input) => ipcRenderer.invoke('file:save-docx', input),
   savePdf: (input) => ipcRenderer.invoke('file:save-pdf', input),
+  saveExport: (input) => ipcRenderer.invoke('file:save-export', input),
+  composePrintPdf: (input) => ipcRenderer.invoke('file:compose-print-pdf', input),
+  listPrinters: () => ipcRenderer.invoke('print:list-printers'),
   printPdf: (input) => ipcRenderer.invoke('file:print-pdf', input),
   getRecents: () => ipcRenderer.invoke('recent:list'),
   removeRecent: (filePath) => ipcRenderer.invoke('recent:remove', filePath),

@@ -2,11 +2,13 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
-const { app } = require('electron')
+const { app, BrowserWindow, clipboard, Menu } = require('electron')
 const { explicitMode, groupPathsByMode, MODES, modeForPath, supportedPaths } = require('./routing.cjs')
 const { launchDetached } = require('./launch.cjs')
+const { installContextMenus } = require('./context-menu.cjs')
 
 const APP_USER_MODEL_ID = 'com.simple.unified'
+installContextMenus({ app, BrowserWindow, clipboard, Menu })
 const selfTest = process.argv.includes('--simple-self-test')
 const incomingPaths = supportedPaths(process.argv)
 const grouped = groupPathsByMode(incomingPaths)
@@ -16,7 +18,11 @@ const mode = firstMode || explicitMode(process.argv) || 'launcher'
 // Each internal mode keeps its own lock and state directory. That lets every
 // workspace coexist while retaining its own lifecycle and IPC registrations,
 // with no duplicate handlers in a shared process.
-const stateRoot = path.join(app.getPath('appData'), 'simple')
+// Honor explicit profiles so isolated checks and managed sessions cannot join
+// the user's live workspace. Detached modes inherit the same profile root.
+const requestedStateRoot = app.commandLine.getSwitchValue('user-data-dir') || process.env.SIMPLE_USER_DATA_DIR
+const stateRoot = requestedStateRoot ? path.resolve(requestedStateRoot) : path.join(app.getPath('appData'), 'simple')
+process.env.SIMPLE_USER_DATA_DIR = stateRoot
 app.setPath('userData', path.join(stateRoot, mode))
 app.setName('simple')
 

@@ -60,7 +60,7 @@ interface SpreadsheetContextMenuProps {
   y: number
   label: string
   items: SpreadsheetMenuItem[]
-  onClose: () => void
+  onClose: (restoreGridFocus?: boolean) => void
 }
 
 export function SpreadsheetContextMenu({ x, y, label, items, onClose }: SpreadsheetContextMenuProps) {
@@ -78,20 +78,25 @@ export function SpreadsheetContextMenu({ x, y, label, items, onClose }: Spreadsh
 
   useEffect(() => {
     const closeOutside = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) onClose()
+      if (!rootRef.current?.contains(event.target as Node)) onClose(false)
     }
     const closeWithEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       event.preventDefault()
-      onClose()
+      onClose(true)
     }
+    const closeForViewportChange = () => onClose(false)
     window.addEventListener('pointerdown', closeOutside)
     window.addEventListener('keydown', closeWithEscape)
-    window.addEventListener('blur', onClose)
+    window.addEventListener('blur', closeForViewportChange)
+    window.addEventListener('resize', closeForViewportChange)
+    window.addEventListener('scroll', closeForViewportChange, true)
     return () => {
       window.removeEventListener('pointerdown', closeOutside)
       window.removeEventListener('keydown', closeWithEscape)
-      window.removeEventListener('blur', onClose)
+      window.removeEventListener('blur', closeForViewportChange)
+      window.removeEventListener('resize', closeForViewportChange)
+      window.removeEventListener('scroll', closeForViewportChange, true)
     }
   }, [onClose])
 
@@ -119,7 +124,7 @@ export function SpreadsheetContextMenu({ x, y, label, items, onClose }: Spreadsh
         else if (event.key === 'ArrowUp') { event.preventDefault(); moveFocus(-1) }
       }}
     >
-      <MenuItems items={items} close={onClose} />
+      <MenuItems items={items} close={() => onClose(true)} />
     </div>
   )
 }

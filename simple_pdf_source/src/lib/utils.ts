@@ -23,5 +23,5 @@ export function pageRangeLabel(indices: number[]) {
 
 export function isTypingTarget(target: EventTarget | null) {
   return target instanceof Element
-    && Boolean(target.closest('input, textarea, [contenteditable="true"]'))
+    && Boolean(target.closest('input, textarea, select, [contenteditable="true"]'))
 }

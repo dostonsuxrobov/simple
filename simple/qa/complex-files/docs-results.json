@@ -1,0 +1,34 @@
+{
+  "pageCounts": [
+    6,
+    6
+  ],
+  "textEqual": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "pixelsEqual": [
+    false,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "changedPixels": [
+    1056,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "maxTextPositionShiftPt": 0.03125,
+  "strictXmlValid": true,
+  "footnoteRetained": true,
+  "mixedScriptsRetained": true
+}

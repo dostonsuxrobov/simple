@@ -61,6 +61,7 @@ function sourceExtensionSet(relativeSourcePath) {
 }
 
 assert.equal(modeForPath('Report.DOCX'), 'docs')
+assert.equal(modeForPath('Legacy.DOC'), 'docs')
 assert.equal(modeForPath('archive.PDF'), 'pdf')
 assert.equal(modeForPath('photo.JPEG'), 'image')
 assert.equal(modeForPath('animation.WEBP'), 'image')
@@ -72,9 +73,13 @@ assert.equal(modeForPath('lotus.123'), 'calc')
 assert.equal(modeForPath('README'), null)
 assert.equal(explicitMode(['--simple-mode=CALC']), 'calc')
 assert.equal(explicitMode(['--anything']), null)
-assert.deepEqual(supportedPaths(['simple.exe', 'a.docx', 'b.xlsx', 'a.docx', '--flag']), ['a.docx', 'b.xlsx'])
+assert.deepEqual(supportedPaths(['simple.exe', 'a.docx', 'legacy.DOC', 'b.xlsx', 'a.docx', '--flag']), ['a.docx', 'legacy.DOC', 'b.xlsx'])
 assert.deepEqual(supportedPaths(['--inspect=trap.pdf', '-trap.png', 'real.pdf']), ['real.pdf'])
-assert.deepEqual([...groupPathsByMode(['a.docx', 'b.xlsx', 'c.pdf']).keys()], ['docs', 'calc', 'pdf'])
+assert.deepEqual([...groupPathsByMode(['a.doc', 'b.docx', 'c.xlsx', 'd.pdf']).entries()], [
+  ['docs', ['a.doc', 'b.docx']],
+  ['calc', ['c.xlsx']],
+  ['pdf', ['d.pdf']],
+])
 
 const flattened = Object.values(EXTENSIONS_BY_MODE).flat()
 assert.equal(new Set(flattened).size, flattened.length, 'Extension ownership must be exclusive.')
@@ -82,8 +87,10 @@ assert.deepEqual(new Set(flattened), new Set(SUPPORTED_EXTENSIONS))
 
 const imageSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.image, 'electron', 'image-files.cjs')).SUPPORTED_EXTENSIONS
 const videoSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.video, 'electron', 'routing.cjs')).SUPPORTED_EXTENSIONS
+const docsSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.docs, 'electron', 'document-files.cjs')).SUPPORTED_EXTENSIONS
 assert.deepEqual(new Set(imageSourceExtensions), new Set(EXTENSIONS_BY_MODE.image), 'Image routing must match the image source.')
 assert.deepEqual(new Set(videoSourceExtensions), new Set(EXTENSIONS_BY_MODE.video), 'Video routing must match the video source.')
+assert.deepEqual(new Set(docsSourceExtensions), new Set(EXTENSIONS_BY_MODE.docs), 'Docs routing must match the Docs source.')
 
 const pdfSourceExtensions = sourceExtensionSet(path.join(SOURCE_BY_MODE.pdf, 'electron', 'main.cjs'))
 const calcSourceExtensions = sourceExtensionSet(path.join(SOURCE_BY_MODE.calc, 'electron', 'workbooks.cjs'))
@@ -114,6 +121,12 @@ for (const mode of MODES) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'modules', 'manifest.json'), 'utf8'))
+const combineSources = ['launcher/combine-worker.cjs', 'launcher/combine-service.cjs', 'launcher/legacy-sheet-preview.cjs', '../simple_doc_source/electron/office-converter.cjs', '../simple_pdf_source/electron/image-to-pdf.cjs']
+for (const source of combineSources) {
+  const hash = crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, source))).digest('hex')
+  assert.equal(manifest.shared?.combineSourceHashes?.[source], hash, `Combine is stale (${source}); run npm run sync.`)
+}
+assert.equal(manifest.shared?.combineWorkerHash, crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, 'modules', 'shared', 'combine-worker.cjs'))).digest('hex'), 'The bundled Combine worker differs from the manifest.')
 assert.deepEqual(Object.keys(manifest.modules).sort(), [...MODES].sort())
 assert.deepEqual(Object.keys(SOURCE_BY_MODE).sort(), [...MODES].sort())
 for (const mode of MODES) {

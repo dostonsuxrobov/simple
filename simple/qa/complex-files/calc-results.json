@@ -1,0 +1,234 @@
+{
+  "checks": [
+    "live formula errors replace stale cached totals in grid, Save and HTML; corrected inputs recalculate successfully",
+    "real create/save API, UI open/input edit/formatting, 609 formulas across 4 sheets, cross-sheet recalculation, exports leave original unchanged",
+    "ODS edited in real UI, original format saved, original backup created, updated rate and hidden state reopened"
+  ],
+  "exports": {
+    "pdf": {
+      "elapsedMs": 725,
+      "bytes": 353588
+    },
+    "html": {
+      "elapsedMs": 185,
+      "bytes": 181239,
+      "pages": 5
+    },
+    "ods": {
+      "elapsedMs": 13384,
+      "bytes": 39529,
+      "roundtrip": {
+        "bytes": 39529,
+        "sheets": 4,
+        "formulas": 611,
+        "hidden": "hidden",
+        "normalFont": {
+          "name": "Arial",
+          "size": 10
+        },
+        "heading": {
+          "font": {
+            "name": "Georgia",
+            "size": 21,
+            "bold": true,
+            "color": {
+              "argb": "FFFFFFFF"
+            }
+          },
+          "fill": {
+            "type": "pattern",
+            "pattern": "solid",
+            "fgColor": {
+              "argb": "FF234E42"
+            },
+            "bgColor": {
+              "argb": "FF003366"
+            }
+          },
+          "alignment": {
+            "horizontal": "general",
+            "vertical": "middle"
+          }
+        },
+        "noteHeight": 12,
+        "error": {
+          "formula": "#DIV/0!",
+          "result": "#DIV/0!",
+          "resultType": "error",
+          "display": "#DIV/0!",
+          "style": {
+            "font": {
+              "name": "Arial",
+              "size": 10
+            },
+            "alignment": {
+              "horizontal": "general",
+              "vertical": "middle"
+            }
+          }
+        },
+        "total": {
+          "formula": "SUM(Transactions!F4:F203)",
+          "result": 16490,
+          "display": "16490",
+          "style": {
+            "font": {
+              "name": "Arial",
+              "size": 10,
+              "bold": true
+            },
+            "alignment": {
+              "horizontal": "general",
+              "vertical": "middle"
+            }
+          },
+          "numFmt": "_($* #,##0.00_);_($* (#,##0.00);_($* -??_);_(@_)"
+        },
+        "printArea": "A1:F20"
+      }
+    },
+    "csv": {
+      "elapsedMs": 187,
+      "bytes": 564
+    },
+    "xls": {
+      "elapsedMs": 12236,
+      "bytes": 52736,
+      "roundtrip": {
+        "bytes": 52736,
+        "sheets": 4,
+        "formulas": 611,
+        "hidden": "hidden",
+        "normalFont": {
+          "name": "Arial",
+          "charset": 1,
+          "size": 10
+        },
+        "heading": {
+          "fill": {
+            "type": "pattern",
+            "pattern": "solid",
+            "fgColor": {
+              "argb": "FF234E42"
+            },
+            "bgColor": {
+              "argb": "FF003366"
+            }
+          },
+          "font": {
+            "name": "Georgia",
+            "charset": 1,
+            "size": 21,
+            "bold": true,
+            "color": {
+              "argb": "FFFFFFFF"
+            }
+          },
+          "alignment": {
+            "vertical": "middle"
+          }
+        },
+        "noteHeight": 12,
+        "error": {
+          "formula": "#DIV/0!",
+          "result": "#DIV/0!",
+          "resultType": "error",
+          "display": "#DIV/0!",
+          "style": {
+            "font": {
+              "name": "Arial",
+              "charset": 1,
+              "size": 10
+            },
+            "alignment": {
+              "vertical": "middle"
+            }
+          }
+        },
+        "total": {
+          "formula": "SUM(Transactions!F4:F203)",
+          "result": 16490,
+          "display": " $16,490.00 ",
+          "style": {
+            "font": {
+              "name": "Arial",
+              "charset": 1,
+              "size": 10,
+              "bold": true
+            },
+            "alignment": {
+              "vertical": "middle"
+            }
+          },
+          "numFmt": "_(\\$* #,##0.00_);_(\\$* \\(#,##0.00\\);_(\\$* \\-??_);_(@_)"
+        },
+        "printArea": "A1:F20"
+      }
+    }
+  },
+  "timings": {
+    "createAndSaveMs": 145
+  },
+  "source": {
+    "bytes": 24893,
+    "sheets": 4,
+    "formulas": 609,
+    "hidden": "hidden",
+    "normalFont": {
+      "name": "Arial",
+      "size": 10
+    },
+    "heading": {
+      "font": {
+        "name": "Georgia",
+        "size": 21,
+        "bold": true,
+        "color": {
+          "argb": "FFFFFFFF"
+        }
+      },
+      "fill": {
+        "type": "pattern",
+        "pattern": "solid",
+        "fgColor": {
+          "argb": "FF234E42"
+        }
+      },
+      "alignment": {
+        "vertical": "middle"
+      }
+    },
+    "noteHeight": 12,
+    "error": {
+      "value": "#DIV/0!",
+      "type": "error",
+      "display": "#DIV/0!",
+      "style": {
+        "font": {
+          "name": "Arial",
+          "size": 10
+        },
+        "alignment": {
+          "vertical": "middle"
+        }
+      }
+    },
+    "total": {
+      "formula": "SUM(Transactions!F4:F203)",
+      "result": 16490,
+      "display": "16490",
+      "style": {
+        "font": {
+          "name": "Arial",
+          "size": 10,
+          "bold": true
+        },
+        "alignment": {
+          "vertical": "middle"
+        }
+      },
+      "numFmt": "_($* #,##0.00_);_($* (#,##0.00);_($* \"-\"??_);_(@_)"
+    },
+    "printArea": "A1:F20"
+  }
+}

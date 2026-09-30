@@ -71,7 +71,7 @@ async function main() {
 
   const opened = await workbookPayloadFromPath(FIXTURE_PATH)
   assert.equal(opened.sourceFormat, 'xls')
-  assert.equal(opened.requiresSaveAs, true)
+  assert.equal(opened.requiresSaveAs, false)
   assert.equal(opened.workbook.sheets.length, 1)
   assert.equal(opened.stats.formulas, 2)
 
@@ -95,9 +95,20 @@ async function main() {
   approximately(sheet.colWidths['5'], 15.33203125, 'column E width')
   approximately(sheet.colWidths['6'], 3, 'column F width')
   approximately(sheet.rowHeights['1'], 15.75, 'row 1 height')
+  approximately(sheet.rowHeights['2'], 16, 'automatic row 2 height')
+  approximately(sheet.rowHeights['26'], 16, 'automatic row 26 height')
+  approximately(sheet.rowHeights['34'], 16, 'automatic row 34 height')
   approximately(sheet.rowHeights['30'], 15.5, 'row 30 height')
   approximately(sheet.rowHeights['32'], 77.25, 'row 32 height')
   approximately(sheet.rowHeights['37'], 18, 'row 37 height')
+  assert.equal(opened.workbook.metadata.normalFont.name, 'Arial')
+  assert.equal(opened.workbook.metadata.normalFont.size, 10)
+  assert.equal(sheet.pageSetup.printArea, 'A1:E37')
+  assert.equal(sheet.pageSetup.scale, 91)
+  assert.equal(sheet.pageSetup.fitToPage, false, 'stored fit1x1 must not activate disabled fit-to-page mode')
+  assert.equal(sheet.pageSetup.orientation, 'portrait')
+  assert.match(sheet.headerFooter.oddHeader, /SCHEDULE OF ACCOUNTS/)
+  assert.match(sheet.headerFooter.oddHeader, /Page &P of &N/)
 
   // Blank BIFF cells carry the table's layout. They must not be discarded or
   // reduced to their white fill by the compatibility reader.
@@ -152,6 +163,10 @@ async function main() {
   const savedWorkbook = new ExcelJS.Workbook()
   await savedWorkbook.xlsx.load(savedBytes)
   const savedSheet = savedWorkbook.worksheets[0]
+  approximately(savedSheet.getRow(2).height, 16, 'saved automatic row height')
+  assert.equal(savedSheet.pageSetup.scale, 91)
+  assert.equal(savedSheet.pageSetup.fitToPage, false)
+  assert.equal(savedSheet.headerFooter.oddHeader, sheet.headerFooter.oddHeader)
   for (const [range, leftAddress, rightAddress] of [
     ['A35:B35', 'A35', 'B35'],
     ['A37:B37', 'A37', 'B37'],

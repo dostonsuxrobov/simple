@@ -1,0 +1,77 @@
+{
+  "passed": true,
+  "width": 321,
+  "height": 481,
+  "duration": 65,
+  "fitGeometry": {
+    "mode": "contain",
+    "width": 1280,
+    "height": 754,
+    "stageWidth": 1280,
+    "stageHeight": 754
+  },
+  "decoderReference": "FFmpeg",
+  "cases": [
+    {
+      "seconds": 1.25,
+      "format": "PNG image",
+      "name": "portrait odd frame 00-00-01.250.png",
+      "exportMilliseconds": 463.9511000000002,
+      "meanChannelError": 0.039956563321049306,
+      "outlierFraction": 0
+    },
+    {
+      "seconds": 1.75,
+      "format": "PNG image",
+      "name": "portrait odd frame 00-00-01.750.png",
+      "exportMilliseconds": 69.45099999999911,
+      "meanChannelError": 0.039561488159619,
+      "outlierFraction": 0
+    },
+    {
+      "seconds": 64.25,
+      "format": "PNG image",
+      "name": "portrait odd frame 00-01-04.250.png",
+      "exportMilliseconds": 26.093199999999342,
+      "meanChannelError": 0.039166412998188696,
+      "outlierFraction": 0
+    },
+    {
+      "seconds": 0.25,
+      "format": "PNG image",
+      "name": "portrait odd frame 00-00-00.250.png",
+      "exportMilliseconds": 30.10620000000017,
+      "meanChannelError": 0.03942979643914223,
+      "outlierFraction": 0
+    },
+    {
+      "seconds": 32.75,
+      "format": "PNG image",
+      "name": "portrait odd frame 00-00-32.750.png",
+      "exportMilliseconds": 50.22620000000097,
+      "meanChannelError": 0.04008825504152607,
+      "outlierFraction": 0
+    },
+    {
+      "seconds": 15.25,
+      "format": "JPEG image",
+      "name": "portrait odd frame 00-00-15.250.jpg",
+      "exportMilliseconds": 63.290900000001784,
+      "meanChannelError": 3.522978046342532,
+      "outlierFraction": 0.04148073306951812
+    },
+    {
+      "seconds": 4.25,
+      "format": "PNG image",
+      "name": "portrait odd frame 00-00-04.250.png",
+      "exportMilliseconds": 58.24619999999777,
+      "meanChannelError": 0.039166412998188696,
+      "outlierFraction": 0
+    }
+  ],
+  "rapidSeekCorrect": true,
+  "subsecondNamesDistinct": true,
+  "stalePlayheadRejected": true,
+  "recoveryExportPassed": true,
+  "sourceUnchanged": true
+}

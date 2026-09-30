@@ -128,10 +128,17 @@ async function stageMode(mode, lockHash) {
     platform: 'node',
     format: 'cjs',
     target: 'node22',
-    external: ['electron'],
+    external: ['electron', 'mupdf'],
     legalComments: 'none',
     sourcemap: false,
   })
+
+  if (mode === 'pdf') {
+    // MuPDF's ES module loads its WASM beside import.meta.url. Preserve the
+    // package layout instead of bundling it into a CommonJS backend.
+    await fs.cp(path.join(sourceRoot, 'node_modules', 'mupdf'),
+      path.join(temporaryRoot, 'vendor', 'mupdf'), { recursive: true })
+  }
 
   const rendererIconsReplaced = config.replaceRendererIcon
     ? await replaceCalcRendererIcon(path.join(temporaryRoot, 'dist'), sourceRoot)
@@ -172,10 +179,18 @@ async function main() {
   const previous = await readManifest()
   const results = await Promise.all(modes.map(async (mode) => [mode, await stageMode(mode, lockHashes[mode])]))
   const modules = { ...(previous.modules || {}), ...Object.fromEntries(results) }
+  await esbuild.build({
+    entryPoints: [path.join(ROOT, 'launcher', 'combine-worker.cjs')],
+    outfile: path.join(MODULES_ROOT, 'shared', 'combine-worker.cjs'),
+    bundle: true, platform: 'node', format: 'cjs', target: 'node22', legalComments: 'none',
+  })
+  const combineSources = ['launcher/combine-worker.cjs', 'launcher/combine-service.cjs', 'launcher/legacy-sheet-preview.cjs', '../simple_doc_source/electron/office-converter.cjs', '../simple_pdf_source/electron/image-to-pdf.cjs']
+  const combineSourceHashes = Object.fromEntries(await Promise.all(combineSources.map(async (file) => [file, await sha256File(path.join(ROOT, file))])))
   const manifest = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     modules,
+    shared: { combineSourceHashes, combineWorkerHash: await sha256File(path.join(MODULES_ROOT, 'shared', 'combine-worker.cjs')) },
   }
   await fs.writeFile(path.join(MODULES_ROOT, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
   await fs.rm(path.join(ROOT, '.stage'), { recursive: true, force: true })

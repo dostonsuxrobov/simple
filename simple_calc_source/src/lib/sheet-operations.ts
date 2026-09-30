@@ -10,6 +10,7 @@ import {
   formatA1Address,
   parseA1Address,
 } from './formulas'
+import { transformTablesForStructure } from './tables'
 
 export const MAX_SHEET_ROWS = 1_048_576
 export const MAX_SHEET_COLUMNS = 16_384
@@ -23,6 +24,19 @@ export interface SheetStructureOperation {
   kind: SheetStructureKind
   index: number
   count: number
+  /**
+   * Insert/delete cells rather than whole rows or columns: only this 0-based band of the other
+   * axis shifts (columns for row operations, rows for column operations), as Excel's
+   * "Shift cells down/right/up/left" does.
+   */
+  span?: { start: number; end: number }
+}
+
+export type CellShiftDirection = 'down' | 'right' | 'up' | 'left'
+
+/** Whether a 1-based perpendicular extent lies outside the operation's band. */
+function outsideSpan(operation: SheetStructureOperation, low: number, high: number) {
+  return Boolean(operation.span) && (low < operation.span!.start + 1 || high > operation.span!.end + 1)
 }
 
 export interface GridCoordinate {
@@ -88,7 +102,8 @@ export class SheetStructureError extends Error {
       | 'INVALID_OPERATION'
       | 'SHEET_NOT_FOUND'
       | 'LIMIT_EXCEEDED'
-      | 'ARRAY_RANGE_CONFLICT',
+      | 'ARRAY_RANGE_CONFLICT'
+      | 'SHIFT_CONFLICT',
   ) {
     super(message)
     this.name = 'SheetStructureError'
@@ -269,6 +284,8 @@ function formatLike(original: string, value: number, axis: SheetAxis): string | 
 function transformCellToken(token: string, operation: SheetStructureOperation): string | null {
   const address = parseA1Address(token)
   if (!address) return token
+  const across = operation.axis === 'row' ? address.column : address.row
+  if (outsideSpan(operation, across, across)) return token
   const position = operation.axis === 'row' ? address.row : address.column
   const transformed = transformPosition(position, operation)
   if (transformed === null) return null
@@ -288,6 +305,9 @@ function transformCellRange(firstToken: string, secondToken: string, operation: 
   const first = parseA1Address(firstToken)
   const second = parseA1Address(secondToken)
   if (!first || !second) return `${firstToken}:${secondToken}`
+  const acrossLow = operation.axis === 'row' ? Math.min(first.column, second.column) : Math.min(first.row, second.row)
+  const acrossHigh = operation.axis === 'row' ? Math.max(first.column, second.column) : Math.max(first.row, second.row)
+  if (outsideSpan(operation, acrossLow, acrossHigh)) return `${firstToken}:${secondToken}`
   const interval = operation.axis === 'row'
     ? { start: first.row, end: second.row }
     : { start: first.column, end: second.column }
@@ -323,7 +343,7 @@ function transformWholeRange(
   referenceAxis: SheetAxis,
   operation: SheetStructureOperation,
 ): string | null {
-  if (referenceAxis !== operation.axis) return `${firstToken}:${secondToken}`
+  if (referenceAxis !== operation.axis || operation.span) return `${firstToken}:${secondToken}`
   const first = referenceAxis === 'row'
     ? Number(firstToken.replace('$', ''))
     : columnLabelToNumber(firstToken.replace('$', ''))
@@ -517,6 +537,32 @@ function transformSqref(text: string, operation: SheetStructureOperation): strin
   return transformed.length ? transformed.join(' ') : null
 }
 
+/** A shift may not move part of a merge, a table or an array range (Excel refuses too). */
+function preflightShift(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (!operation.span) return
+  const { start } = operationInterval(operation)
+  const straddles = (bounds: Bounds) => {
+    const along = operation.axis === 'row' ? bounds.bottom : bounds.right
+    if (along < start) return false
+    const low = operation.axis === 'row' ? bounds.left : bounds.top
+    const high = operation.axis === 'row' ? bounds.right : bounds.bottom
+    const intersects = high >= operation.span!.start + 1 && low <= operation.span!.end + 1
+    return intersects && outsideSpan(operation, low, high)
+  }
+  for (const merge of sheet.merges || []) {
+    const bounds = parseRange(merge)
+    if (bounds && straddles(bounds)) throw new SheetStructureError(`Shifting these cells would split the merged cells ${merge}.`, 'SHIFT_CONFLICT')
+  }
+  for (const table of sheet.tables || []) {
+    const bounds = parseRange(table.ref)
+    if (bounds && straddles(bounds)) throw new SheetStructureError(`Shifting these cells would move part of the table ${table.name}. Select whole table columns or rows.`, 'SHIFT_CONFLICT')
+  }
+  for (const cell of Object.values(sheet.cells)) {
+    const bounds = cell.formulaRange ? parseRange(cell.formulaRange) : null
+    if (bounds && straddles(bounds)) throw new SheetStructureError(`Shifting these cells would split the array formula range ${cell.formulaRange}.`, 'SHIFT_CONFLICT')
+  }
+}
+
 function preflightArrayRanges(sheet: SheetData, operation: SheetStructureOperation): void {
   const { start, end } = operationInterval(operation)
   const seen = new Set<string>()
@@ -525,6 +571,7 @@ function preflightArrayRanges(sheet: SheetData, operation: SheetStructureOperati
     seen.add(cell.formulaRange)
     const bounds = parseRange(cell.formulaRange)
     if (!bounds) continue
+    if (operation.span && outsideSpan(operation, operation.axis === 'row' ? bounds.left : bounds.top, operation.axis === 'row' ? bounds.right : bounds.bottom)) continue
     const low = operation.axis === 'row' ? bounds.top : bounds.left
     const high = operation.axis === 'row' ? bounds.bottom : bounds.right
     const conflicts = operation.kind === 'insert'
@@ -549,6 +596,7 @@ function preflightOverflow(sheet: SheetData, operation: SheetStructureOperation)
       throw new SheetStructureError('The edit would push worksheet cells beyond the XLSX limit.', 'LIMIT_EXCEEDED')
     }
   }
+  if (operation.span) return
   const dimensionRecord = operation.axis === 'row'
     ? { ...(sheet.rowHeights || {}), ...(sheet.rowProperties || {}) }
     : { ...(sheet.colWidths || {}), ...(sheet.columnProperties || {}) }
@@ -574,6 +622,11 @@ function transformCells(sheet: SheetData, operation: SheetStructureOperation): v
   for (const [address, sourceCell] of Object.entries(sheet.cells)) {
     const coordinate = coordinateFromAddress(address)
     if (!coordinate) {
+      cells[address] = sourceCell
+      continue
+    }
+    const across = operation.axis === 'row' ? coordinate.col + 1 : coordinate.row + 1
+    if (outsideSpan(operation, across, across)) {
       cells[address] = sourceCell
       continue
     }
@@ -696,9 +749,15 @@ function transformFormulaProperties(
       ? rewriteFormulaForSheetStructure(value, formulaSheetId, targetSheet, operation)
       : value
   }
+  const record = value as Record<string, unknown>
+  // Conditional-format thresholds (cfvo) hold formulas in `value` for formula/num/percent types.
+  const threshold = typeof record.value === 'string' && ['formula', 'num', 'percent', 'percentile'].includes(String(record.type)) &&
+    !/^\s*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*$/.test(record.value)
   const result: Record<string, unknown> = {}
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    result[key] = transformFormulaProperties(child, formulaSheetId, targetSheet, operation, key)
+  for (const [key, child] of Object.entries(record)) {
+    result[key] = key === 'value' && threshold
+      ? rewriteFormulaForSheetStructure(child as string, formulaSheetId, targetSheet, operation)
+      : transformFormulaProperties(child, formulaSheetId, targetSheet, operation, key)
   }
   return result
 }
@@ -816,7 +875,30 @@ function splitFormulaAreas(value: string): string[] {
   return result
 }
 
+/** Shifting cells moves only the band's cells, merges and tables; rows and columns stay. */
+function transformShiftedCells(sheet: SheetData, operation: SheetStructureOperation): void {
+  transformCells(sheet, operation)
+  sheet.merges = (sheet.merges || []).flatMap((range) => {
+    const bounds = parseRange(range)
+    if (!bounds) return [range]
+    const low = operation.axis === 'row' ? bounds.left : bounds.top
+    const high = operation.axis === 'row' ? bounds.right : bounds.bottom
+    if (outsideSpan(operation, low, high)) return [range]
+    const transformed = transformBounds(bounds, operation)
+    return transformed ? [boundsToRange(transformed)] : []
+  })
+  transformTablesForStructure(sheet, operation)
+  if (operation.kind === 'insert') {
+    if (operation.axis === 'row') sheet.rowCount = Math.min(MAX_SHEET_ROWS, Math.max(1, Math.floor(Number(sheet.rowCount) || 1)) + operation.count)
+    else sheet.colCount = Math.min(MAX_SHEET_COLUMNS, Math.max(1, Math.floor(Number(sheet.colCount) || 1)) + operation.count)
+  }
+}
+
 function transformSheetStructure(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (operation.span) {
+    transformShiftedCells(sheet, operation)
+    return
+  }
   transformCells(sheet, operation)
   sheet.merges = (sheet.merges || []).flatMap((range) => {
     const bounds = parseRange(range)
@@ -848,6 +930,16 @@ function transformSheetStructure(sheet: SheetData, operation: SheetStructureOper
 
   transformViewsAndFrozen(sheet, operation)
   transformAutoFilter(sheet, operation)
+  transformTablesForStructure(sheet, operation)
+  if (sheet.pivots?.length) {
+    // Pivot blocks move with their anchor; one whose anchor row/column is deleted goes with it.
+    sheet.pivots = sheet.pivots.flatMap((pivot) => {
+      const position = (operation.axis === 'row' ? pivot.anchor.row : pivot.anchor.col) + 1
+      const transformed = transformPosition(position, operation)
+      if (transformed === null) return []
+      return [{ ...pivot, anchor: operation.axis === 'row' ? { ...pivot.anchor, row: transformed - 1 } : { ...pivot.anchor, col: transformed - 1 } }]
+    })
+  }
   transformPageSetup(sheet, operation)
 }
 
@@ -892,6 +984,21 @@ function rewriteWorkbookFormulas(workbook: WorkbookModel, targetSheet: SheetData
   }
   transformDefinedNames(workbook, targetSheet, operation)
   for (const sheet of workbook.sheets) {
+    for (const pivot of sheet.pivots || []) {
+      if (/[!:]/.test(pivot.source)) pivot.source = rewriteFormulaForSheetStructure(pivot.source, sheet.id, targetSheet, operation)
+    }
+    if (sheet.sparklineGroups?.length) {
+      sheet.sparklineGroups = sheet.sparklineGroups.map((group) => ({
+        ...group,
+        sparklines: group.sparklines.flatMap((item) => {
+          const source = item.source ? rewriteFormulaForSheetStructure(item.source, sheet.id, targetSheet, operation) : item.source
+          const cell = sheet.id === targetSheet.id ? transformLocalRangeText(item.cell, operation) : item.cell
+          return cell ? [{ source, cell }] : []
+        }),
+      })).filter((group) => group.sparklines.length)
+    }
+  }
+  for (const sheet of workbook.sheets) {
     if (sheet.id === targetSheet.id) {
       transformDataValidations(sheet, targetSheet, operation)
       transformConditionalFormatting(sheet, targetSheet, operation)
@@ -929,6 +1036,7 @@ export function applySheetStructureOperation(
   validateOperation(operation)
   const sourceSheet = workbook.sheets.find((sheet) => sheet.id === sheetId)
   if (!sourceSheet) throw new SheetStructureError(`Worksheet ${sheetId} was not found.`, 'SHEET_NOT_FOUND')
+  preflightShift(sourceSheet, operation)
   preflightArrayRanges(sourceSheet, operation)
   preflightOverflow(sourceSheet, operation)
 
@@ -943,6 +1051,22 @@ export function applySheetStructureOperation(
     forceFullCalc: true,
   }
   return next
+}
+
+/**
+ * Excel's Insert/Delete cells: shift the cells in (and beyond) a block down/right to make room,
+ * or delete the block and shift the following cells up/left. References move with the cells.
+ */
+export function shiftCells(workbook: WorkbookModel, sheetId: string, bounds: Bounds, direction: CellShiftDirection): WorkbookModel {
+  const vertical = direction === 'down' || direction === 'up'
+  const operation: SheetStructureOperation = {
+    axis: vertical ? 'row' : 'column',
+    kind: direction === 'down' || direction === 'right' ? 'insert' : 'delete',
+    index: vertical ? bounds.top : bounds.left,
+    count: vertical ? bounds.bottom - bounds.top + 1 : bounds.right - bounds.left + 1,
+    span: vertical ? { start: bounds.left, end: bounds.right } : { start: bounds.top, end: bounds.bottom },
+  }
+  return applySheetStructureOperation(workbook, sheetId, operation)
 }
 
 export function insertRows(workbook: WorkbookModel, sheetId: string, index: number, count = 1): WorkbookModel {

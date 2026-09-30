@@ -1,0 +1,57 @@
+{
+  "verifiedAt": "2026-09-05T13:41:09.3006465Z",
+  "executable": "C:\\Users\\dosto\\Documents\\simple\\simple.exe",
+  "sha256": "1571C42E0F3F0C73690A1672854516B9B81DCB82C7963FE9E6636540C70D68C7",
+  "printPreview": {
+    "modes": [
+      "image",
+      "docs",
+      "calc",
+      "pdf",
+      "video"
+    ],
+    "toolbarAndShortcut": 10,
+    "passed": true,
+    "physicalPrintSubmitted": false
+  },
+  "exportMenus": {
+    "modes": [
+      "image",
+      "docs",
+      "calc",
+      "pdf",
+      "video"
+    ],
+    "toolbarAndShortcut": 10,
+    "passed": true
+  },
+  "combine": {
+    "passed": true,
+    "runtime": "packaged-asar",
+    "files": 4,
+    "pages": 5,
+    "wordReferencePages": 1,
+    "wordTextMatches": true,
+    "spreadsheetNativePages": 1,
+    "spreadsheetTextAndPaperMatch": true,
+    "spreadsheetRangeValidated": true,
+    "spreadsheetPreviewRoutesToSource": true,
+    "spreadsheetHeaderColorTokenVisible": false,
+    "pageOrder": [
+      "Word original layout",
+      "PDF page 3",
+      "PDF page 1",
+      "spreadsheet printed page 1",
+      "oriented photo"
+    ],
+    "invalidRangeRejected": true,
+    "sourceOverwriteRefused": true,
+    "inputHashesUnchanged": true,
+    "workerSaveMilliseconds": 130.1234999999997,
+    "dialogReorderRemoveAndEditingLock": true,
+    "dialogDismissedWhileWorking": true,
+    "completionToast": true,
+    "interactiveFormsRejected": true,
+    "outputBytes": 125429
+  }
+}

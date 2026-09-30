@@ -111,6 +111,33 @@ async function click(selector) {
   assert.equal(clicked, true, `Missing clickable ${selector}`)
 }
 
+async function rightClick(selector) {
+  const handled = await evaluate(`(() => {
+    const element = document.querySelector(${JSON.stringify(selector)});
+    if (!element) return null;
+    const box = element.getBoundingClientRect();
+    const event = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+      buttons: 2,
+      clientX: box.left + box.width / 2,
+      clientY: box.top + box.height / 2,
+    });
+    element.dispatchEvent(event);
+    return event.defaultPrevented;
+  })()`)
+  assert.notEqual(handled, null, `Missing context-click target ${selector}`)
+  assert.equal(handled, true, `Context menu was not handled for ${selector}`)
+  await waitFor("document.querySelector('.sheet-context-menu')", `context menu for ${selector}`)
+}
+
+async function resetGridViewport() {
+  await evaluate("document.querySelector('.sheet-viewport')?.scrollTo({ left: 0, top: 0 })")
+  await waitFor("document.querySelector('.sheet-viewport')?.scrollLeft === 0 && document.querySelector('.sheet-viewport')?.scrollTop === 0", 'grid viewport reset')
+  await waitFor("document.querySelector('[id$=\"-B2\"]')", 'top-left grid cells after reset')
+}
+
 async function selectCell(address) {
   const expression = JSON.stringify(address)
   const selected = await evaluate(`(() => {
@@ -454,6 +481,7 @@ async function measureScrollResponsiveness() {
       mutations: result.mutations,
       scrollEvents: result.scrollEvents,
     }
+    if (process.env.SIMPLE_CALC_QA_VERBOSE) console.log('Scroll summary', JSON.stringify(summary))
     assert(summary.wheels >= 46, `Only ${summary.wheels} of 48 wheel inputs reached the grid`)
     assert(summary.downTravel >= 950 && summary.upTravel >= 950, `Scroll travel was incomplete: ${summary.downTravel}px down, ${summary.upTravel}px up`)
     assert(summary.returnError <= 8, `Direction reversal returned ${summary.returnError}px from its start`)
@@ -516,7 +544,7 @@ await waitFor("document.querySelector('.sheet-viewport')", 'new workbook grid')
 const gridMetrics = await evaluate(`(() => ({
   cells: document.querySelectorAll('.grid-cell').length,
   tabs: document.querySelectorAll('.sheet-tab').length,
-  formulaBar: Boolean(document.querySelector('.formula-bar input[aria-label="Formula bar"]')),
+  formulaBar: Boolean(document.querySelector('.formula-bar textarea[aria-label="Formula bar"]')),
   menuTriggers: [...document.querySelectorAll('[data-menu-trigger]')].map((item) => item.textContent.trim()),
   toolbarControls: document.querySelectorAll('.command-bar button, .command-bar select').length,
   active: document.querySelector('.name-box')?.value,
@@ -525,8 +553,188 @@ assert(gridMetrics.cells > 20 && gridMetrics.cells < 1500, `Unexpected virtualiz
 assert.equal(gridMetrics.tabs, 1)
 assert.equal(gridMetrics.formulaBar, true)
 assert.equal(gridMetrics.active, 'A1')
-assert.deepEqual(gridMetrics.menuTriggers, ['View', 'Insert', 'Format', 'Data', 'Tools'])
+assert.deepEqual(gridMetrics.menuTriggers, ['File', 'View', 'Insert', 'Format', 'Data', 'Tools'])
 assert(gridMetrics.toolbarControls >= 25, `Expected the expanded toolbar, found ${gridMetrics.toolbarControls} controls`)
+
+// The grid owns spreadsheet-aware clipboard commands, including a shared Ctrl+A / Select all path.
+await rightClick('[id$="-B2"]')
+const cellContextItems = await evaluate("[...document.querySelectorAll('.sheet-context-menu > .sheet-menu-entry > [data-menu-action]')].map((item) => item.dataset.menuAction)")
+assert.deepEqual(cellContextItems.slice(0, 6), ['context-cut', 'context-copy', 'context-paste', 'context-paste-special', 'context-clear', 'context-select-all'])
+assert.equal(await evaluate("document.querySelector('.name-box')?.value"), 'B2')
+await click('[data-menu-action="context-select-all"]')
+await waitFor("document.querySelector('.name-box')?.value === 'A1:AN200'", 'context-menu Select all range')
+await waitFor("document.activeElement?.classList.contains('sheet-viewport')", 'grid focus after context command')
+await resetGridViewport()
+
+// Escape restores the grid, while an outside pointer target keeps the focus it requested.
+await rightClick('[id$="-B2"]')
+await evaluate("document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))")
+await waitFor("!document.querySelector('.sheet-context-menu') && document.activeElement?.classList.contains('sheet-viewport')", 'context-menu Escape focus restoration')
+await rightClick('[id$="-B2"]')
+await evaluate(`(() => {
+  const field = document.querySelector('.formula-bar-input');
+  field.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+  field.focus();
+})()`)
+await waitFor("!document.querySelector('.sheet-context-menu') && document.activeElement?.classList.contains('formula-bar-input')", 'outside context-menu focus preservation')
+
+// Scrolling closes a stale floating menu instead of leaving it detached from its target.
+await rightClick('[id$="-B2"]')
+await evaluate(`(() => {
+  const viewport = document.querySelector('.sheet-viewport');
+  viewport.scrollTop = 120;
+  viewport.dispatchEvent(new Event('scroll'));
+})()`)
+await waitFor("!document.querySelector('.sheet-context-menu')", 'context-menu close on scroll')
+await evaluate("document.querySelector('.sheet-viewport').scrollTop = 0; document.querySelector('.sheet-viewport').focus()")
+
+// A partial selection that happens to intersect a header still expands to the full row/column.
+await selectCell('A1')
+await evaluate(`(() => {
+  const cell = document.querySelector('[id$="-B2"]');
+  cell.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, shiftKey: true }));
+})()`)
+await waitFor("document.querySelector('.name-box')?.value === 'A1:B2'", 'partial selection before row context menu')
+await rightClick('[aria-label="Row 1"]')
+await waitFor("document.querySelector('.name-box')?.value === 'A1:AN1'", 'full row context selection')
+await evaluate("document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))")
+await resetGridViewport()
+await selectCell('A1')
+await evaluate(`(() => {
+  const cell = document.querySelector('[id$="-B2"]');
+  cell.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, shiftKey: true }));
+})()`)
+await waitFor("document.querySelector('.name-box')?.value === 'A1:B2'", 'partial selection before column context menu')
+await rightClick('[aria-label="Column A"]')
+await waitFor("document.querySelector('.name-box')?.value === 'A1:A200'", 'full column context selection')
+await evaluate("document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))")
+
+// The top-left corner selects everything and exposes only the compact clipboard menu.
+const cornerHandled = await evaluate(`(() => {
+  const viewport = document.querySelector('.sheet-viewport');
+  const box = viewport.getBoundingClientRect();
+  const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, buttons: 2, clientX: box.left + 10, clientY: box.top + 10 });
+  viewport.dispatchEvent(event);
+  return event.defaultPrevented;
+})()`)
+assert.equal(cornerHandled, true)
+await waitFor("document.querySelector('.sheet-context-menu')?.getAttribute('aria-label') === 'All cells menu'", 'select-all corner context menu')
+assert.equal(await evaluate("document.querySelectorAll('.sheet-context-menu > .sheet-menu-entry > [data-menu-action]').length"), 6)
+await evaluate("document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))")
+await resetGridViewport()
+
+// An in-cell text editor remains a native editable target; the grid must not cover it with its menu.
+await selectCell('B2')
+await doubleClick('[id$="-B2"]')
+await waitFor("document.querySelector('.cell-editor')", 'editable cell before native context menu')
+const editorContextHandled = await evaluate(`(() => {
+  const editor = document.querySelector('.cell-editor');
+  const box = editor.getBoundingClientRect();
+  const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, buttons: 2, clientX: box.left + 8, clientY: box.top + 8 });
+  editor.dispatchEvent(event);
+  return event.defaultPrevented;
+})()`)
+assert.equal(editorContextHandled, false)
+assert.equal(await evaluate("Boolean(document.querySelector('.sheet-context-menu'))"), false)
+await evaluate("document.querySelector('.cell-editor').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))")
+await waitFor("!document.querySelector('.cell-editor')", 'editable cell context cleanup')
+await selectCell('A1')
+
+await evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, bubbles: true, cancelable: true }))")
+await waitFor("document.querySelector('.print-layout-dialog')", 'two-pane print dialog from Ctrl+P')
+await waitFor("document.querySelector('.print-preview-frame') && document.querySelector('.print-preview-pane')?.getAttribute('aria-busy') === 'false'", 'live paper preview')
+// The dialog starts from the file's saved layout; switch to manual settings to inspect them.
+await evaluate(`(() => { const box = document.querySelector('[aria-label="Use saved page layout"]'); if (box?.checked) box.click(); })()`)
+await waitFor("document.querySelector('[aria-label=\"Print orientation\"]') && document.querySelector('.print-preview-pane')?.getAttribute('aria-busy') === 'false'", 'manual print settings')
+const printSettings = await evaluate(`(() => ({
+  scope: document.querySelector('[aria-label="Print scope"]')?.value,
+  orientation: document.querySelector('[aria-label="Print orientation"]')?.value,
+  scaling: document.querySelector('[aria-label="Print scaling"]')?.value,
+  margins: document.querySelector('[aria-label="Print margins"]')?.value,
+  gridlines: document.querySelector('.print-detail-options input')?.checked,
+  printLabel: document.querySelector('.print-controls-actions .primary-action')?.textContent.trim(),
+  printDisabled: document.querySelector('.print-controls-actions .primary-action')?.disabled,
+  hasExactPage: document.querySelector('.print-preview-frame')?.srcdoc.includes('class="print-page print-sheet"'),
+  hasPrintMedia: document.querySelector('.print-preview-frame')?.srcdoc.includes('@media print'),
+  summary: document.querySelector('.print-preview-summary')?.textContent,
+  columns: getComputedStyle(document.querySelector('.print-dialog-columns')).gridTemplateColumns,
+  controlWidth: Math.round(document.querySelector('.print-controls-pane').getBoundingClientRect().width),
+  previewWidth: Math.round(document.querySelector('.print-preview-pane').getBoundingClientRect().width),
+}))()`)
+assert.equal(printSettings.scope, 'active-sheet')
+assert.equal(printSettings.orientation, 'portrait')
+assert.equal(printSettings.scaling, 'fit-width')
+assert.equal(printSettings.margins, 'normal')
+assert.equal(typeof printSettings.gridlines, 'boolean')
+assert.equal(printSettings.printLabel, 'Print now')
+assert.equal(printSettings.printDisabled, false)
+assert.equal(printSettings.hasExactPage, true)
+assert.equal(printSettings.hasPrintMedia, true)
+assert.match(printSettings.summary, /1 page · Letter · Portrait/)
+assert(printSettings.controlWidth >= 270, `print controls pane is too narrow: ${printSettings.controlWidth}`)
+assert(printSettings.previewWidth > printSettings.controlWidth, `print preview must occupy the second pane: ${printSettings.columns}`)
+await evaluate(`(() => {
+  const select = document.querySelector('[aria-label="Print orientation"]');
+  select.value = 'landscape';
+  select.dispatchEvent(new Event('change', { bubbles: true }));
+})()`)
+await waitFor("document.querySelector('.print-preview-frame')?.srcdoc.includes('data-orientation=\"landscape\"') && document.querySelector('.print-preview-pane')?.getAttribute('aria-busy') === 'false'", 'landscape preview refresh')
+assert.match(await evaluate("document.querySelector('.print-preview-summary')?.textContent"), /Landscape/)
+await evaluate("document.querySelector('.print-close').focus()")
+const reverseWrappedPrintFocus = await evaluate(`(() => {
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));
+  return document.activeElement?.getAttribute('aria-label');
+})()`)
+assert.equal(reverseWrappedPrintFocus, 'Preview zoom', 'Shift+Tab should stay within the print dialog')
+const forwardWrappedPrintFocus = await evaluate(`(() => {
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+  return document.activeElement?.getAttribute('aria-label');
+})()`)
+assert.equal(forwardWrappedPrintFocus, 'Close print dialog', 'Tab should wrap to the first print control')
+await screenshot('print-two-pane-preview.png')
+await click('.print-close')
+await waitFor("!document.querySelector('.print-layout-dialog')", 'print dialog close')
+
+await click('[aria-label^="Export As"]')
+await waitFor("document.querySelector('.export-card')", 'top-level Export As dialog')
+const exportSettings = await evaluate(`(() => ({
+  formats: [...document.querySelectorAll('[data-export-format]')].map((item) => item.dataset.exportFormat),
+  selected: document.querySelector('[data-export-format][aria-checked="true"]')?.dataset.exportFormat,
+  scope: document.querySelector('[aria-label="Export scope"]')?.value,
+  title: document.querySelector('#export-dialog-title')?.textContent.trim(),
+  safeCopy: document.querySelector('.export-card header p')?.textContent.includes('unsaved changes'),
+}))()`)
+assert.deepEqual(exportSettings, {
+  formats: ['pdf', 'xlsx', 'xls', 'html', 'ods', 'csv', 'tsv'],
+  selected: 'pdf',
+  scope: 'workbook',
+  title: 'Export As',
+  safeCopy: true,
+})
+await waitFor("document.activeElement?.dataset.exportFormat === 'pdf'", 'initial Export format focus')
+await evaluate("document.querySelector('.export-card .print-close').focus()")
+const reverseWrappedExportFocus = await evaluate(`(() => {
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));
+  return document.activeElement?.classList.contains('primary-action');
+})()`)
+assert.equal(reverseWrappedExportFocus, true, 'Shift+Tab should wrap from the first DOM export control to the last')
+const forwardWrappedExportFocus = await evaluate(`(() => {
+  document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+  return document.activeElement?.getAttribute('aria-label');
+})()`)
+assert.equal(forwardWrappedExportFocus, 'Close export options', 'Tab should wrap from the last export control to the first DOM control')
+await screenshot('export-as.png')
+await evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, bubbles: true, cancelable: true }))")
+assert.equal(await evaluate("Boolean(document.querySelector('.export-card')) && !document.querySelector('.print-card')"), true, 'Ctrl+P must not stack Print over the Export dialog')
+await click('[data-export-format="csv"]')
+assert.equal(await evaluate("Boolean(document.querySelector('[aria-label=\"Export scope\"]'))"), false, 'CSV should not show page-layout controls')
+await click('.export-card .print-close')
+await waitFor("!document.querySelector('.export-card')", 'export dialog close')
+await evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'E', code: 'KeyE', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }))")
+await waitFor("document.querySelector('.export-card')", 'Export As dialog from Ctrl+Shift+E')
+await waitFor("document.activeElement?.dataset.exportFormat === 'pdf'", 'shortcut Export format focus')
+await click('.export-card .print-close')
+await waitFor("!document.querySelector('.export-card')", 'shortcut export dialog close')
 
 await editCell('A1', '3')
 await editCell('B1', '5')
@@ -537,11 +745,11 @@ const formulaState = await evaluate(`(() => {
   return { display: cell.textContent.trim() };
 })()`)
 await pause(60)
-const formulaBarValue = await evaluate("document.querySelector('.formula-bar input[aria-label=\"Formula bar\"]').value")
+const formulaBarValue = await evaluate("document.querySelector('.formula-bar textarea[aria-label=\"Formula bar\"]').value")
 if (formulaState.display !== '8') {
   const debugState = await evaluate(`(() => ({
     cells: [...document.querySelectorAll('.grid-cell')].filter((item) => /-(A1|B1|A2)$/.test(item.id)).map((item) => ({ id: item.id, text: item.textContent, title: item.title })),
-    formulaBar: document.querySelector('.formula-bar input[aria-label="Formula bar"]')?.value,
+    formulaBar: document.querySelector('.formula-bar textarea[aria-label="Formula bar"]')?.value,
     active: document.querySelector('.name-box')?.value,
   }))()`)
   console.error('Formula debug state:', debugState)
@@ -583,42 +791,24 @@ try {
   console.error('Autofill debug state:', JSON.stringify(fillDebug))
   throw error
 }
-await waitFor("document.querySelector('.aggregate-picker output')?.textContent.trim() === '15'", 'autofill aggregate')
+const statusStat = (key) => `document.querySelector('[data-status-stat="${key}"] strong')?.textContent.trim()`
+await waitFor(`${statusStat('sum')} === '15'`, 'autofill sum in the status bar')
 const autofillState = await evaluate(`(() => ({
   values: ['C1', 'C2', 'C3', 'C4', 'C5'].map((address) => [...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-' + address))?.textContent.trim()),
-  aggregate: document.querySelector('.aggregate-picker output')?.textContent.trim(),
-  aggregateLabel: document.querySelector('.aggregate-picker select')?.selectedOptions[0]?.textContent,
-  aggregateMode: document.querySelector('.aggregate-picker select')?.value,
+  average: ${statusStat('average')},
+  count: ${statusStat('count')},
+  sum: ${statusStat('sum')},
 }))()`)
 assert.deepEqual(autofillState.values, ['1', '2', '3', '4', '5'])
-assert.equal(autofillState.aggregateMode, 'sum')
-assert.equal(autofillState.aggregateLabel, 'Sum')
-assert.equal(autofillState.aggregate, '15')
-await evaluate(`(() => {
-  const select = document.querySelector('.aggregate-picker select');
-  select.value = 'count';
-  select.dispatchEvent(new Event('change', { bubbles: true }));
-})()`)
-await waitFor("document.querySelector('.aggregate-picker select')?.value === 'count' && document.querySelector('.aggregate-picker output')?.textContent.trim() === '5'", 'count aggregate selection')
+assert.deepEqual({ average: autofillState.average, count: autofillState.count, sum: autofillState.sum }, { average: '3', count: '5', sum: '15' })
 await screenshot('autofill-summary.png')
-await evaluate(`(() => {
-  const format = document.querySelector('.number-select');
-  format.value = '0%';
-  format.dispatchEvent(new Event('change', { bubbles: true }));
-  const aggregate = document.querySelector('.aggregate-picker select');
-  aggregate.value = 'average';
-  aggregate.dispatchEvent(new Event('change', { bubbles: true }));
-})()`)
-await waitFor("document.querySelector('.aggregate-picker output')?.textContent.trim() === '300%'", 'formatted percentage aggregate')
-await evaluate(`(() => {
-  const format = document.querySelector('.number-select');
-  format.value = 'General';
-  format.dispatchEvent(new Event('change', { bubbles: true }));
-  const aggregate = document.querySelector('.aggregate-picker select');
-  aggregate.value = 'count';
-  aggregate.dispatchEvent(new Event('change', { bubbles: true }));
-})()`)
-await waitFor("document.querySelector('.aggregate-picker output')?.textContent.trim() === '5'", 'aggregate reset')
+// Status-bar statistics follow the selection's shared number format.
+await click('[aria-label="Format as percent"]')
+await waitFor(`${statusStat('average')} === '300.00%'`, 'formatted percentage average')
+await click('[aria-label="More number formats"]')
+await waitFor("document.querySelector('[data-toolbar-action=\"number-format-automatic\"]')", 'number format menu')
+await click('[data-toolbar-action="number-format-automatic"]')
+await waitFor(`${statusStat('average')} === '3'`, 'general format restored')
 
 await evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true }))")
 await waitFor("document.querySelector('.search-panel input') === document.activeElement", 'focused find panel')
@@ -748,6 +938,9 @@ await click('[data-menu-action="insert-checkbox"]')
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-F2'))?.querySelector('.cell-checkbox')", 'inserted checkbox')
 await evaluate("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-F2')).querySelector('.cell-checkbox').click()")
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-F2'))?.querySelector('.cell-checkbox')?.checked === true", 'checked checkbox')
+await rightClick('[id$="-F2"] .cell-checkbox')
+assert.equal(await evaluate("document.querySelector('.sheet-context-menu')?.getAttribute('aria-label')"), 'Cell menu')
+await evaluate("document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))")
 
 await selectCell('G2')
 await click('[data-menu-trigger="insert"]')
@@ -760,6 +953,9 @@ await evaluate(`(() => {
   dropdown.dispatchEvent(new Event('change', { bubbles: true }));
 })()`)
 await waitFor("[...document.querySelectorAll('.grid-cell')].find((item) => item.id.endsWith('-G2'))?.querySelector('.cell-dropdown')?.value === 'High'", 'selected dropdown value')
+await rightClick('[id$="-G2"] .cell-dropdown')
+assert.equal(await evaluate("document.querySelector('.sheet-context-menu')?.getAttribute('aria-label')"), 'Cell menu')
+await evaluate("document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))")
 
 await selectCell('H2')
 await click('[data-menu-trigger="insert"]')
@@ -875,8 +1071,9 @@ assert(savedSummary.getCell('H2').note, 'Cell note did not survive save')
 assert.equal(savedSummary.getCell('I2').hyperlink, 'https://example.com')
 assert.equal(savedSummary.getCell('A8').value, 'Merged title')
 assert.equal(savedSummary.getCell('B8').isMerged, true)
-assert(Math.abs(savedSummary.getColumn(2).width - (fittedDimensions.columnB / 8)) < 0.2)
-assert(Math.abs(savedSummary.getColumn(5).width - (fittedDimensions.columnE / 8)) < 0.2)
+// Excel stores widths in max-digit-width units (7px for Calibri 11 at 100%).
+assert(Math.abs(savedSummary.getColumn(2).width - (fittedDimensions.columnB / 7)) < 0.2)
+assert(Math.abs(savedSummary.getColumn(5).width - (fittedDimensions.columnE / 7)) < 0.2)
 assert(Math.abs(savedSummary.getRow(4).height - fittedDimensions.row4 * 0.75) < 0.2)
 assert(Math.abs(savedSummary.getRow(6).height - fittedDimensions.row6 * 0.75) < 0.2)
 

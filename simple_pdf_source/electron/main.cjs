@@ -6,6 +6,17 @@ const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 const { replacePdfOutlines } = require('./pdf-outlines.cjs')
 const { removePageImageDraws } = require('./pdf-content-edits.cjs')
+const { removeNativeText } = require('./text-removal.cjs')
+const {
+  IMAGE_EXPORT_FORMATS,
+  TEXT_EXPORT_FORMATS,
+  buildTextExport,
+  imageExportFileName,
+  safeExportBaseName,
+} = require('./pdf-export.cjs')
+const { loadPdfViewerForPrint, nativePrintOptions, preparePrintPdf, printWebContentsSilently, resolvePrinter } = require('./pdf-print.cjs')
+const { imageToPdfBytes } = require('./image-to-pdf.cjs')
+const { embedPdfFont } = require('./font-embedding.cjs')
 
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.png', '.jpg', '.jpeg', '.txt', '.md', '.docx', '.doc',
@@ -19,6 +30,7 @@ let WordExtractorModule
 let fontkitModule
 let pdfLibModule
 let dragExportDirectory = null
+const imageExportSessions = new Map()
 
 // Conversion/editing dependencies are intentionally loaded only when a user
 // invokes those features. In particular, mammoth and fontkit are expensive to
@@ -83,7 +95,9 @@ async function getPdfFont(pdfDoc, requestedFamily = 'Segoe UI', cache = new Map(
       if (missingRequiredGlyph) throw new Error('Decoded PDF subset does not contain every replacement glyph.')
       if (cache.has(embeddedKey)) return cache.get(embeddedKey)
       pdfDoc.registerFontkit(getFontkit())
-      const embedded = await pdfDoc.embedFont(fontBytes, { subset: true })
+      const embedded = await embedPdfFont(pdfDoc, fontBytes, style.text || '')
+      // Fontkit defers subset serialization until PDF.save(). Exercise it here
+      // while we can still fall back from a malformed browser-decoded font.
       cache.set(embeddedKey, embedded)
       return embedded
     } catch {
@@ -137,7 +151,7 @@ async function getPdfFont(pdfDoc, requestedFamily = 'Segoe UI', cache = new Map(
     try {
       const fontBytes = await fs.readFile(candidate)
       pdfDoc.registerFontkit(getFontkit())
-      const font = await pdfDoc.embedFont(fontBytes, { subset: true })
+      const font = await embedPdfFont(pdfDoc, fontBytes, style.text || '')
       cache.set(definition.key, font)
       return font
     } catch {
@@ -223,26 +237,6 @@ async function textToPdfBytes(text, title = 'Converted document') {
   return pdfDoc.save()
 }
 
-async function imageToPdfBytes(buffer, extension, title = 'Converted image') {
-  const { PDFDocument } = getPdfLib()
-  const pdfDoc = await PDFDocument.create()
-  const lower = extension.toLowerCase()
-  const image = lower === '.png'
-    ? await pdfDoc.embedPng(buffer)
-    : await pdfDoc.embedJpg(buffer)
-  const dimensions = image.scale(1)
-  const maxWidth = 841.89
-  const maxHeight = 841.89
-  const scale = Math.min(1, maxWidth / dimensions.width, maxHeight / dimensions.height)
-  const width = dimensions.width * scale
-  const height = dimensions.height * scale
-  const page = pdfDoc.addPage([width, height])
-  page.drawImage(image, { x: 0, y: 0, width, height })
-  pdfDoc.setTitle(title)
-  pdfDoc.setCreator('simple')
-  return pdfDoc.save()
-}
-
 function escapeHtml(value) {
   return String(value || '')
     .replace(/&/g, '&amp;')
@@ -311,20 +305,9 @@ async function convertInputToPdf(buffer, extension, name) {
   if (['.txt', '.md'].includes(ext)) {
     return textToPdfBytes(buffer.toString('utf8'), safeBaseName(name))
   }
-  if (ext === '.docx') {
-    const mammoth = getMammoth()
-    const result = await mammoth.convertToHtml({ buffer }, {
-      convertImage: mammoth.images.imgElement(async (image) => ({
-        src: `data:${image.contentType};base64,${await image.read('base64')}`,
-      })),
-    })
-    return htmlToPdfBytes(result.value, safeBaseName(name))
-  }
-  if (ext === '.doc') {
-    const WordExtractor = getWordExtractor()
-    const extractor = new WordExtractor()
-    const extracted = await extractor.extract(buffer)
-    return textToPdfBytes(extracted.getBody(), safeBaseName(name))
+  if (ext === '.docx' || ext === '.doc') {
+    const { convertOfficeBytes } = require('./office-converter.cjs')
+    return convertOfficeBytes({ bytes: buffer, inputExtension: ext.slice(1), outputExtension: 'pdf', filter: 'writer_pdf_Export' })
   }
   throw new Error(`Unsupported file type: ${ext || 'unknown'}`)
 }
@@ -469,6 +452,9 @@ async function insertDocuments(baseData, insertIndex, paths) {
     const sourceBuffer = await fs.readFile(filePath)
     const sourceBytes = await convertInputToPdf(sourceBuffer, ext, filePath)
     const sourceDoc = await PDFDocument.load(sourceBytes)
+    if (sourceDoc.getForm().getFields().length) {
+      throw new Error(`“${path.basename(filePath)}” contains interactive form fields. Flatten or print it to a static PDF before adding its pages.`)
+    }
     const pages = await baseDoc.copyPages(sourceDoc, sourceDoc.getPageIndices())
     for (const page of pages) baseDoc.insertPage(targetIndex++, page)
   }
@@ -489,6 +475,9 @@ async function insertDocumentPayloads(baseData, insertIndex, inputs) {
     if (!SUPPORTED_EXTENSIONS.has(ext)) continue
     const sourceBytes = await convertInputToPdf(toBytes(input.data), ext, name)
     const sourceDoc = await PDFDocument.load(sourceBytes, { updateMetadata: false, throwOnInvalidObject: false })
+    if (sourceDoc.getForm().getFields().length) {
+      throw new Error(`“${name}” contains interactive form fields. Flatten or print it to a static PDF before adding its pages.`)
+    }
     const pages = await baseDoc.copyPages(sourceDoc, sourceDoc.getPageIndices())
     for (const page of pages) baseDoc.insertPage(targetIndex++, page)
   }
@@ -614,35 +603,12 @@ function dataUrlBytes(dataUrl) {
   return { mime: match[1].toLowerCase(), bytes: Buffer.from(match[2], 'base64') }
 }
 
-function wrapText(text, font, size, maxWidth) {
-  const output = []
-  for (const paragraph of String(text || '').replace(/\r\n?/g, '\n').split('\n')) {
-    if (!paragraph) {
-      output.push('')
-      continue
-    }
-    const words = paragraph.split(/\s+/)
-    let line = ''
-    for (const word of words) {
-      const candidate = line ? `${line} ${word}` : word
-      if (!line || font.widthOfTextAtSize(candidate, size) <= maxWidth) {
-        line = candidate
-        continue
-      }
-      output.push(line)
-      line = word
-    }
-    if (line) output.push(line)
-  }
-  return output
-}
-
 async function flattenOverlays(data, overlays = [], formValues = {}, documentEdits = {}) {
+  const { layoutText, resolveTextFit } = await import('./text-layout.mjs')
   const { BlendMode, LineCapStyle, rgb } = getPdfLib()
-  const pdfDoc = await loadPdf(data)
+  const pdfDoc = await loadPdf(await removeNativeText(toBytes(data), overlays))
   applyDocumentEdits(pdfDoc, documentEdits)
   const fontCache = new Map()
-  const formFont = await getPdfFont(pdfDoc, 'Segoe UI', fontCache)
 
   try {
     const form = pdfDoc.getForm()
@@ -658,7 +624,10 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
         // A malformed or duplicated field should not prevent the rest of the save.
       }
     }
-    if (Object.keys(formValues || {}).length) form.updateFieldAppearances(formFont)
+    if (Object.keys(formValues || {}).length) {
+      const formFont = await getPdfFont(pdfDoc, 'Segoe UI', fontCache, { text: Object.values(formValues).join(' ') })
+      form.updateFieldAppearances(formFont)
+    }
   } catch {
     // Documents without a valid AcroForm simply skip this step.
   }
@@ -766,7 +735,7 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
       const size = Math.max(4, Math.min(96, Number(overlay.fontSize) || Math.max(8, rect.height * 0.72)))
       const [r, g, b] = parseColor(overlay.color, [0.04, 0.04, 0.05])
       let scaleX = Math.max(0.25, Math.min(4, Number(overlay.scaleX) || 1))
-      const letterSpacing = Math.max(-4, Math.min(24, Number(overlay.letterSpacing) || 0))
+      const letterSpacing = Math.max(-4, Math.min(20, Number(overlay.letterSpacing) || 0))
       const angle = Number.isFinite(overlay.angle) ? Number(overlay.angle) : 0
       // Text typed on a rotated page reads along the rotated axes. Lay lines
       // out in the displayed box (reading width × stacked height) and map the
@@ -776,7 +745,8 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
       const boxWidth = sideways ? rect.height : rect.width
       const boxHeight = sideways ? rect.width : rect.height
       const sourceRect = validRect(overlay.originalRect)
-      if (sourceRect && overlay.originalText && overlay.fontData?.byteLength && hasReliableWindowsFontMatch(overlay.fontFamily)) {
+      const preserveSourceMetrics = overlay.preserveSourceMetrics !== false && Math.abs(angle) < 0.01
+      if (preserveSourceMetrics && sourceRect && overlay.originalText && overlay.fontData?.byteLength && hasReliableWindowsFontMatch(overlay.fontFamily)) {
         // PDF.js sometimes exposes a decoded browser font whose glyph outlines
         // are correct but whose synthetic space advance is not. Napoleon's
         // embedded Times face reports a 1593/2048-em space instead of 512/2048,
@@ -801,7 +771,7 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
         }
       }
       let sourceSpaceAdvance = null
-      if (sourceRect && overlay.originalText) {
+      if (preserveSourceMetrics && sourceRect && overlay.originalText) {
         const sourceSpaceCount = whitespaceLength(overlay.originalText)
         if (sourceSpaceCount > 0) {
           const sourceWordWidth = textTokens(overlay.originalText)
@@ -840,50 +810,28 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
           }
         }
       }
-      if (overlay.cover !== false) {
-        const coverRect = sourceRect || rect
-        const [coverR, coverG, coverB] = parseColor(overlay.backgroundColor, [1, 1, 1])
-        // The renderer supplies the exact selected glyph range. Cover only that
-        // range plus a hairline for antialiasing; broad font-relative padding
-        // visibly erased neighboring words and lines on dense book pages.
-        // Italic glyphs can overhang a PDF.js text item's nominal rectangle by
-        // about one point. Use separate horizontal/vertical bleed so deletion
-        // removes those edge pixels without broadly erasing adjacent lines.
-        const horizontalBleed = Math.max(0.75, Math.min(1.5, size * 0.065))
-        const verticalBleed = Math.max(0.25, Math.min(0.75, size * 0.03))
-        page.drawRectangle({
-          x: coverRect.x - horizontalBleed,
-          y: coverRect.y - verticalBleed,
-          width: coverRect.width + horizontalBleed * 2,
-          height: coverRect.height + verticalBleed * 2,
-          color: rgb(coverR, coverG, coverB),
-          opacity: 1,
-          borderWidth: 0,
-        })
-      }
-      const nativeSingleLine = typeof overlay.originalText === 'string'
-        && !overlay.originalText.includes('\n')
-        && !String(overlay.text || '').includes('\n')
-      if (nativeSingleLine && overlay.text) {
-        const replacementWidth = sourceSpaceAdvance === null
-          ? textWidthAtSize(font, overlay.text, size, letterSpacing, scaleX)
-          : separatedTextWidth(font, overlay.text, size, letterSpacing, scaleX, sourceSpaceAdvance)
-        if (replacementWidth > boxWidth && replacementWidth > 0) {
-          const fit = boxWidth / replacementWidth
-          scaleX = Math.max(0.25, scaleX * fit)
-          if (sourceSpaceAdvance !== null) sourceSpaceAdvance *= fit
-        }
-      }
-      const lines = nativeSingleLine
-        ? [String(overlay.text || '')]
-        : wrapText(overlay.text, font, size, Math.max(4, boxWidth / scaleX))
+      const layout = layoutText(String(overlay.text || ''), boxWidth, (line) => (
+        sourceSpaceAdvance === null
+          ? textWidthAtSize(font, line, size, letterSpacing, scaleX)
+          : separatedTextWidth(font, line, size, letterSpacing, scaleX, sourceSpaceAdvance)
+      ), resolveTextFit(overlay))
+      scaleX *= layout.fitScale
+      if (sourceSpaceAdvance !== null) sourceSpaceAdvance *= layout.fitScale
+      const lines = layout.lines
       const lineHeight = Math.max(size * 0.8, Number(overlay.lineHeight) || size * 1.18)
       // Baseline distance measured downward from the displayed top of the box.
       let baselineV = Number.isFinite(overlay.baselineOffset)
         ? boxHeight - Number(overlay.baselineOffset)
         : Math.min(size, boxHeight)
+      const lastContentLine = lines.findLastIndex((line) => line.trim())
+      // A PDF.js selection box can end above its source baseline (e.g. fonts
+      // with unusual ascent metrics). Preserving that one native baseline is
+      // valid; it must not make Save, Print, and every export format fail.
+      const preservesNativeBaseline = sourceRect && Number.isFinite(overlay.baselineOffset) && lastContentLine === 0
+      if (!preservesNativeBaseline && lastContentLine >= 0 && baselineV + lastContentLine * lineHeight > boxHeight + 0.5) {
+        throw new Error(`Text on page ${overlay.pageIndex + 1} does not fit its box. Enlarge or move the text box, or reduce its font size before saving.`)
+      }
       for (const line of lines) {
-        if (baselineV > boxHeight + lineHeight) break
         const lineWidth = sourceSpaceAdvance === null
           ? textWidthAtSize(font, line, size, letterSpacing, scaleX)
           : separatedTextWidth(font, line, size, letterSpacing, scaleX, sourceSpaceAdvance)
@@ -967,48 +915,6 @@ async function atomicWrite(targetPath, data) {
   }
 }
 
-async function printPdfBytes(data, documentName, ownerWindow) {
-  const printDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-print-'))
-  const printPath = path.join(printDirectory, `${safeBaseName(documentName || 'Document')}.pdf`)
-  let printWindow = null
-  const cleanup = async () => {
-    await fs.rm(printDirectory, { recursive: true, force: true }).catch(() => {})
-  }
-
-  try {
-    await fs.writeFile(printPath, toBytes(data))
-    printWindow = new BrowserWindow({
-      ...(ownerWindow && !ownerWindow.isDestroyed() ? { parent: ownerWindow } : {}),
-      width: 960,
-      height: 780,
-      minWidth: 680,
-      minHeight: 520,
-      show: false,
-      title: `Print preview — ${documentName || 'PDF'}`,
-      backgroundColor: '#f4f4f5',
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        plugins: true,
-        devTools: false,
-      },
-    })
-    printWindow.removeMenu()
-    printWindow.on('closed', cleanup)
-    await printWindow.loadURL(pathToFileURL(printPath).href)
-    printWindow.show()
-    // Keep the preview open so Chromium's PDF viewer owns the complete print
-    // lifecycle. Its toolbar opens the native Windows print dialog and avoids
-    // Electron's unreliable callback when that dialog is cancelled.
-    return true
-  } catch (error) {
-    if (printWindow && !printWindow.isDestroyed()) printWindow.close()
-    await cleanup()
-    throw error
-  }
-}
-
 function printerCapabilityHints(options = {}) {
   const flattened = Object.entries(options)
     .map(([key, value]) => `${key}=${String(value)}`)
@@ -1025,8 +931,7 @@ async function printPdfDirect(data, documentName, options = {}) {
   const printPath = path.join(printDirectory, `${safeBaseName(documentName || 'Document')}.pdf`)
   let printWindow = null
   try {
-    const indices = Array.isArray(options.pageIndices) && options.pageIndices.length ? options.pageIndices : null
-    const printBytes = indices ? await exportedPages(data, indices, documentName || 'Document') : data
+    const printBytes = await preparePrintPdf(toBytes(data), options)
     await fs.writeFile(printPath, toBytes(printBytes))
     printWindow = new BrowserWindow({
       width: 800,
@@ -1040,28 +945,29 @@ async function printPdfDirect(data, documentName, options = {}) {
         devTools: false,
       },
     })
-    await printWindow.loadURL(pathToFileURL(printPath).href)
-    // Chromium's PDF viewer keeps parsing after did-finish-load; printing
-    // immediately produces blank pages, so give it a moment to settle.
-    await new Promise((resolve) => setTimeout(resolve, 400))
-    return await new Promise((resolve) => {
-      printWindow.webContents.print({
-        silent: true,
-        ...(options.deviceName ? { deviceName: String(options.deviceName) } : {}),
-        copies: Math.max(1, Math.trunc(Number(options.copies) || 1)),
-        ...(typeof options.landscape === 'boolean' ? { landscape: options.landscape } : {}),
-        color: options.color !== false,
-        ...(options.duplexMode ? { duplexMode: options.duplexMode } : {}),
-        collate: options.collate !== false,
-        margins: { marginType: 'default' },
-      }, (success, failureReason) => resolve({ success, failureReason: failureReason || '' }))
-    })
+    await loadPdfViewerForPrint(printWindow, pathToFileURL(printPath).href)
+    return await printWebContentsSilently(printWindow.webContents, nativePrintOptions(options))
   } catch (error) {
     return { success: false, failureReason: error instanceof Error ? error.message : String(error) }
   } finally {
     if (printWindow && !printWindow.isDestroyed()) printWindow.destroy()
     await fs.rm(printDirectory, { recursive: true, force: true }).catch(() => {})
   }
+}
+
+async function cleanupStalePrintDirectories() {
+  let entries = []
+  try { entries = await fs.readdir(os.tmpdir(), { withFileTypes: true }) } catch { return }
+  const cutoff = Date.now() - 24 * 60 * 60 * 1_000
+  await Promise.all(entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('simple-print-'))
+    .map(async (entry) => {
+      const target = path.join(os.tmpdir(), entry.name)
+      try {
+        const stat = await fs.stat(target)
+        if (stat.mtimeMs < cutoff) await fs.rm(target, { recursive: true, force: true })
+      } catch {}
+    }))
 }
 
 function createWindow(openPath = null) {
@@ -1101,6 +1007,14 @@ function createWindow(openPath = null) {
   })
   browserWindow.on('maximize', () => browserWindow.webContents.send('window:maximized', true))
   browserWindow.on('unmaximize', () => browserWindow.webContents.send('window:maximized', false))
+  const rendererId = browserWindow.webContents.id
+  browserWindow.on('closed', () => {
+    for (const [id, session] of imageExportSessions) {
+      if (session.ownerId !== rendererId) continue
+      imageExportSessions.delete(id)
+      if (session.directory) void fs.rm(session.targetPath, { recursive: true, force: true }).catch(() => {})
+    }
+  })
   browserWindow.on('close', (event) => {
     if (isQuitting || closeApprovedWindows.has(browserWindow)) return
     event.preventDefault()
@@ -1122,6 +1036,134 @@ function showOpenDialogFor(event, options) {
 function showSaveDialogFor(event, options) {
   const browserWindow = callingWindow(event)
   return browserWindow ? dialog.showSaveDialog(browserWindow, options) : dialog.showSaveDialog(options)
+}
+
+function withRequiredExtension(filePath, extension) {
+  return filePath.toLowerCase().endsWith(extension) ? filePath : `${filePath}${extension}`
+}
+
+async function uniqueExportDirectory(parentDirectory, requestedName) {
+  const baseName = safeExportBaseName(requestedName)
+  for (let suffix = 0; suffix < 1_000; suffix += 1) {
+    const candidate = path.join(parentDirectory, suffix ? `${baseName} (${suffix + 1})` : baseName)
+    try {
+      await fs.mkdir(candidate)
+      return candidate
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+    }
+  }
+  throw new Error('Could not create a unique export folder.')
+}
+
+async function exportTextDocument(event, input = {}) {
+  const format = String(input.format || '').toLowerCase()
+  if (!TEXT_EXPORT_FORMATS.has(format)) throw new Error('This document export format is not supported.')
+  const baseName = safeExportBaseName(input.baseName || input.title || 'Exported PDF')
+  const metadata = {
+    docx: { extension: '.docx', filter: { name: 'Word document', extensions: ['docx'] } },
+    txt: { extension: '.txt', filter: { name: 'Plain text', extensions: ['txt'] } },
+    md: { extension: '.md', filter: { name: 'Markdown document', extensions: ['md'] } },
+    html: { extension: '.html', filter: { name: 'Web page', extensions: ['html'] } },
+  }[format]
+  const result = await showSaveDialogFor(event, {
+    title: `Export as ${format.toUpperCase()}`,
+    defaultPath: `${baseName}${metadata.extension}`,
+    filters: [metadata.filter],
+  })
+  if (result.canceled || !result.filePath) return null
+  const targetPath = withRequiredExtension(result.filePath, metadata.extension)
+  await atomicWrite(targetPath, await buildTextExport(format, input.pages, input.title || baseName))
+  return targetPath
+}
+
+async function beginImageExport(event, input = {}) {
+  const format = String(input.format || '').toLowerCase()
+  if (!IMAGE_EXPORT_FORMATS.has(format)) throw new Error('This image export format is not supported.')
+  const pageCount = Math.trunc(Number(input.pageCount))
+  if (!Number.isInteger(pageCount) || pageCount < 1 || pageCount > 10_000) {
+    throw new Error('Choose between 1 and 10,000 pages to export.')
+  }
+  const activeForWindow = [...imageExportSessions.values()].filter((session) => session.ownerId === event.sender.id).length
+  if (activeForWindow >= 4 || imageExportSessions.size >= 32) throw new Error('Finish or cancel another image export before starting a new one.')
+  const baseName = safeExportBaseName(input.baseName || 'Exported PDF')
+  const extension = format === 'jpeg' ? '.jpg' : `.${format}`
+  let targetPath
+  let directory = false
+  if (pageCount === 1) {
+    const result = await showSaveDialogFor(event, {
+      title: `Export page as ${format.toUpperCase()}`,
+      defaultPath: `${baseName}${extension}`,
+      filters: [{ name: format === 'jpeg' ? 'JPEG image' : `${format.toUpperCase()} image`, extensions: [extension.slice(1)] }],
+    })
+    if (result.canceled || !result.filePath) return null
+    targetPath = withRequiredExtension(result.filePath, extension)
+  } else {
+    const result = await showOpenDialogFor(event, {
+      title: `Choose where to export ${pageCount} ${format.toUpperCase()} images`,
+      buttonLabel: 'Choose folder',
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (result.canceled || !result.filePaths[0]) return null
+    targetPath = await uniqueExportDirectory(result.filePaths[0], `${baseName} - ${format.toUpperCase()} pages`)
+    directory = true
+  }
+  const id = crypto.randomUUID()
+  imageExportSessions.set(id, {
+    ownerId: event.sender.id,
+    format,
+    pageCount,
+    baseName,
+    targetPath,
+    directory,
+    writtenPages: new Set(),
+  })
+  return { id, targetPath }
+}
+
+function imageExportSession(event, id) {
+  const session = imageExportSessions.get(String(id || ''))
+  if (!session || session.ownerId !== event.sender.id) throw new Error('This image export session is no longer available.')
+  return session
+}
+
+async function writeImageExportPage(event, input = {}) {
+  const session = imageExportSession(event, input.id)
+  const pageNumber = Math.trunc(Number(input.pageNumber))
+  if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > 1_000_000 || session.writtenPages.has(pageNumber) || session.writtenPages.size >= session.pageCount) {
+    throw new Error('The exported page number is invalid or duplicated.')
+  }
+  const data = toBytes(input.data)
+  if (!data.length || data.length > 100 * 1024 * 1024) throw new Error('The rendered page image is empty or too large.')
+  const validSignature = session.format === 'png'
+    ? data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+    : session.format === 'jpeg'
+      ? data[0] === 0xff && data[1] === 0xd8
+      : data.subarray(0, 4).toString('ascii') === 'RIFF' && data.subarray(8, 12).toString('ascii') === 'WEBP'
+  if (!validSignature) throw new Error(`The rendered page is not a valid ${session.format.toUpperCase()} image.`)
+  const targetPath = session.directory
+    ? path.join(session.targetPath, imageExportFileName(session.baseName, pageNumber, session.pageCount, session.format))
+    : session.targetPath
+  await atomicWrite(targetPath, data)
+  session.writtenPages.add(pageNumber)
+  return targetPath
+}
+
+async function finishImageExport(event, id) {
+  const session = imageExportSession(event, id)
+  if (session.writtenPages.size !== session.pageCount) {
+    throw new Error(`Only ${session.writtenPages.size} of ${session.pageCount} page images were written.`)
+  }
+  imageExportSessions.delete(String(id))
+  return session.targetPath
+}
+
+async function cancelImageExport(event, id) {
+  const session = imageExportSessions.get(String(id || ''))
+  if (!session || session.ownerId !== event.sender.id) return false
+  imageExportSessions.delete(String(id))
+  if (session.directory) await fs.rm(session.targetPath, { recursive: true, force: true }).catch(() => {})
+  return true
 }
 
 function supportedPaths(argv) {
@@ -1186,14 +1228,26 @@ function registerIpc() {
     }
   })
 
+  ipcMain.handle('pdf:unlock', async (_event, data, password) => {
+    const result = await require('./pdf-unlock.cjs').unlockPdf(data, typeof password === 'string' ? password : '')
+    return result.data ? { status: result.status, data: serializableBytes(result.data) } : result
+  })
+
   ipcMain.handle('pdf:mutate', async (_event, data, operation) => serializableBytes(await applyMutation(data, operation)))
+  ipcMain.handle('pdf:text-background', async (_event, data, pageIndex, edits) => {
+    const source = await loadPdf(data)
+    const single = await getPdfLib().PDFDocument.create()
+    const [page] = await single.copyPages(source, [pageIndex])
+    single.addPage(page)
+    return serializableBytes(await removeNativeText(await single.save(), edits.map(edit => ({ ...edit, pageIndex: 0 }))))
+  })
   ipcMain.handle('pdf:flatten-overlays', async (_event, data, overlays, formValues, documentEdits) => serializableBytes(await flattenOverlays(data, overlays, formValues, documentEdits)))
 
   ipcMain.handle('pdf:insert-files', async (event, data, insertIndex) => {
     const result = await showOpenDialogFor(event, {
       title: 'Add pages',
       properties: ['openFile', 'multiSelections'],
-      filters: [{ name: 'Documents', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'txt', 'md'] }],
+      filters: [{ name: 'Documents', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'doc', 'docx', 'txt', 'md'] }],
     })
     if (result.canceled || !result.filePaths.length) return null
     const inserted = await insertDocuments(data, insertIndex, result.filePaths)
@@ -1222,6 +1276,28 @@ function registerIpc() {
     }
   })
 
+  ipcMain.handle('pdf:export-as-pdf', async (event, input = {}) => {
+    const suggestedName = `${safeExportBaseName(input.suggestedName || 'Exported PDF')}.pdf`
+    const result = await showSaveDialogFor(event, {
+      title: 'Export as PDF',
+      defaultPath: suggestedName,
+      filters: [{ name: 'PDF file', extensions: ['pdf'] }],
+    })
+    if (result.canceled || !result.filePath) return null
+    const targetPath = withRequiredExtension(result.filePath, '.pdf')
+    const output = input.fullDocument
+      ? toBytes(input.data)
+      : await exportedPages(input.data, input.indices, suggestedName)
+    await atomicWrite(targetPath, output)
+    return targetPath
+  })
+
+  ipcMain.handle('pdf:export-text-document', (event, input) => exportTextDocument(event, input))
+  ipcMain.handle('pdf:begin-image-export', (event, input) => beginImageExport(event, input))
+  ipcMain.handle('pdf:write-image-export-page', (event, input) => writeImageExportPage(event, input))
+  ipcMain.handle('pdf:finish-image-export', (event, id) => finishImageExport(event, id))
+  ipcMain.handle('pdf:cancel-image-export', (event, id) => cancelImageExport(event, id))
+
   ipcMain.handle('pdf:export-pages', async (event, data, indices, suggestedName) => {
     const result = await showSaveDialogFor(event, {
       title: 'Export pages',
@@ -1245,19 +1321,23 @@ function registerIpc() {
     return targetPath
   })
 
-  ipcMain.handle('pdf:print', async (event, data, documentName) => printPdfBytes(data, documentName, callingWindow(event)))
-
   ipcMain.handle('print:list-printers', async (event) => {
     const printers = await event.sender.getPrintersAsync()
     return printers.map((printer) => ({
       name: printer.name,
       displayName: printer.displayName || printer.name,
-      isDefault: Boolean(printer.isDefault),
       ...printerCapabilityHints(printer.options),
     }))
   })
 
-  ipcMain.handle('pdf:print-direct', async (_event, data, documentName, options) => printPdfDirect(data, documentName, options))
+  ipcMain.handle('pdf:print-direct', async (event, data, documentName, options = {}) => {
+    try {
+      const printer = resolvePrinter(await event.sender.getPrintersAsync(), options.deviceName)
+      return printPdfDirect(data, documentName, { ...options, deviceName: printer.name })
+    } catch (error) {
+      return { success: false, failureReason: error instanceof Error ? error.message : String(error) }
+    }
+  })
 
   ipcMain.handle('pdf:save', async (event, input) => {
     let targetPath = input.forceDialog ? null : input.path
@@ -1314,6 +1394,7 @@ if (!gotLock) {
   })
 
   app.whenReady().then(() => {
+    void cleanupStalePrintDirectories()
     registerIpc()
     const incoming = supportedPaths(process.argv)
     if (incoming.length) {

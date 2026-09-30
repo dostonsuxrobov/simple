@@ -6,8 +6,21 @@ const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron')
 const { EXTENSIONS_BY_MODE, groupPathsByMode, MODES, supportedPaths } = require('../electron/routing.cjs')
 const { launchDetached, portableExecutablePath } = require('../electron/launch.cjs')
 const { registerAssociations, unregisterAssociations } = require('./associations.cjs')
+const { atomicWrite, runCombine } = require('./combine-host.cjs')
 
 let mainWindow = null
+let combineBusy = false
+const COMBINE_EXTENSIONS = ['pdf', 'docx', 'doc', 'xls', 'xlsx', 'ods', 'png', 'jpg', 'jpeg']
+
+async function describeCombinePaths(paths) {
+  if (!Array.isArray(paths) || paths.length > 100) throw new Error('Choose up to 100 files at a time.')
+  return Promise.all(paths.map(async (filePath) => {
+    if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !COMBINE_EXTENSIONS.includes(path.extname(filePath).slice(1).toLowerCase())) throw new Error('Combine accepts PDFs, Word documents, Excel and ODS spreadsheets, PNGs, and JPEGs.')
+    const stat = await fs.stat(filePath)
+    if (!stat.isFile() || !stat.size || stat.size > 256 * 1024 * 1024) throw new Error(`${path.basename(filePath)} must be a nonempty file smaller than 256 MB.`)
+    return { path: filePath, name: path.basename(filePath), size: stat.size, pages: '' }
+  }))
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -55,6 +68,41 @@ async function buildInfo() {
 
 function registerIpc() {
   ipcMain.handle('launcher:info', buildInfo)
+  ipcMain.handle('launcher:combine-add', async (event, paths) => {
+    if (combineBusy) throw new Error('Wait for the current PDF to finish.')
+    if (paths !== undefined) return describeCombinePaths(paths)
+    const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
+      title: 'Add files to combine', properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'PDF, Word, spreadsheets, and photos', extensions: COMBINE_EXTENSIONS }],
+    })
+    return result.canceled ? [] : describeCombinePaths(result.filePaths)
+  })
+  ipcMain.handle('launcher:combine-save', async (event, entries) => {
+    if (combineBusy) throw new Error('Wait for the current PDF to finish.')
+    if (!Array.isArray(entries) || entries.length < 2) throw new Error('Add at least two files.')
+    await describeCombinePaths(entries.map((entry) => entry?.path))
+    combineBusy = true
+    try {
+      const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender), {
+        title: 'Save combined PDF', defaultPath: path.join(path.dirname(entries[0].path), 'Combined.pdf'),
+        filters: [{ name: 'PDF document', extensions: ['pdf'] }],
+      })
+      if (result.canceled || !result.filePath) return { canceled: true }
+      const target = path.extname(result.filePath) ? result.filePath : `${result.filePath}.pdf`
+      if (path.extname(target).toLowerCase() !== '.pdf') throw new Error('Choose a .pdf filename for the combined document.')
+      const realTarget = await fs.realpath(target).catch(() => path.resolve(target))
+      for (const entry of entries) {
+        const realSource = await fs.realpath(entry.path)
+        if (realSource.toLowerCase() === realTarget.toLowerCase()) throw new Error('Choose a new filename so the combined PDF keeps your source file intact.')
+      }
+      const combined = await runCombine(entries, (progress) => {
+        if (!event.sender.isDestroyed()) event.sender.send('launcher:combine-progress', progress)
+      })
+      await atomicWrite(target, combined.bytes)
+      launchDetached([target])
+      return { canceled: false, name: path.basename(target), pageCount: combined.pageCount }
+    } finally { combineBusy = false }
+  })
   ipcMain.handle('launcher:open', async (event) => {
     const owner = BrowserWindow.fromWebContents(event.sender)
     const result = await dialog.showOpenDialog(owner, {

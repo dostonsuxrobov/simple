@@ -1,0 +1,203 @@
+.ps-overlay {
+  position: fixed;
+  inset: 38px 0 0;
+  z-index: 600;
+  display: grid;
+  place-items: center;
+  background: rgba(247, 248, 245, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.ps-card {
+  width: min(452px, calc(100vw - 48px));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line-strong, #d3d6ce);
+  border-radius: 11px;
+  color: var(--ink, #222421);
+  background: var(--paper, #fff);
+  box-shadow: var(--shadow, 0 16px 46px rgba(36, 39, 34, 0.13));
+  font-family: Inter, "Segoe UI Variable", "Segoe UI", Arial, sans-serif;
+  user-select: none;
+}
+
+.ps-header {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 28px;
+  align-items: start;
+  gap: 10px;
+  padding: 16px 18px 12px;
+}
+
+.ps-header h2 {
+  margin: 1px 0 2px;
+  font-size: 13.5px;
+  font-weight: 680;
+}
+
+.ps-header p {
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted, #747871);
+  font-size: 10.5px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ps-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: #31523e;
+  background: var(--accent-soft, #e9f0eb);
+}
+
+.ps-close {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--muted, #747871);
+  background: transparent;
+  cursor: pointer;
+}
+
+.ps-close:hover {
+  color: var(--ink, #222421);
+  background: var(--panel, #fbfbf9);
+}
+
+.ps-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0 18px 16px;
+}
+
+.ps-group {
+  min-width: 0;
+  margin: 0;
+  padding: 8px 10px 9px;
+  border: 1px solid var(--line, #e2e4de);
+  border-radius: 8px;
+  background: var(--panel, #fbfbf9);
+}
+
+.ps-group legend {
+  padding: 0 5px;
+  color: var(--muted, #747871);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ps-group:disabled legend {
+  opacity: 0.6;
+}
+
+.ps-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 12px;
+  row-gap: 1px;
+}
+
+.ps-grid-paste {
+  grid-auto-flow: column;
+  grid-template-rows: repeat(6, auto);
+}
+
+.ps-grid-operation {
+  grid-auto-flow: column;
+  grid-template-rows: repeat(3, auto);
+}
+
+.ps-option {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 5px;
+  border-radius: 5px;
+  color: var(--ink, #222421);
+  font-size: 11.5px;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.ps-option:hover:not(.is-disabled) {
+  background: var(--accent-faint, rgba(71, 107, 87, 0.12));
+}
+
+.ps-option.is-checked {
+  color: #26402f;
+  font-weight: 600;
+}
+
+.ps-option.is-disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ps-option input {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent, #476b57);
+  cursor: inherit;
+}
+
+.ps-option input:focus-visible {
+  outline: 2px solid rgba(71, 107, 87, 0.45);
+  outline-offset: 2px;
+}
+
+.ps-option span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ps-key {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ps-toggles {
+  display: flex;
+  gap: 18px;
+  padding: 0 5px;
+}
+
+.ps-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.ps-actions .primary-action,
+.ps-actions .secondary-action {
+  height: 32px;
+  padding: 0 14px;
+}
+
+.ps-actions .primary-action {
+  min-width: 72px;
+}
+
+.ps-link {
+  gap: 6px;
+}
+
+.ps-spacer {
+  flex: 1;
+}

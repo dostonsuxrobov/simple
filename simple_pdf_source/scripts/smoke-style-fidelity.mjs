@@ -201,8 +201,8 @@ if (editor.style.weight !== source.style.weight || editor.style.fontStyle !== so
 }
 if (editor.value !== sourceText) throw new Error(`Editor did not remain selection-only: ${JSON.stringify(editor)}`)
 if (committed.text !== committedText) throw new Error(`Commit did not reflow the complete source item: ${JSON.stringify({ committedText, committed })}`)
-if (!committed.cover || Math.abs(committed.cover.width - source.itemBounds.width) > 1) {
-  throw new Error(`Commit did not cover the complete source item: ${JSON.stringify({ source, committed })}`)
+if (committed.cover) {
+  throw new Error(`Commit painted a background patch: ${JSON.stringify({ source, committed })}`)
 }
 if (saved.text !== committedText) throw new Error(`Replacement and suffix were not saved as one reflowed run: ${JSON.stringify({ committedText, saved })}`)
 if (!Number.isFinite(saved.suffixGap) || saved.suffixGap < -0.5 || saved.suffixGap > Number.parseFloat(editor.style.size)) {

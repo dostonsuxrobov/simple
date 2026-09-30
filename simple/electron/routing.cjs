@@ -6,8 +6,8 @@ const path = require('node:path')
 // import the same format; the unified app chooses the editor that best matches
 // the extension so a double-click always has one deterministic destination.
 const EXTENSIONS_BY_MODE = Object.freeze({
-  docs: Object.freeze(['.docx']),
-  pdf: Object.freeze(['.pdf', '.txt', '.md', '.doc']),
+  docs: Object.freeze(['.docx', '.doc']),
+  pdf: Object.freeze(['.pdf', '.txt', '.md']),
   image: Object.freeze(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg', '.avif']),
   video: Object.freeze(['.mp4', '.m4v', '.webm', '.ogv', '.mov', '.mkv']),
   calc: Object.freeze([

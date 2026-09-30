@@ -13,7 +13,11 @@
     "build:dir": "npm run test && npm run build:web && electron-builder --win dir --x64",
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && node --test tests/*.test.cjs",
-    "smoke": "electron qa/smoke.cjs"
+    "smoke": "electron qa/smoke.cjs",
+    "smoke:context-menu": "node qa/context-menu-smoke.cjs",
+    "smoke:print": "electron qa/print-smoke.cjs",
+    "smoke:print-render": "electron qa/print-render-smoke.cjs",
+    "smoke:packaged-print": "node qa/packaged-print-smoke.cjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

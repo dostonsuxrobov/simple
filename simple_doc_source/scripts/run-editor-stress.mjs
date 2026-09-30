@@ -1,0 +1,137 @@
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { mkdir, writeFile, readFile, copyFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import { runImport } from '@forevka/wordcanvas/import';
+import { deflateSync } from 'node:zlib';
+
+const require = createRequire(import.meta.url);
+const root = fileURLToPath(new URL('..', import.meta.url));
+const output = path.join(root, 'tmp', 'editor-stress');
+await mkdir(output, { recursive: true });
+const port = 23100 + Math.floor(Math.random() * 500);
+const hostPath = path.join(output, 'host.cjs');
+await writeFile(hostPath, `const {app,dialog}=require('electron');const path=require('node:path');
+app.setPath('userData',path.join(__dirname,'profile'));
+dialog.showSaveDialog=async(_owner,options)=>({canceled:false,filePath:path.join(__dirname,'created.'+options.filters[0].extensions[0])});
+dialog.showOpenDialog=async()=>({canceled:false,filePaths:[require('node:fs').readFileSync(path.join(__dirname,'open-target.txt'),'utf8')]});
+require(${JSON.stringify(path.join(root, 'electron', 'main.cjs'))});`);
+const child = spawn(require('electron'), [`--remote-debugging-port=${port}`, hostPath], { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+let stderr = '';
+child.stderr.on('data', data => stderr += String(data));
+let socket;
+let id = 0;
+const pending = new Map();
+const send = (method, params = {}) => new Promise((resolve, reject) => { const request = ++id; pending.set(request, {resolve,reject}); socket.send(JSON.stringify({id:request,method,params})); });
+const evaluate = async(expression) => { const result = await send('Runtime.evaluate', { expression, awaitPromise:true, returnByValue:true,userGesture:true }); if(result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails)); return result.result.value; };
+const pause = (ms) => new Promise(resolve=>setTimeout(resolve,ms));
+const until = async(expression, label, timeout=30000) => { const end=Date.now()+timeout; while(Date.now()<end) {if(await evaluate(expression))return;await pause(100);}throw new Error(`Timed out ${label}`); };
+const key = async(key,code,number,modifiers=0) => {for(const type of ['keyDown','keyUp'])await send('Input.dispatchKeyEvent',{type,key,code,windowsVirtualKeyCode:number,modifiers,...(key==='Enter'&&type==='keyDown'&&!(modifiers&2)?{text:'\r',unmodifiedText:'\r'}:{})});};
+const clickTitle = async(title) => {await evaluate(`[...document.querySelectorAll('button')].find(n=>n.title===${JSON.stringify(title)}&&n.checkVisibility()).click()`);await pause(80);};
+const clickText = async(text) => {await evaluate(`[...document.querySelectorAll('button')].find(n=>n.textContent===${JSON.stringify(text)}&&n.checkVisibility()).click()`);await pause(80);};
+const typeText = async(text) => {await evaluate(`document.querySelector('#editor [contenteditable="true"]').focus()`);await send('Input.insertText',{text});await pause(70);};
+const paste = async(html) => {await evaluate(`(()=>{const data=new DataTransfer();data.setData('text/html',${JSON.stringify(html)});const editor=document.querySelector('#editor [contenteditable="true"]');editor.focus();editor.dispatchEvent(new InputEvent('beforeinput',{inputType:'insertFromPaste',dataTransfer:data,bubbles:true,cancelable:true}));})()`);await pause(150);};
+const table = async(rows,cols) => {await clickText('Insert');await clickTitle('Insert table');await evaluate(`document.querySelectorAll('.cw-grid .cell')[${(rows-1)*10+cols-1}].click()`);await pause(100);};
+const pageClick = async(index,x,y,count=1) => {const p=await evaluate(`(()=>{const r=document.querySelector('#editor [data-page="${index}"]').getBoundingClientRect();return{x:r.left+${x},y:r.top+${y}};})()`);for(const type of ['mousePressed','mouseReleased'])await send('Input.dispatchMouseEvent',{type,button:'left',clickCount:count,...p});await pause(100);};
+const screenshot=async(name)=>{const shot=await send('Page.captureScreenshot',{format:'png',fromSurface:true});await writeFile(path.join(output,name),Buffer.from(shot.data,'base64'));};
+const connect = async(target) => {
+  socket?.close();
+  socket=new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise(resolve=>socket.addEventListener('open',resolve,{once:true}));
+  socket.addEventListener('message',event=>{const message=JSON.parse(String(event.data));const request=pending.get(message.id);if(!request)return;pending.delete(message.id);message.error?request.reject(new Error(message.error.message)):request.resolve(message.result);});
+  await send('Page.enable');
+};
+function png(width,height){const crc=(bytes)=>{let c=0xffffffff;for(const b of bytes){c^=b;for(let i=0;i<8;i++)c=(c>>>1)^((c&1)?0xedb88320:0);}return(c^0xffffffff)>>>0;};const chunk=(name,data)=>{const type=Buffer.from(name),body=Buffer.concat([type,data]),head=Buffer.alloc(4),tail=Buffer.alloc(4);head.writeUInt32BE(data.length);tail.writeUInt32BE(crc(body));return Buffer.concat([head,body,tail]);};const header=Buffer.alloc(13);header.writeUInt32BE(width,0);header.writeUInt32BE(height,4);header[8]=8;header[9]=2;const rows=Buffer.alloc((width*3+1)*height);for(let y=0;y<height;y++)for(let x=0;x<width;x++){const at=y*(width*3+1)+1+x*3;rows[at]=x<width/2?30:230;rows[at+1]=y<height/2?140:65;rows[at+2]=180;}return Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),chunk('IHDR',header),chunk('IDAT',deflateSync(rows)),chunk('IEND',Buffer.alloc(0))]);}
+try {
+ let target;
+ const end=Date.now()+25000;
+ while(!target&&Date.now()<end){try{target=(await(await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t=>t.type==='page');}catch{}if(!target)await pause(100);}
+ assert.ok(target,`Renderer starts: ${stderr}`);
+ socket=new WebSocket(target.webSocketDebuggerUrl);
+ await new Promise(resolve=>socket.addEventListener('open',resolve,{once:true}));
+ socket.addEventListener('message',event=>{const message=JSON.parse(String(event.data));const request=pending.get(message.id);if(!request)return;pending.delete(message.id);message.error?request.reject(new Error(message.error.message)):request.resolve(message.result);});
+ await send('Page.enable');
+ await until(`document.querySelector('#blank-document')&&!document.querySelector('#loading-overlay')?.checkVisibility()`,'welcome');
+ await evaluate(`document.querySelector('#blank-document').click()`);
+ await until(`document.querySelector('#editor.is-active [contenteditable="true"]')`,'blank editor');
+ const pagePoint=await evaluate(`(()=>{const r=document.querySelector('#editor [data-page="0"]').getBoundingClientRect();return{x:r.left+110,y:r.top+110};})()`);
+ for(const type of ['mousePressed','mouseReleased'])await send('Input.dispatchMouseEvent',{type,button:'left',clickCount:1,...pagePoint});
+ const inventory=await evaluate(`({buttons:[...document.querySelectorAll('button')].filter(n=>n.checkVisibility()).map(n=>({text:n.textContent,title:n.title,label:n.getAttribute('aria-label')})),selects:[...document.querySelectorAll('select')].filter(n=>n.checkVisibility()).map(n=>({label:n.getAttribute('aria-label'),title:n.title,options:[...n.options].map(o=>o.text)}))})`);
+ await writeFile(path.join(output,'inventory.json'),JSON.stringify(inventory,null,2));
+ await clickText('Layout');await evaluate(`[...document.querySelectorAll('button')].find(n=>n.title.startsWith('Page layout (')).click()`);await pause(150);
+ await evaluate(`[...document.querySelectorAll('button')].find(n=>n.textContent==='Layout'&&n.className.includes('cw-pl')).click()`);
+ await writeFile(path.join(output,'layout-dialog.html'),await evaluate(`document.body.innerHTML`));
+ await evaluate(`(()=>{const label=[...document.querySelectorAll('label')].find(n=>n.textContent.includes('Different first page'));if(label){const input=label.querySelector('input');input.checked=true;input.dispatchEvent(new Event('change',{bubbles:true}));}})()`);
+ await evaluate(`[...document.querySelectorAll('button')].find(n=>n.textContent==='Apply to this section'&&n.checkVisibility()).click()`);await pause(200);
+ await pageClick(0,110,130,2);await key('End','End',35,2);
+ await paste('<h1>STRESS_START — Local editor creation</h1><p><span style="font-family:Arial;font-size:18px;color:#003388">Mixed Arial blue</span> <b>bold text</b> <i>italic accent café naïve Ångström</i></p><p>Table one follows.</p>');
+ await until(`!document.querySelector('#editor').textContent.includes('0 words · 0 characters')`,'initial pasted content');
+ await key('End','End',35,2);
+ await table(3,3);
+ for(let i=0;i<9;i++){await typeText(`TABLE_ONE_${i+1} ${i===4?'Long wrapped cell content. '.repeat(8):'value'}`);if(i<8)await key('Tab','Tab',9);}
+ await key('End','End',35,2);await key('Enter','Enter',13);
+ await paste('<p>BETWEEN_TABLES</p>');
+ await table(2,2);
+ for(let i=0;i<4;i++){await typeText(`TABLE_TWO_${i+1}`);if(i<3)await key('Tab','Tab',9);}
+ await key('End','End',35,2);await key('Enter','Enter',13);
+ await clickText('Home');await clickTitle('Bulleted list');await typeText('BULLET_ONE');await key('Enter','Enter',13);await typeText('BULLET_TWO');await key('Enter','Enter',13);await key('Enter','Enter',13);
+ await paste('<p>LONG_CONTENT_START</p>'+Array.from({length:16},(_,i)=>`<p>PARA_${String(i+1).padStart(2,'0')} ${'Reliable documents preserve every sentence, table boundary and page break. '.repeat(7)}</p>`).join('')+'<p>RTL العربية 123 نهاية — עברית שלום 456 סוף</p><p>CJK 中文测试 日本語の文章 한국어 문장</p><p>STRESS_SECTION_TWO</p>');
+ await clickText('Insert');await clickTitle('Section break — next page');
+ await clickText('Layout');await evaluate(`[...document.querySelectorAll('button')].find(n=>n.title.startsWith('Page layout (')).click()`);await pause(150);
+ await evaluate(`(()=>{const select=[...document.querySelectorAll('select')].find(n=>[...n.options].some(o=>o.value==='landscape'));select.value='landscape';select.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+ await evaluate(`[...document.querySelectorAll('button')].find(n=>n.textContent==='Apply to this section'&&n.checkVisibility()).click()`);await pause(150);
+ await paste('<h2>LANDSCAPE_MARKER</h2><p>Wide section created through the page layout dialog.</p>');
+ const imagePath=path.join(output,'synthetic-quadrants.png');await writeFile(imagePath,png(320,140));
+ await send('Page.setInterceptFileChooserDialog',{enabled:true});
+ let imageChooser;
+ const chooserPromise=new Promise(resolve=>{imageChooser=event=>{const m=JSON.parse(String(event.data));if(m.method==='Page.fileChooserOpened'){socket.removeEventListener('message',imageChooser);resolve(m.params.backendNodeId);}};socket.addEventListener('message',imageChooser);});
+ await clickText('Insert');await clickTitle('Insert image from your device');
+ const chooser=await Promise.race([chooserPromise,pause(10000).then(()=>{throw new Error('Image chooser did not open')})]);await send('DOM.setFileInputFiles',{files:[imagePath],backendNodeId:chooser});await pause(600);
+ await send('Page.setInterceptFileChooserDialog',{enabled:false});
+ const imagePoint=await evaluate(`(()=>{for(const page of document.querySelectorAll('#editor [data-page]')){for(const canvas of page.querySelectorAll('canvas')){const data=canvas.getContext('2d').getImageData(0,0,canvas.width,canvas.height).data;for(let y=0;y<canvas.height;y+=4)for(let x=0;x<canvas.width;x+=4){const at=(y*canvas.width+x)*4;if(data[at]===30&&data[at+1]===140&&data[at+2]===180){page.scrollIntoView({block:'center'});return {index:Number(page.dataset.page),x:x+40,y:y+30};}}}}return null;})()`);
+ assert.ok(imagePoint,'Inserted image is visibly painted in the editor');
+ await pageClick(imagePoint.index,imagePoint.x,imagePoint.y);
+ const imageSelected=await evaluate(`![...document.querySelectorAll('button')].find(n=>n.title.startsWith('Wrap text around image')).disabled`);
+ if(imageSelected)await clickTitle('Wrap text around image (square)');
+ await key('Escape','Escape',27);await pageClick(imagePoint.index,110,110);
+ await key('End','End',35,2);await key('Enter','Enter',13);await typeText('STRESS_END — final retained sentence.');
+ await key('Enter','Enter',13,8);await typeText('SOFT_BREAK_LINE — same paragraph.');
+ await clickTitle('Insert footnote');await typeText('FOOTNOTE_CONTENT — survives each export.');
+ await screenshot('editor-before.png');
+ await key('s','KeyS',83,2);await until(`document.querySelector('#toast').textContent==='Saved.'`,'save');
+ const imported=runImport(new Uint8Array(await readFile(path.join(output,'created.docx'))),undefined,{collectMediaBytes:true});
+ const tables=imported.doc.blocks.filter(b=>b.kind==='table');
+ assert.equal(tables.length,2);
+ assert.equal(tables[0].rows[0].cells[0].blocks[0].runs.map(r=>r.text).join(''),'TABLE_ONE_1 value');
+ assert.equal(tables[1].rows[1].cells[1].blocks[0].runs.map(r=>r.text).join(''),'TABLE_TWO_4');
+ assert.equal(Object.keys(imported.doc.footnotes||{}).length,1);
+ assert.equal(imported.doc.blocks.find(b=>b.kind==='image').wrap,'square','Real Square toolbar wrapping survives DOCX save');
+ assert.ok(imported.doc.blocks.some(b=>b.kind==='paragraph'&&b.runs.some(r=>r.text.includes('Mixed Arial blue')&&r.style.color==='#003388')),'Pasted CSS color becomes valid retained Word color');
+ assert.ok(imported.doc.blocks.some(b=>b.style?.list),'Real toolbar list survives save');
+ await writeFile(path.join(output,'created-model.json'),JSON.stringify(imported,null,2));
+ const dom=await evaluate(`({text:document.querySelector('#editor').textContent.slice(-800),canvases:[...document.querySelectorAll('#editor canvas')].map(n=>({width:n.width,height:n.height,parent:n.parentElement.className,html:n.parentElement.outerHTML.slice(0,250)}))})`);
+ await writeFile(path.join(output,'editor-dom.json'),JSON.stringify(dom,null,2));
+ for(const format of ['pdf','html','md','txt']){await evaluate(`document.querySelector('#toast').textContent='';document.querySelector('#export-as-button').click();document.querySelector('[data-export-format="${format}"]').click()`);await until(`document.querySelector('#toast').textContent.includes('exported')||document.querySelector('#toast').dataset.kind==='error'`,`export ${format}`,45000);console.log(format,await evaluate(`document.querySelector('#toast').textContent`));}
+ for(const format of ['html','md','txt']){const text=await readFile(path.join(output,'created.'+format),'utf8');for(const marker of ['FOOTNOTE_CONTENT','STRESS_END','TABLE_ONE_9','한국어'])assert.ok(text.replace(/\\/g,'').includes(marker),`${format} retains ${marker}`);if(format!=='txt')assert.ok(text.includes('data:image/png;base64,'),`${format} embeds image`);}
+ await copyFile(path.join(output,'created.pdf'),path.join(output,'before-reopen.pdf'));
+ await copyFile(path.join(output,'created.docx'),path.join(output,'before-reopen.docx'));
+ await writeFile(path.join(output,'open-target.txt'),path.join(output,'created.docx'));
+ await evaluate(`document.querySelector('#toast').textContent='';document.querySelector('#open-button').click()`);
+ let reopened;const reopenDeadline=Date.now()+45000;
+ while(!reopened&&Date.now()<reopenDeadline){reopened=(await(await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t=>t.type==='page'&&t.id!==target.id&&t.url===target.url);if(!reopened)await pause(100);}
+ assert.ok(reopened,'Open creates a fresh document window');await connect(reopened);
+ await until(`document.querySelector('#editor.is-active')&&document.querySelector('#loading-overlay').hidden&&document.querySelector('#document-title').textContent==='created'`,'reopen',60000);
+ assert.ok(await evaluate(`document.querySelector('#document-layout-bar').hidden`),'Supported square-wrap reopens in editor without Office conversion');
+ if(await evaluate(`!document.querySelector('#document-layout-bar').hidden`))await evaluate(`document.querySelector('#edit-layout-button').click()`);
+ await pause(600);await screenshot('editor-reopened.png');
+ await key('s','KeyS',83,2);await until(`document.querySelector('#toast').textContent==='Saved.'`,'reopened save');
+ assert.deepEqual(await readFile(path.join(output,'created.docx')),await readFile(path.join(output,'before-reopen.docx')),'Unedited reopen Save preserves original DOCX bytes');
+ await evaluate(`document.querySelector('#toast').textContent='';document.querySelector('#export-as-button').click();document.querySelector('[data-export-format="pdf"]').click()`);await until(`document.querySelector('#toast').textContent.includes('exported')`,'reopened PDF',45000);
+ await copyFile(path.join(output,'created.pdf'),path.join(output,'after-reopen.pdf'));
+ console.log(JSON.stringify({created:true,imageSelected,output,dom},null,2));
+} finally {
+ socket?.close();child.kill();
+ await pause(300);
+}

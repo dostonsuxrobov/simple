@@ -1,0 +1,349 @@
+.table-style-gallery {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.table-style-group h4 {
+  margin: 0 0 5px;
+  color: var(--muted, #6f746c);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.table-style-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(52px, 1fr));
+  gap: 5px;
+}
+
+.table-style-option {
+  aspect-ratio: 60 / 42;
+  padding: 3px;
+  border: 1px solid var(--line, #e2e4de);
+  border-radius: 5px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.table-style-option:hover {
+  border-color: var(--accent, #476b57);
+}
+
+.table-style-option.is-active {
+  border-color: var(--accent, #476b57);
+  box-shadow: 0 0 0 2px var(--accent-faint, rgba(71, 107, 87, 0.22));
+}
+
+.table-style-preview {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.create-table-dialog .dt-body {
+  gap: 12px;
+}
+
+.create-table-styles {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  padding-right: 4px;
+  overflow-y: auto;
+}
+
+.create-table-label {
+  color: #3b3e39;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.table-design-toggles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+}
+
+.table-design-totals {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.table-design-totals .chart-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table-design-panel .table-style-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+/* Row/column outline (grouping) bars beside the grid ------------------------------------------ */
+.sheet-outline-frame {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  background: #f6f7f4;
+}
+
+.sheet-outline-frame > .sheet-viewport {
+  grid-row: 2;
+  grid-column: 2;
+  min-width: 0;
+  min-height: 0;
+}
+
+.outline-corner {
+  grid-row: 1;
+  grid-column: 1;
+  border-right: 1px solid var(--line, #e2e4de);
+  border-bottom: 1px solid var(--line, #e2e4de);
+}
+
+.outline-strip {
+  position: relative;
+  overflow: hidden;
+  user-select: none;
+}
+
+.outline-strip.is-rows {
+  grid-row: 2;
+  grid-column: 1;
+  border-right: 1px solid var(--line, #e2e4de);
+}
+
+.outline-strip.is-columns {
+  grid-row: 1;
+  grid-column: 2;
+  border-bottom: 1px solid var(--line, #e2e4de);
+}
+
+.outline-layer {
+  position: absolute;
+  overflow: hidden;
+}
+
+.outline-content {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
+}
+
+.outline-line {
+  position: absolute;
+  background: #8b9087;
+  pointer-events: none;
+}
+
+.outline-toggle,
+.outline-level {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #8b9087;
+  border-radius: 2px;
+  color: #3f433d;
+  background: #fff;
+  font: 600 10px/1 "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+
+.outline-toggle {
+  width: 12px;
+  height: 12px;
+}
+
+.outline-level {
+  width: 13px;
+  height: 13px;
+  font-size: 9px;
+}
+
+.outline-toggle:hover,
+.outline-level:hover {
+  border-color: var(--accent, #476b57);
+  color: var(--accent, #476b57);
+  background: var(--accent-soft, #e9f0eb);
+}
+
+/* Pivot table editor ---------------------------------------------------------------------------- */
+.pivot-field-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 10px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.pivot-field-list .chart-toggle span,
+.pivot-card-head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pivot-area-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pivot-area-head h3 {
+  margin: 0;
+}
+
+.pivot-add,
+.pivot-move {
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--line-strong, #d3d6ce);
+  border-radius: 5px;
+  background: #fff;
+  font-size: 11px;
+}
+
+.pivot-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pivot-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 8px;
+  border: 1px solid var(--line, #e2e4de);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.pivot-card-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 2px;
+}
+
+.pivot-card-head .chart-icon-button {
+  width: 22px;
+  height: 22px;
+}
+
+.pivot-card-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.pivot-card-row .chart-field {
+  flex: 1;
+  min-width: 110px;
+}
+
+.pivot-spacer {
+  flex: 1;
+}
+
+.pivot-filter-status {
+  color: var(--muted, #6f746c);
+  font-size: 10.5px;
+}
+
+.pivot-link {
+  padding: 0;
+  border: 0;
+  color: var(--accent, #476b57);
+  background: none;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.pivot-filter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.pivot-filter-search {
+  height: 26px;
+  padding: 0 7px;
+  border: 1px solid var(--line-strong, #d3d6ce);
+  border-radius: 5px;
+  font-size: 11px;
+}
+
+.pivot-filter-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.pivot-filter-list ul {
+  max-height: 180px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.pivot-filter-list .chart-toggle small {
+  margin-left: auto;
+  color: var(--muted, #6f746c);
+}
+
+.workspace-body > .pivot-editor {
+  flex: none;
+  height: auto;
+}
+
+/* SPARKLINE() in-cell charts */
+.cell-sparkline {
+  display: block;
+  flex: 1;
+  align-self: stretch;
+  min-width: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.cell-sparkline > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.protect-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+}
+
+.protect-options legend {
+  grid-column: 1 / -1;
+}
+
+.sheet-tab-lock {
+  margin-right: 4px;
+  color: #8a8e86;
+  vertical-align: -1px;
+}
+
+/* Excel sparklines draw behind the cell's own content */
+.cell-sparkline.is-background {
+  position: absolute;
+  inset: 2px 3px;
+}

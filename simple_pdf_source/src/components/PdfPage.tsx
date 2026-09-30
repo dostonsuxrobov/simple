@@ -11,9 +11,14 @@ import type {
   PdfOverlay,
   PdfRect,
   ToolMode,
+  TextOverlay,
 } from '../types'
+import { layoutText, resolveTextFit } from '../../electron/text-layout.mjs'
+import { textColorResolver } from '../../electron/text-appearance.mjs'
+import { boundedCanvasSize } from '../../electron/canvas-size.mjs'
 import { getPageTextContent, pdfjs, pdfRectToViewport, viewportRectToPdf } from '../lib/pdf'
 import { detectPageObjects } from '../lib/pageObjects'
+import { textBackground } from '../lib/textBackground'
 import { findTextLayerSearchRects } from '../lib/search'
 import {
   caretOffsetAtPoint,
@@ -112,6 +117,26 @@ interface PdfPageProps {
 
 const RESIZE_HANDLES: ResizeHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
 
+let textMeasurementCanvas: HTMLCanvasElement | null = null
+
+function previewTextLayout(edit: PageTextEdit | TextOverlay, width: number, sourceScale?: number) {
+  textMeasurementCanvas ||= document.createElement('canvas')
+  const context = textMeasurementCanvas.getContext('2d')
+  const size = edit.fontSize
+  const spacing = edit.letterSpacing || 0
+  if (context) context.font = `${edit.fontStyle || 'normal'} ${edit.fontWeight || 400} ${size}px ${edit.fontFamily}`
+  const measure = (text: string) => (context?.measureText(text).width ?? Array.from(text).length * size * 0.5)
+    + Math.max(0, Array.from(text).length - 1) * spacing
+  let scaleX = sourceScale || edit.scaleX || 1
+  if (edit.preserveSourceMetrics !== false && edit.originalText && edit.originalRect && Math.abs(edit.angle || 0) < 0.01) {
+    const measured = measure(edit.originalText) * scaleX
+    const correction = measured > 0 ? edit.originalRect.width / measured : 1
+    if (correction >= 0.5 && correction <= 2) scaleX *= correction
+  }
+  const layout = layoutText(edit.text, width, (text: string) => measure(text) * scaleX, resolveTextFit(edit))
+  return { ...layout, scaleX: scaleX * layout.fitScale, lineHeight: Math.max(size * 0.8, edit.lineHeight || size * 1.18) }
+}
+
 function colorCss(color: [number, number, number]) {
   return `rgb(${color.map((channel) => Math.round(clamp(channel, 0, 1) * 255)).join(', ')})`
 }
@@ -128,6 +153,13 @@ function sameRect(a?: PdfRect, b?: PdfRect) {
     && Math.abs(a.y - b.y) < 0.01
     && Math.abs(a.width - b.width) < 0.01
     && Math.abs(a.height - b.height) < 0.01
+}
+
+function checkboxValueIsChecked(value: unknown) {
+  if (typeof value === 'boolean') return value
+  if (value === null || value === undefined) return false
+  const normalized = String(value).trim().toLocaleLowerCase()
+  return Boolean(normalized) && !['off', 'false', '0', 'no'].includes(normalized)
 }
 
 function textViewportSignature(viewport: { width: number; height: number; rotation: number; scale: number }) {
@@ -262,7 +294,8 @@ export const PdfPage = memo(function PdfPage({
   const transformRef = useRef<TransformGesture | null>(null)
   const textVisualStyleRef = useRef<InlineTextVisualStyle | null>(null)
   const fontDataRef = useRef(new Map<string, Uint8Array>())
-  const [page, setPage] = useState<PDFPageProxy | null>(null)
+  const [pageState, setPageState] = useState<{ page: PDFPageProxy; owner: PDFDocumentProxy } | null>(null)
+  const page = pageState?.page || null
   const [loading, setLoading] = useState(true)
   const [renderViewport, setRenderViewport] = useState<ReturnType<PDFPageProxy['getViewport']> | null>(null)
   const [canvasReadyViewport, setCanvasReadyViewport] = useState<ReturnType<PDFPageProxy['getViewport']> | null>(null)
@@ -287,14 +320,9 @@ export const PdfPage = memo(function PdfPage({
 
   useEffect(() => {
     let active = true
-    setPage(null)
-    setLoading(true)
     setRenderError('')
-    setCanvasReadyViewport(null)
-    setAnnotations([])
-    setImageCandidates([])
     pdf.getPage(pageIndex + 1).then((nextPage) => {
-      if (active) setPage(nextPage)
+      if (active) setPageState({ page: nextPage, owner: pdf })
     }).catch((error) => {
       if (active) setRenderError(error instanceof Error ? error.message : 'Page could not be opened.')
     })
@@ -303,10 +331,46 @@ export const PdfPage = memo(function PdfPage({
 
   const viewport = useMemo(() => {
     if (!page) return null
+    if (pageState?.owner !== pdf && canvasReadyViewportRef.current) return canvasReadyViewportRef.current
     const angle = (((page.rotate || 0) + rotation) % 360 + 360) % 360
     return page.getViewport({ scale: zoom, rotation: angle })
-  }, [page, zoom, rotation])
+  }, [page, pageState?.owner, pdf, zoom, rotation])
+  const pageVisualReady = Boolean(viewport && pageState?.owner === pdf && canvasReadyViewport === viewport)
+  const displayedViewport = canvasReadyViewport && !pageVisualReady ? canvasReadyViewport : viewport
   const displayRotation = ((((viewport?.rotation || 0) % 360) + 360) % 360) as DisplayRotation
+  // Only the source selection matters. Typing, dragging, and resizing the new
+  // text must not repeatedly parse a book or remove a different source region.
+  const removedTextKey = JSON.stringify([
+    ...overlays.filter((edit): edit is TextOverlay => edit.type === 'text' && edit.pageIndex === pageIndex),
+    ...(textEdit?.pageIndex === pageIndex ? [textEdit] : []),
+  ].filter(edit => edit.cover && edit.originalRect).map(edit => ({
+    type: 'text', cover: true, originalRect: edit.originalRect, originalText: edit.originalText,
+  })))
+  const [backgroundPage, setBackgroundPage] = useState<{ owner: PDFDocumentProxy; key: string; page: PDFPageProxy; disposed: boolean } | null>(null)
+  const paintingPage = backgroundPage?.owner === pdf && backgroundPage.key === removedTextKey && !backgroundPage.disposed ? backgroundPage.page : page
+
+  useEffect(() => {
+    if (removedTextKey === '[]') { setBackgroundPage(null); return }
+    let cancelled = false
+    let document: PDFDocumentProxy | null = null
+    let entry: NonNullable<typeof backgroundPage> | null = null
+    textBackground(pdf, pageIndex, JSON.parse(removedTextKey)).then(async result => {
+      document = result
+      if (cancelled) { await result.destroy(); return }
+      const nextPage = await result.getPage(1)
+      if (!cancelled) {
+        entry = { owner: pdf, key: removedTextKey, page: nextPage, disposed: false }
+        setBackgroundPage(entry)
+      }
+    }).catch(error => {
+      if (!cancelled) setRenderError(error instanceof Error ? error.message : 'The text preview could not be prepared.')
+    })
+    return () => {
+      cancelled = true
+      if (entry) entry.disposed = true
+      if (document) void document.destroy().catch(() => {})
+    }
+  }, [pdf, pageIndex, removedTextKey])
 
   useEffect(() => {
     if (!viewport) return
@@ -317,9 +381,9 @@ export const PdfPage = memo(function PdfPage({
   }, [viewport])
 
   useEffect(() => {
-    if (!viewport) return
-    onPageReady?.({ width: viewport.width, height: viewport.height })
-  }, [viewport, onPageReady])
+    if (!displayedViewport || !pageVisualReady) return
+    onPageReady?.({ width: displayedViewport.width, height: displayedViewport.height })
+  }, [displayedViewport, pageVisualReady, onPageReady])
 
   // Ctrl+wheel zoom arrives in bursts. While a canvas rendered at the same
   // rotation already exists, the layout effect below CSS-scales it for instant
@@ -341,6 +405,7 @@ export const PdfPage = memo(function PdfPage({
   useLayoutEffect(() => {
     const canvas = canvasRef.current
     if (!viewport || !canvas) return
+    if (canvasReadyViewport && canvasReadyViewport !== viewport) return
     canvas.style.width = `${viewport.width}px`
     canvas.style.height = `${viewport.height}px`
     // Spans built for another viewport must never stay visible floating over
@@ -349,40 +414,46 @@ export const PdfPage = memo(function PdfPage({
     if (layer?.dataset.viewportSignature && layer.dataset.viewportSignature !== textViewportSignature(viewport)) {
       layer.style.visibility = 'hidden'
     }
-  }, [viewport])
+  }, [viewport, canvasReadyViewport])
 
   useEffect(() => {
     if (!page || !renderViewport || !canvasRef.current) return
+    if (removedTextKey !== '[]' && paintingPage === page) return
     let cancelled = false
     const canvas = canvasRef.current
+    const stagingCanvas = document.createElement('canvas')
     // Chromium's grayscale canvas text is visibly softer than native PDF
     // viewers when it is rendered at exactly one backing pixel per CSS pixel.
     // A modest supersampling floor restores fine serifs on common 100%-scaled
     // Windows displays, while the area cap keeps oversized architectural pages
     // bounded. ContinuousPdfViewer still mounts only nearby canvases.
     const desiredDpr = Math.min(Math.max(window.devicePixelRatio || 1, 1.5), 2.5)
-    const maxCanvasPixels = 24_000_000
-    const pixelArea = renderViewport.width * renderViewport.height * desiredDpr * desiredDpr
-    const dpr = pixelArea > maxCanvasPixels
-      ? Math.max(1, desiredDpr * Math.sqrt(maxCanvasPixels / pixelArea))
-      : desiredDpr
-    canvas.width = Math.max(1, Math.ceil(renderViewport.width * dpr))
-    canvas.height = Math.max(1, Math.ceil(renderViewport.height * dpr))
-    const context = canvas.getContext('2d', { alpha: false })
+    const backing = boundedCanvasSize(renderViewport.width, renderViewport.height, desiredDpr)
+    stagingCanvas.width = backing.width
+    stagingCanvas.height = backing.height
+    const context = stagingCanvas.getContext('2d', { alpha: false })
     if (!context) return
-    // Resizing an opaque canvas clears it to black. Paint the page background
-    // right away so rotate/zoom/mount never flash before pdf.js renders.
+    // Render offscreen and copy only when complete. The visible canvas keeps
+    // the previous page pixels throughout a document-proxy swap, so a page
+    // operation never flashes white or falls back to a loading placeholder.
     context.fillStyle = '#fff'
-    context.fillRect(0, 0, canvas.width, canvas.height)
+    context.fillRect(0, 0, stagingCanvas.width, stagingCanvas.height)
     setLoading(true)
     setRenderError('')
-    const renderTask = page.render({
+    const renderTask = (paintingPage || page).render({
       canvasContext: context,
       viewport: renderViewport,
-      transform: dpr === 1 ? undefined : [canvas.width / renderViewport.width, 0, 0, canvas.height / renderViewport.height, 0, 0],
+      transform: [stagingCanvas.width / renderViewport.width, 0, 0, stagingCanvas.height / renderViewport.height, 0, 0],
     })
     renderTask.promise.then(() => {
       if (!cancelled) {
+        canvas.width = stagingCanvas.width
+        canvas.height = stagingCanvas.height
+        canvas.style.width = `${renderViewport.width}px`
+        canvas.style.height = `${renderViewport.height}px`
+        const visibleContext = canvas.getContext('2d', { alpha: false })
+        visibleContext?.drawImage(stagingCanvas, 0, 0)
+        canvas.dataset.textRemovals = removedTextKey
         setLoading(false)
         setCanvasReadyViewport(renderViewport)
       }
@@ -391,12 +462,16 @@ export const PdfPage = memo(function PdfPage({
         setRenderError(error instanceof Error ? error.message : 'This page could not be rendered.')
         setLoading(false)
       }
+    }).finally(() => {
+      // Release the staging bitmap after the renderer has finished or canceled.
+      // The visible canvas owns the completed copy and stays crisp while zooming.
+      stagingCanvas.width = stagingCanvas.height = 1
     })
     return () => {
       cancelled = true
       renderTask.cancel()
     }
-  }, [page, renderViewport])
+  }, [page, paintingPage, renderViewport, removedTextKey])
 
   useEffect(() => {
     if (!page || tool !== 'edit') {
@@ -453,6 +528,12 @@ export const PdfPage = memo(function PdfPage({
 
     async function renderText() {
       const content = await getPageTextContent(currentPage)
+      let originalTextColor: (font: string, text: string) => number[] | undefined = () => undefined
+      try {
+        originalTextColor = textColorResolver(await currentPage.getOperatorList(), pdfjs.OPS)
+      } catch {
+        // A damaged/unsupported operator stream can still use canvas sampling.
+      }
       if (cancelled) return
       try {
         await document.fonts.ready
@@ -512,6 +593,8 @@ export const PdfPage = memo(function PdfPage({
         span.dataset.fontStyle = fontTraits.style
         span.dataset.pdfFontName = item.fontName
         span.dataset.pdfFontSourceName = sourceFontName
+        const paintColor = originalTextColor(item.fontName, item.str)
+        if (paintColor) span.dataset.pdfTextColor = JSON.stringify(paintColor)
         span.dataset.pdfTextScaleX = String(pdfScaleX)
         span.dataset.pdfTextAngle = String(pdfAngle)
         span.dataset.pdfBaselineY = String(item.transform[5])
@@ -706,6 +789,40 @@ export const PdfPage = memo(function PdfPage({
 
   const activeText = textEdit?.pageIndex === pageIndex ? textEdit : null
   const activeObject = objectEdit?.pageIndex === pageIndex ? objectEdit : null
+  const activeTextBox = activeText && viewport ? pdfRectToViewport(viewport, activeText.rect) : null
+  const activeObjectBox = activeObject && viewport ? pdfRectToViewport(viewport, activeObject.rect) : null
+  const activeTextDisplayDelta = activeText
+    ? (((displayRotation - (activeText.displayRotation ?? 0)) % 360) + 360) % 360
+    : 0
+  const activeTextSideways = activeTextDisplayDelta === 90 || activeTextDisplayDelta === 270
+  const activeTextScreenAngle = activeTextDisplayDelta * Math.PI / 180 - (activeText?.angle || 0)
+  const activeTextLayout = useMemo(() => activeText && activeTextBox
+    ? previewTextLayout(activeText, (activeTextSideways ? activeTextBox.height : activeTextBox.width) / zoom)
+    : null, [activeText, activeTextBox?.width, activeTextBox?.height, activeTextSideways, zoom, textLayerVersion])
+  const activeTextRequiredHeight = activeTextLayout && activeText
+    ? Math.max(activeText.fontSize, activeTextLayout.lines.length * activeTextLayout.lineHeight)
+    : 0
+  const activeTextOverflow = Boolean(activeTextLayout && activeTextBox
+    && activeTextRequiredHeight > (activeTextSideways ? activeTextBox.width : activeTextBox.height) / zoom + 1)
+
+  useLayoutEffect(() => {
+    if (!activeText || !activeTextBox || !viewport || !activeText.modified || !activeTextOverflow
+      || Math.abs(activeTextScreenAngle) > 0.01) return
+    if (resolveTextFit(activeText) === 'fit' && !activeText.text.includes('\n') && activeText.preserveSourceMetrics !== false) return
+    const height = Math.min(activeTextRequiredHeight * zoom, viewport.height - activeTextBox.top)
+    if (height <= activeTextBox.height + 1) return
+    const rect = viewportRectToPdf(viewport, {
+      left: activeTextBox.left, top: activeTextBox.top,
+      right: activeTextBox.left + activeTextBox.width, bottom: activeTextBox.top + height,
+    })
+    onTextEditChange({
+      ...activeText, rect,
+      baselineOffset: Number.isFinite(activeText.baselineOffset)
+        ? Number(activeText.baselineOffset) + activeText.rect.y - rect.y
+        : undefined,
+    })
+  }, [activeText, activeTextBox?.width, activeTextBox?.height, activeTextOverflow, activeTextRequiredHeight,
+    activeTextScreenAngle, viewport, zoom, onTextEditChange])
   const activeTextKey = activeText
     ? `${activeText.overlayId || 'native'}:${activeText.originalText}:${activeText.originalRect?.x ?? activeText.rect.x}:${activeText.originalRect?.y ?? activeText.rect.y}`
     : ''
@@ -924,9 +1041,32 @@ export const PdfPage = memo(function PdfPage({
     const fontHeight = Number.parseFloat(computed.fontSize)
     const letterSpacing = Number.parseFloat(computed.letterSpacing)
     const colors = sampleCanvasColors(bounds)
+    if (span.dataset.pdfTextColor) {
+      try {
+        const color = JSON.parse(span.dataset.pdfTextColor)
+        if (Array.isArray(color) && color.length === 3 && color.every(n => Number.isFinite(n) && n >= 0 && n <= 1)) colors.text = color as [number, number, number]
+      } catch { /* Keep the sampled fallback for malformed metadata. */ }
+    }
     const caret = caretOffsetAtPoint(span, clientX, clientY)
     const pdfBaselineY = Number(span.dataset.pdfBaselineY)
     const pdfTextAngle = Number(span.dataset.pdfTextAngle) || 0
+    let inkRect: PdfRect | undefined
+    if (Number.isFinite(pdfBaselineY) && Math.abs(pdfTextAngle) < 0.01) {
+      const measureCanvas = document.createElement('canvas')
+      const context = measureCanvas.getContext('2d')
+      if (context) {
+        context.font = `${computed.fontStyle} ${computed.fontWeight} ${computed.fontSize} ${computed.fontFamily}`
+        const metrics = context.measureText(sourceItemText)
+        const ascent = metrics.actualBoundingBoxAscent / zoom
+        const descent = metrics.actualBoundingBoxDescent / zoom
+        if (Number.isFinite(ascent) && Number.isFinite(descent) && ascent >= 0 && descent >= 0) {
+          const y = Math.min(rect.y, pdfBaselineY - descent)
+          const top = Math.max(rect.y + rect.height, pdfBaselineY + ascent)
+          inkRect = { ...rect, y, height: top - y }
+        }
+      }
+      measureCanvas.width = measureCanvas.height = 1
+    }
     const baselineOffset = Number.isFinite(pdfBaselineY) && Math.abs(pdfTextAngle) < 0.01
       ? pdfBaselineY - rect.y
       : undefined
@@ -949,11 +1089,14 @@ export const PdfPage = memo(function PdfPage({
       rect,
       originalRect: rect,
       originalText: text,
+      inkRect,
       text,
       fontSize: Number(span.dataset.fontSize) || 11,
       fontFamily: family,
       fontWeight: Number.parseInt(span.dataset.fontWeight || computed.fontWeight, 10) || 400,
       fontStyle: (span.dataset.fontStyle || computed.fontStyle) === 'italic' ? 'italic' : 'normal',
+      textFit: 'fit',
+      preserveSourceMetrics: true,
       lineHeight: (Number.isFinite(lineHeight) ? lineHeight : fontHeight) / zoom,
       letterSpacing: (Number.isFinite(letterSpacing) ? letterSpacing : 0) / zoom,
       scaleX: clamp(Number(span.dataset.pdfTextScaleX) || 1, 0.25, 4),
@@ -965,13 +1108,16 @@ export const PdfPage = memo(function PdfPage({
       sourceSpaceWidth: Number.isFinite(Number(span.dataset.pdfSourceSpaceWidth))
         ? Number(span.dataset.pdfSourceSpaceWidth)
         : undefined,
+      // Native text is authored in the PDF's own axes. Page viewing rotation
+      // belongs to the viewport, and must not be baked into it a second time.
+      displayRotation: 0,
       sourceItemText,
       sourceItemRect,
       sourceSelectionStart: 0,
       sourceSelectionEnd: sourceItemText.length,
       align: computed.direction === 'rtl' ? 'right' : 'left',
       color: colors.text,
-      backgroundColor: cssColorToPdf(colors.background),
+      backgroundColor: undefined,
       cover: true,
       modified: false,
       caretOffset: caret,
@@ -1301,8 +1447,6 @@ export const PdfPage = memo(function PdfPage({
     return <div className="page-loading"><LoaderCircle className="spin" size={20} /><span>Preparing page {pageIndex + 1}…</span></div>
   }
 
-  const activeTextBox = activeText ? pdfRectToViewport(viewport, activeText.rect) : null
-  const activeObjectBox = activeObject ? pdfRectToViewport(viewport, activeObject.rect) : null
   // Object pixels are stored in unrotated PDF orientation (captureRect and the
   // signature/image placement normalize them), so on a rotated page the raw
   // <img> must be turned by the current display rotation to match the canvas
@@ -1326,16 +1470,15 @@ export const PdfPage = memo(function PdfPage({
     && sameRect(rememberedTextVisual.sourceRect, activeText.originalRect || activeText.rect)
     ? rememberedTextVisual
     : null
-  const editorScaleX = activeTextVisual && Math.abs(activeTextVisual.angle) < 0.01
-    ? activeTextVisual.scaleX
-    : activeText?.scaleX || 1
+  const editorScaleX = activeTextLayout?.scaleX || 1
 
   return (
     <div className="page-stage" style={{ minHeight: 'auto' }}>
       <div
         ref={surfaceRef}
-        className={cx('page-surface', `tool-${tool}`, selectingObjectRegion && 'is-selecting-object')}
-        style={{ width: viewport.width, height: viewport.height }}
+        className={cx('page-surface', `tool-${tool}`, selectingObjectRegion && 'is-selecting-object', !pageVisualReady && 'is-page-transitioning')}
+        style={{ width: displayedViewport?.width || viewport.width, height: displayedViewport?.height || viewport.height }}
+        aria-busy={!pageVisualReady}
         onClick={handleClick}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -1402,7 +1545,7 @@ export const PdfPage = memo(function PdfPage({
                   type="checkbox"
                   className="pdf-form-checkbox"
                   style={box}
-                  checked={Boolean(formValues[annotation.fieldName] ?? annotation.fieldValue)}
+                  checked={checkboxValueIsChecked(formValues[annotation.fieldName] ?? annotation.fieldValue)}
                   onChange={(event) => onFormChange(annotation.fieldName, event.target.checked)}
                 />
               )
@@ -1491,28 +1634,37 @@ export const PdfPage = memo(function PdfPage({
               )
             }
             if (activeText?.overlayId === overlay.id) return null
-            const originalBox = overlay.cover && overlay.originalRect ? pdfRectToViewport(viewport, overlay.originalRect) : null
+            const originalBox = overlay.cover && overlay.originalRect ? pdfRectToViewport(viewport, overlay.inkRect || overlay.originalRect) : null
+            const sourceDisplayRotation = overlay.displayRotation ?? 0
+            const displayDelta = (((displayRotation - sourceDisplayRotation) % 360) + 360) % 360
+            const sidewaysText = displayDelta === 90 || displayDelta === 270
+            const screenAngle = displayDelta * Math.PI / 180 - (overlay.angle || 0)
+            const preview = previewTextLayout(overlay, (sidewaysText ? box.height : box.width) / zoom)
+            const textScaleX = preview.scaleX
             return (
               <div key={overlay.id} className="committed-text-group">
-                {originalBox && <span className="text-original-cover" style={{ ...originalBox, backgroundColor: overlay.backgroundColor ? colorCss(overlay.backgroundColor) : undefined }} />}
                 <button
                   type="button"
                   data-edit-ui="true"
                   className={cx('text-overlay', overlay.cover && 'is-replacement', tool === 'edit' && 'is-editable')}
                   style={{
-                    ...box,
+                    left: box.left + box.width / 2,
+                    top: box.top + box.height / 2,
+                    width: (sidewaysText ? box.height : box.width) / textScaleX,
+                    height: sidewaysText ? box.width : box.height,
                     fontSize: overlay.fontSize * zoom,
                     fontFamily: overlay.fontFamily,
                     fontWeight: overlay.fontWeight,
                     fontStyle: overlay.fontStyle,
-                    lineHeight: overlay.lineHeight ? `${overlay.lineHeight * zoom}px` : undefined,
+                    lineHeight: `${preview.lineHeight * zoom}px`,
                     letterSpacing: overlay.letterSpacing ? `${overlay.letterSpacing * zoom}px` : undefined,
                     direction: overlay.direction,
                     textAlign: overlay.align || 'left',
                     color: colorCss(overlay.color),
-                    backgroundColor: overlay.backgroundColor ? colorCss(overlay.backgroundColor) : undefined,
-                    transform: overlay.scaleX && Math.abs(overlay.scaleX - 1) > 0.01 ? `scaleX(${overlay.scaleX})` : undefined,
-                    transformOrigin: '0 0',
+                    backgroundColor: originalBox ? 'transparent' : overlay.backgroundColor ? colorCss(overlay.backgroundColor) : undefined,
+                    transform: `translate(-50%, -50%) rotate(${screenAngle}rad) scaleX(${textScaleX})`,
+                    transformOrigin: 'center',
+                    whiteSpace: 'pre',
                   }}
                   onClick={(event) => {
                     event.stopPropagation()
@@ -1524,11 +1676,14 @@ export const PdfPage = memo(function PdfPage({
                       rect: overlay.rect,
                       originalRect: overlay.originalRect,
                       originalText: overlay.originalText ?? overlay.text,
+                      inkRect: overlay.inkRect,
                       text: overlay.text,
                       fontSize: overlay.fontSize,
                       fontFamily: overlay.fontFamily,
                       fontWeight: overlay.fontWeight,
                       fontStyle: overlay.fontStyle,
+                      textFit: overlay.textFit,
+                      preserveSourceMetrics: overlay.preserveSourceMetrics,
                       lineHeight: overlay.lineHeight,
                       letterSpacing: overlay.letterSpacing,
                       scaleX: overlay.scaleX,
@@ -1549,7 +1704,7 @@ export const PdfPage = memo(function PdfPage({
                       selectionEnd: overlay.text.length,
                     })
                   }}
-                >{overlay.text}</button>
+                >{preview.lines.join('\n')}</button>
               </div>
             )
           })}
@@ -1587,12 +1742,6 @@ export const PdfPage = memo(function PdfPage({
           )
         })}
 
-        {activeText?.cover && activeText.originalRect && !sameRect(activeText.rect, activeText.originalRect) && (
-          <span className="text-original-cover active-original-cover" style={{
-            ...pdfRectToViewport(viewport, activeText.originalRect),
-            backgroundColor: activeText.backgroundColor ? colorCss(activeText.backgroundColor) : undefined,
-          }} />
-        )}
         {activeText && activeTextBox && (
           <div
             className="inline-text-frame"
@@ -1600,14 +1749,16 @@ export const PdfPage = memo(function PdfPage({
             style={{
               ...activeTextBox,
               borderWidth: 0,
-              backgroundColor: activeTextVisual?.backgroundColor || (activeText.backgroundColor ? colorCss(activeText.backgroundColor) : undefined),
+              backgroundColor: activeText.cover && activeText.originalRect
+                ? 'transparent'
+                : activeTextVisual?.backgroundColor || (activeText.backgroundColor ? colorCss(activeText.backgroundColor) : undefined),
             }}
           >
             <textarea
               ref={textEditorRef}
               className="inline-pdf-text-editor"
               value={activeText.text}
-              wrap={activeText.originalText && !activeText.originalText.includes('\n') ? 'off' : 'soft'}
+              wrap={resolveTextFit(activeText) === 'fit' ? 'off' : 'soft'}
               spellCheck
               aria-label="Edit text directly on the PDF"
               style={{
@@ -1615,17 +1766,21 @@ export const PdfPage = memo(function PdfPage({
                 fontFamily: activeText.fontFamily,
                 color: colorCss(activeText.color),
                 textAlign: activeText.align,
-                fontWeight: activeTextVisual?.fontWeight || activeText.fontWeight,
-                fontStyle: activeTextVisual?.fontStyle || activeText.fontStyle,
+                fontWeight: activeText.fontWeight,
+                fontStyle: activeText.fontStyle,
                 fontStretch: activeTextVisual?.fontStretch,
-                lineHeight: `${(activeTextVisual?.lineHeight || activeText.lineHeight || activeText.fontSize * 1.18) * zoom}px`,
-                letterSpacing: `${(activeTextVisual?.letterSpacing ?? activeText.letterSpacing ?? 0) * zoom}px`,
-                direction: activeTextVisual?.direction || activeText.direction,
-                width: editorScaleX === 1 ? '100%' : `${100 / editorScaleX}%`,
-                transform: editorScaleX === 1 ? undefined : `scaleX(${editorScaleX})`,
-                transformOrigin: '0 0',
-                backgroundColor: activeTextVisual || activeText.backgroundColor ? 'transparent' : undefined,
-                whiteSpace: activeText.originalText && !activeText.originalText.includes('\n') ? 'pre' : 'pre-wrap',
+                lineHeight: `${(activeTextLayout?.lineHeight || activeText.fontSize * 1.18) * zoom}px`,
+                letterSpacing: `${(activeText.letterSpacing ?? 0) * zoom}px`,
+                direction: activeText.direction,
+                position: 'absolute',
+                left: '50%',
+                top: '50%',
+                width: `${(activeTextSideways ? activeTextBox.height : activeTextBox.width) / editorScaleX}px`,
+                height: `${activeTextSideways ? activeTextBox.width : activeTextBox.height}px`,
+                transform: `translate(-50%, -50%) rotate(${activeTextScreenAngle}rad) scaleX(${editorScaleX})`,
+                transformOrigin: 'center',
+                backgroundColor: activeText.cover && activeText.originalRect || activeTextVisual || activeText.backgroundColor ? 'transparent' : undefined,
+                whiteSpace: resolveTextFit(activeText) === 'fit' ? 'pre' : 'pre-wrap',
               }}
               onChange={(event) => {
                 const target = event.currentTarget
@@ -1634,10 +1789,9 @@ export const PdfPage = memo(function PdfPage({
                 // wrapping must not turn a slightly longer replacement into a
                 // taller box: growing downward in viewport coordinates moves
                 // rect.y (and therefore the saved PDF baseline) down a line.
-                const staysSingleLine = Boolean(activeText.originalText)
-                  && !activeText.originalText.includes('\n')
+                const staysSingleLine = resolveTextFit(activeText) === 'fit'
                   && !target.value.includes('\n')
-                if (!staysSingleLine && target.scrollHeight > target.clientHeight + 1) {
+                if (!staysSingleLine && Math.abs(activeTextScreenAngle) < 0.01 && target.scrollHeight > target.clientHeight + 1) {
                   const box = pdfRectToViewport(viewport, activeText.rect)
                   const desiredHeight = clamp(target.scrollHeight + 3, box.height, viewport.height - box.top)
                   rect = viewportRectToPdf(viewport, {
@@ -1650,6 +1804,9 @@ export const PdfPage = memo(function PdfPage({
                 onTextEditChange({
                   ...activeText,
                   rect,
+                  baselineOffset: Number.isFinite(activeText.baselineOffset)
+                    ? Number(activeText.baselineOffset) + activeText.rect.y - rect.y
+                    : undefined,
                   text: target.value,
                   modified: true,
                   caretOffset: target.selectionStart,
@@ -1673,6 +1830,13 @@ export const PdfPage = memo(function PdfPage({
                 if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); onCommitTextEdit() }
               }}
             />
+            {(activeTextOverflow || (activeTextLayout?.fitScale ?? 1) < 0.995) && (
+              <span className={cx('text-fit-feedback', activeTextOverflow && 'has-overflow')} role="status">
+                {activeTextOverflow
+                  ? 'Text exceeds the box — enlarge or move it'
+                  : `Fitted to ${Math.round((activeTextLayout?.fitScale || 1) * 100)}% width`}
+              </span>
+            )}
             <span
               role="presentation"
               className="selection-move-handle"
@@ -1734,7 +1898,7 @@ export const PdfPage = memo(function PdfPage({
           </div>
         )}
 
-        {loading && <div className="page-rendering"><LoaderCircle className="spin" size={18} /></div>}
+        {loading && !canvasReadyViewport && <div className="page-rendering"><LoaderCircle className="spin" size={18} /></div>}
         {renderError && <div className="page-error"><Crop size={18} /><strong>Page unavailable</strong><span>{renderError}</span></div>}
       </div>
     </div>

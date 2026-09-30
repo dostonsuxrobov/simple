@@ -1,0 +1,208 @@
+.command-bar {
+  flex-wrap: nowrap;
+  overflow: hidden;
+  gap: 4px;
+}
+
+.command-bar .command-group {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.command-bar .tool-button {
+  width: 30px;
+  height: 30px;
+}
+
+.command-bar .font-select {
+  width: 118px;
+  font-size: 11.5px;
+}
+
+.command-bar .toolbar-zoom-select {
+  width: 70px;
+  font-size: 11.5px;
+}
+
+.size-input {
+  width: 40px;
+  height: 30px;
+  padding: 0 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  outline: 0;
+  background: #fff;
+  font-size: 11.5px;
+  text-align: center;
+  user-select: text;
+}
+
+.size-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-faint);
+}
+
+.size-input::-webkit-calendar-picker-indicator {
+  display: none !important;
+}
+
+.number-format-tool {
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.command-trailing {
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+
+.toolbar-menu-button {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  height: 30px;
+  border-radius: 6px;
+}
+
+.toolbar-menu-button:hover,
+.toolbar-menu-button.is-active {
+  background: var(--accent-soft);
+}
+
+.toolbar-menu-main,
+.toolbar-menu-chevron-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  height: 30px;
+  padding: 0 5px;
+  border-radius: 6px;
+  color: #5d6159;
+  background: transparent;
+  cursor: pointer;
+}
+
+.toolbar-menu-button.is-split .toolbar-menu-main {
+  padding-right: 3px;
+  border-radius: 6px 0 0 6px;
+}
+
+.toolbar-menu-chevron-button {
+  padding: 0 2px;
+  border-radius: 0 6px 6px 0;
+}
+
+.toolbar-menu-button.is-split:hover .toolbar-menu-chevron-button {
+  box-shadow: inset 1px 0 0 rgba(71, 107, 87, 0.18);
+}
+
+.toolbar-menu-main:disabled,
+.toolbar-menu-chevron-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.toolbar-menu-chevron {
+  color: #8a8e86;
+}
+
+.toolbar-menu-text {
+  font-size: 11.5px;
+}
+
+.toolbar-menu-list {
+  min-width: 200px;
+  max-height: min(70vh, 520px);
+  overflow-y: auto;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+
+.toolbar-menu-item {
+  display: grid;
+  grid-template-columns: 20px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 29px;
+  padding: 0 10px 0 8px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  text-align: left;
+  white-space: pre;
+  cursor: pointer;
+}
+
+.toolbar-menu-item:hover,
+.toolbar-menu-item:focus-visible {
+  background: var(--accent-soft);
+  outline: 0;
+}
+
+.toolbar-menu-item.is-checked {
+  font-weight: 650;
+}
+
+.toolbar-menu-item.is-checked .toolbar-menu-item-icon.is-empty::after {
+  content: "✓";
+  color: var(--accent);
+}
+
+.toolbar-menu-item.has-separator {
+  margin-top: 5px;
+  position: relative;
+}
+
+.toolbar-menu-item.has-separator::before {
+  content: "";
+  position: absolute;
+  top: -3px;
+  left: 6px;
+  right: 6px;
+  height: 1px;
+  background: var(--line);
+}
+
+.toolbar-menu-item-icon {
+  display: inline-flex;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.toolbar-menu-item-shortcut {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.command-more-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  max-width: min(560px, 90vw);
+  padding: 8px;
+}
+
+.command-more-panel .command-group {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding-right: 10px;
+  border-right: 1px solid var(--line);
+}
+
+.command-more-panel .command-group:last-child {
+  border-right: 0;
+}
+
+.sheet-viewport.is-format-painting,
+.sheet-viewport.is-format-painting .grid-cell {
+  cursor: copy;
+}

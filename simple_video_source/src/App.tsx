@@ -2,18 +2,23 @@ import {
   Check,
   CircleAlert,
   ChevronDown,
+  Copy,
+  Download,
   Expand,
   FileVideo2,
   FolderOpen,
   Gauge,
   Info,
+  Image as ImageIcon,
   Keyboard,
+  LoaderCircle,
   Maximize2,
   Minimize2,
   MoreHorizontal,
   Pause,
   Play,
   Plus,
+  Printer,
   Square,
   Volume1,
   Volume2,
@@ -21,10 +26,15 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type DragEvent } from 'react'
+import { PrintDialog } from './PrintDialog'
+import { waitForPresentedFrame } from './frameCapture'
 
 const SUPPORTED_EXTENSIONS = ['mp4', 'm4v', 'webm', 'ogv', 'mov', 'mkv']
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
 type FitMode = 'contain' | 'cover' | 'actual'
+type FrameFormat = 'png' | 'jpeg'
+type ExportOperation = FrameFormat | 'copy'
+type FrameContextMenu = { x: number; y: number }
 
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) return '0:00'
@@ -66,10 +76,22 @@ function playbackErrorMessage(code?: number) {
   return 'This video container opened, but its codec is not supported by this computer.'
 }
 
+function canvasBlob(canvas: HTMLCanvasElement, type: 'image/png' | 'image/jpeg', quality?: number) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob)
+      else reject(new Error('This frame could not be encoded as an image.'))
+    }, type, quality)
+  })
+}
+
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const frameContextMenuRef = useRef<HTMLDivElement>(null)
   const hideControlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const dragDepth = useRef(0)
+  const printOpeningRef = useRef(false)
+  const openRequestRef = useRef(0)
   const [file, setFile] = useState<VideoFilePayload | null>(null)
   const [openGeneration, setOpenGeneration] = useState(0)
   const [recents, setRecents] = useState<RecentVideo[]>([])
@@ -89,8 +111,21 @@ function App() {
   const [infoOpen, setInfoOpen] = useState(false)
   const [moreOpen, setMoreOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const [exportOpen, setExportOpen] = useState(false)
+  const [exportBusy, setExportBusy] = useState<ExportOperation | null>(null)
+  const [copyingFrame, setCopyingFrame] = useState(false)
+  const [frameContextMenu, setFrameContextMenu] = useState<FrameContextMenu | null>(null)
+  const [printSession, setPrintSession] = useState<VideoPrintSession | null>(null)
+  const [printOpening, setPrintOpening] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const [mediaError, setMediaError] = useState<string | null>(null)
+
+  const closePrintDialog = useCallback(() => {
+    setPrintSession((current) => {
+      if (current) void window.simpleVideo.endPrint(current.sessionId).catch(() => {})
+      return null
+    })
+  }, [])
 
   const refreshRecents = useCallback(async () => {
     try {
@@ -109,29 +144,204 @@ function App() {
     setMediaError(null)
     setInfoOpen(false)
     setMoreOpen(false)
+    setExportOpen(false)
+    closePrintDialog()
     setFile(payload)
     setOpenGeneration((value) => value + 1)
     window.simpleVideo.setTitle(`${payload.name} — simple video`)
     void refreshRecents()
-  }, [refreshRecents])
+  }, [closePrintDialog, refreshRecents])
 
   const openPath = useCallback(async (filePath: string) => {
+    const request = ++openRequestRef.current
     try {
-      adoptFile(await window.simpleVideo.openPath(filePath))
+      const payload = await window.simpleVideo.openPath(filePath)
+      if (request === openRequestRef.current) adoptFile(payload)
     } catch (error) {
+      if (request !== openRequestRef.current) return
       setLoading(false)
       setToast(errorMessage(error))
     }
   }, [adoptFile])
 
   const chooseFile = useCallback(async () => {
+    const request = ++openRequestRef.current
     try {
       const payload = await window.simpleVideo.openFile()
-      if (payload) adoptFile(payload)
+      if (payload && request === openRequestRef.current) adoptFile(payload)
     } catch (error) {
+      if (request !== openRequestRef.current) return
       setToast(errorMessage(error))
     }
   }, [adoptFile])
+
+  const openExportDialog = useCallback(() => {
+    if (!file) return
+    videoRef.current?.pause()
+    setInfoOpen(false)
+    setMoreOpen(false)
+    setShortcutsOpen(false)
+    setExportOpen(true)
+  }, [file])
+
+  const openPrintDialog = useCallback(async () => {
+    const video = videoRef.current
+    if (!file || !video || printOpeningRef.current) return
+    video.pause()
+    setInfoOpen(false)
+    setMoreOpen(false)
+    setShortcutsOpen(false)
+    setExportOpen(false)
+    if (video.readyState < HTMLMediaElement.HAVE_METADATA || !video.videoWidth || !video.videoHeight) {
+      setToast('Wait for the current video frame to finish loading before printing.')
+      return
+    }
+    if (video.videoWidth > 16_384 || video.videoHeight > 16_384 || video.videoWidth * video.videoHeight > 100_000_000) {
+      setToast('This video frame is too large to print safely at its native resolution.')
+      return
+    }
+
+    printOpeningRef.current = true
+    setPrintOpening(true)
+    const canvas = document.createElement('canvas')
+    const intendedTime = video.currentTime
+    try {
+      await waitForPresentedFrame(video, intendedTime)
+      if (videoRef.current !== video) return
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      const context = canvas.getContext('2d', { alpha: false })
+      if (!context) throw new Error('Frame printing is unavailable on this computer.')
+      context.fillStyle = '#000'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      const blob = await canvasBlob(canvas, 'image/png')
+      if (videoRef.current !== video) return
+      closePrintDialog()
+      const session = await window.simpleVideo.startPrint({
+        sourcePath: file.path,
+        seconds: intendedTime,
+        bytes: await blob.arrayBuffer(),
+      })
+      if (videoRef.current !== video) {
+        await window.simpleVideo.endPrint(session.sessionId).catch(() => {})
+        return
+      }
+      setPrintSession(session)
+    } catch (error) {
+      setToast(errorMessage(error))
+    } finally {
+      canvas.width = 1
+      canvas.height = 1
+      printOpeningRef.current = false
+      setPrintOpening(false)
+    }
+  }, [closePrintDialog, file])
+
+  const exportOriginalCopy = useCallback(async () => {
+    if (!file || exportBusy) return
+    setExportBusy('copy')
+    try {
+      const result = await window.simpleVideo.exportOriginalCopy(file.path)
+      if (!result.canceled) {
+        setExportOpen(false)
+        setToast(`Exported ${result.name || 'video copy'}.`)
+      }
+    } catch (error) {
+      setToast(errorMessage(error))
+    } finally {
+      setExportBusy(null)
+    }
+  }, [exportBusy, file])
+
+  const exportCurrentFrame = useCallback(async (format: FrameFormat) => {
+    const video = videoRef.current
+    if (!file || !video || exportBusy) return
+    video.pause()
+    if (video.readyState < HTMLMediaElement.HAVE_METADATA || !video.videoWidth || !video.videoHeight) {
+      setToast('Wait for the video frame to finish loading before exporting an image.')
+      return
+    }
+    if (video.videoWidth > 16_384 || video.videoHeight > 16_384 || video.videoWidth * video.videoHeight > 100_000_000) {
+      setToast('This frame is too large to export safely at its native resolution.')
+      return
+    }
+
+    setExportBusy(format)
+    const canvas = document.createElement('canvas')
+    const intendedTime = video.currentTime
+    try {
+      await waitForPresentedFrame(video, intendedTime)
+      if (videoRef.current !== video) return
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      const context = canvas.getContext('2d', { alpha: format === 'png' })
+      if (!context) throw new Error('Image export is unavailable on this computer.')
+      if (format === 'jpeg') {
+        context.fillStyle = '#000'
+        context.fillRect(0, 0, canvas.width, canvas.height)
+      }
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      const blob = await canvasBlob(canvas, format === 'png' ? 'image/png' : 'image/jpeg', format === 'jpeg' ? 0.92 : undefined)
+      if (videoRef.current !== video) return
+      const result = await window.simpleVideo.exportFrame({
+        sourcePath: file.path,
+        format,
+        seconds: intendedTime,
+        bytes: await blob.arrayBuffer(),
+      })
+      if (!result.canceled) {
+        setExportOpen(false)
+        setToast(`Exported ${result.name || `${format.toUpperCase()} frame`}.`)
+      }
+    } catch (error) {
+      setToast(errorMessage(error))
+    } finally {
+      canvas.width = 1
+      canvas.height = 1
+      setExportBusy(null)
+    }
+  }, [exportBusy, file])
+
+  const copyCurrentFrame = useCallback(async () => {
+    const video = videoRef.current
+    if (!file || !video || copyingFrame) return false
+    video.pause()
+    if (video.readyState < HTMLMediaElement.HAVE_METADATA || !video.videoWidth || !video.videoHeight) {
+      setToast('Wait for the current video frame to finish loading before copying it.')
+      return false
+    }
+    if (video.videoWidth > 16_384 || video.videoHeight > 16_384 || video.videoWidth * video.videoHeight > 100_000_000) {
+      setToast('This video frame is too large to copy safely at its native resolution.')
+      return false
+    }
+    setCopyingFrame(true)
+    const canvas = document.createElement('canvas')
+    const intendedTime = video.currentTime
+    try {
+      await waitForPresentedFrame(video, intendedTime)
+      if (videoRef.current !== video) return false
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      const context = canvas.getContext('2d', { alpha: false })
+      if (!context) throw new Error('Frame copying is unavailable on this computer.')
+      context.fillStyle = '#000'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      const blob = await canvasBlob(canvas, 'image/png')
+      if (videoRef.current !== video) return false
+      await window.simpleVideo.copyFrame(await blob.arrayBuffer())
+      setToast(`Copied frame at ${formatTime(intendedTime)}.`)
+      return true
+    } catch (error) {
+      setToast(errorMessage(error))
+      return false
+    } finally {
+      canvas.width = 1
+      canvas.height = 1
+      setCopyingFrame(false)
+    }
+  }, [copyingFrame, file])
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current
@@ -207,21 +417,104 @@ function App() {
   }, [toast])
 
   useEffect(() => {
+    if (!frameContextMenu) return
+    const closeOutside = (event: PointerEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest('.video-context-menu')) setFrameContextMenu(null)
+    }
+    const close = () => setFrameContextMenu(null)
+    document.addEventListener('pointerdown', closeOutside)
+    window.addEventListener('blur', close)
+    window.addEventListener('resize', close)
+    window.requestAnimationFrame(() => frameContextMenuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus())
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside)
+      window.removeEventListener('blur', close)
+      window.removeEventListener('resize', close)
+    }
+  }, [frameContextMenu])
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null
+      const target = event.target instanceof HTMLElement ? event.target : null
       const key = event.key.toLowerCase()
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') {
+      if (printSession) {
+        const insidePrintDialog = Boolean(target?.closest('.video-print-dialog'))
+        const dialogNavigation = insidePrintDialog && (event.key === 'Tab' || event.key === 'Enter' || event.code === 'Space' || target?.matches('input, select'))
+        if (!dialogNavigation) event.preventDefault()
+        return
+      }
+      if (printOpening) {
+        event.preventDefault()
+        return
+      }
+      if (frameContextMenu) {
+        const menu = frameContextMenuRef.current
+        const buttons = [...menu?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []]
+        const current = Math.max(0, buttons.indexOf(document.activeElement as HTMLButtonElement))
+        if ((event.ctrlKey || event.metaKey) && key === 'c') {
+          event.preventDefault()
+          setFrameContextMenu(null)
+          void copyCurrentFrame()
+        } else if (key === 'escape') {
+          event.preventDefault()
+          setFrameContextMenu(null)
+        } else if (key === 'arrowdown' || key === 'arrowup' || key === 'home' || key === 'end' || key === 'tab') {
+          event.preventDefault()
+          const next = key === 'home'
+            ? 0
+            : key === 'end'
+              ? buttons.length - 1
+              : (current + (key === 'arrowup' || (key === 'tab' && event.shiftKey) ? -1 : 1) + buttons.length) % buttons.length
+          buttons[next]?.focus()
+        } else if (!target?.closest('.video-context-menu') || (event.ctrlKey || event.metaKey)) {
+          event.preventDefault()
+        }
+        return
+      }
+      if (key === 'escape' && exportOpen) {
+        event.preventDefault()
+        if (!exportBusy) setExportOpen(false)
+        return
+      }
+      if (exportOpen) {
+        const insideExportDialog = Boolean(target?.closest('.export-modal'))
+        const dialogNavigation = insideExportDialog && (event.key === 'Tab' || event.key === 'Enter' || event.code === 'Space')
+        if (!dialogNavigation) event.preventDefault()
+        return
+      }
+      if (shortcutsOpen) {
+        if (key === 'escape') setShortcutsOpen(false)
+        else if (!target?.closest('.shortcuts-modal') || (event.ctrlKey || event.metaKey)) event.preventDefault()
+        return
+      }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && key === 'e') {
+        if (file) {
+          event.preventDefault()
+          openExportDialog()
+        }
+        return
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'p') {
+        if (file) {
+          event.preventDefault()
+          void openPrintDialog()
+        }
+        return
+      }
+      if ((event.ctrlKey || event.metaKey) && key === 'o') {
         event.preventDefault()
         void chooseFile()
+        return
+      }
+      const nativeTextSelected = Boolean(window.getSelection()?.toString().trim())
+      if ((event.ctrlKey || event.metaKey) && key === 'c' && file && !nativeTextSelected && !target?.closest('input, select, textarea, [contenteditable="true"]')) {
+        event.preventDefault()
+        void copyCurrentFrame()
         return
       }
       if (key === 'escape' && fullscreen) {
         event.preventDefault()
         window.simpleVideo.exitFullscreen()
-        return
-      }
-      if (shortcutsOpen) {
-        if (key === 'escape') setShortcutsOpen(false)
         return
       }
       if (target?.closest('input, select, textarea')) return
@@ -269,7 +562,7 @@ function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [changeVolume, chooseFile, file, fullscreen, rate, seekBy, selectRate, shortcutsOpen, togglePlay, volume])
+  }, [changeVolume, chooseFile, closePrintDialog, copyCurrentFrame, exportBusy, exportOpen, file, frameContextMenu, fullscreen, openExportDialog, openPrintDialog, printOpening, printSession, rate, seekBy, selectRate, shortcutsOpen, togglePlay, volume])
 
   const handleDragEnter = (event: DragEvent) => {
     event.preventDefault()
@@ -323,6 +616,8 @@ function App() {
     setMediaError(null)
     setMoreOpen(false)
     setInfoOpen(false)
+    setExportOpen(false)
+    closePrintDialog()
     window.simpleVideo.setTitle('simple video')
     void refreshRecents()
   }
@@ -377,7 +672,20 @@ function App() {
           />
         ) : (
           <div className={`player-shell${controlsVisible ? '' : ' controls-hidden'}`} onMouseMove={revealControls} onMouseLeave={() => playing && setControlsVisible(false)}>
-            <div className="video-stage" onDoubleClick={() => window.simpleVideo.toggleFullscreen()}>
+            <div
+              className="video-stage"
+              onDoubleClick={() => window.simpleVideo.toggleFullscreen()}
+              onContextMenu={(event) => {
+                if (event.target instanceof Element && event.target.closest('.video-context-menu')) return
+                event.preventDefault()
+                setInfoOpen(false)
+                setMoreOpen(false)
+                setFrameContextMenu({
+                  x: Math.max(8, Math.min(event.clientX, window.innerWidth - 226)),
+                  y: Math.max(8, Math.min(event.clientY, window.innerHeight - 250)),
+                })
+              }}
+            >
               <video
                 key={openGeneration}
                 ref={videoRef}
@@ -406,6 +714,17 @@ function App() {
                   setMediaError(message)
                 }}
               />
+              {frameContextMenu && (
+                <div ref={frameContextMenuRef} className="video-context-menu" role="menu" aria-label="Video frame menu" style={{ left: frameContextMenu.x, top: frameContextMenu.y }}>
+                  <button role="menuitem" disabled={copyingFrame || loading || Boolean(mediaError)} onClick={() => { setFrameContextMenu(null); void copyCurrentFrame() }}><Copy /><span>{copyingFrame ? 'Copying frame…' : 'Copy current frame'}</span><kbd>Ctrl C</kbd></button>
+                  <div role="separator" />
+                  <button role="menuitem" onClick={() => { setFrameContextMenu(null); togglePlay() }}>{playing ? <Pause /> : <Play />}<span>{playing ? 'Pause' : 'Play'}</span><kbd>Space</kbd></button>
+                  <button role="menuitem" onClick={() => { setFrameContextMenu(null); setMuted((value) => !value) }}>{muted ? <Volume2 /> : <VolumeX />}<span>{muted ? 'Unmute' : 'Mute'}</span><kbd>M</kbd></button>
+                  <div role="separator" />
+                  <button role="menuitem" onClick={() => { setFrameContextMenu(null); openExportDialog() }}><Download /><span>Export As</span></button>
+                  <button role="menuitem" disabled={printOpening} onClick={() => { setFrameContextMenu(null); void openPrintDialog() }}><Printer /><span>Print current frame</span><kbd>Ctrl P</kbd></button>
+                </div>
+              )}
               {loading && (
                 <div className="loading-indicator" aria-live="polite">
                   <span className="spinner" />
@@ -428,6 +747,8 @@ function App() {
             <div className="player-toolbar top-toolbar">
               <div className="file-chip"><FileVideo2 /><span>{file.name}</span></div>
               <div className="toolbar-spacer" />
+              <button type="button" className="export-toolbar-button" onClick={openExportDialog} title="Export As (Ctrl+Shift+E)"><Download /><span>Export As</span></button>
+              <button type="button" className="print-toolbar-button" disabled={printOpening} onClick={() => void openPrintDialog()} title="Print current frame (Ctrl+P)">{printOpening ? <LoaderCircle className="export-spinner" /> : <Printer />}<span>{printOpening ? 'Capturing…' : 'Print'}</span></button>
               <button type="button" className={fit !== 'contain' ? 'is-active' : ''} onClick={cycleFit} title="Cycle fit mode"><Expand /><span>{fitLabel}</span></button>
               <button type="button" className={infoOpen ? 'is-active' : ''} onClick={() => { setInfoOpen((value) => !value); setMoreOpen(false) }} title="Video information"><Info /></button>
               <div className="menu-anchor">
@@ -435,6 +756,8 @@ function App() {
                 {moreOpen && (
                   <div className="popup-menu compact-menu">
                     <button type="button" onClick={() => void chooseFile()}><FolderOpen /><span>Open another video</span><kbd>Ctrl O</kbd></button>
+                    <button type="button" onClick={openExportDialog}><Download /><span>Export As</span><kbd>Ctrl Shift E</kbd></button>
+                    <button type="button" onClick={() => void openPrintDialog()}><Printer /><span>Print current frame</span><kbd>Ctrl P</kbd></button>
                     <button type="button" onClick={() => window.simpleVideo.openInNewWindow(file.path)}><Plus /><span>Open in new window</span></button>
                     <button type="button" onClick={() => window.simpleVideo.revealFile(file.path)}><FileVideo2 /><span>Show in folder</span></button>
                     <button type="button" onClick={() => setShortcutsOpen(true)}><Keyboard /><span>Keyboard shortcuts</span><kbd>?</kbd></button>
@@ -508,6 +831,19 @@ function App() {
         )}
       </section>
 
+      {file && exportOpen && (
+        <ExportDialog
+          file={file}
+          seconds={videoRef.current?.currentTime || currentTime}
+          resolution={resolution}
+          frameReady={!loading && !mediaError && resolution.width > 0 && resolution.height > 0}
+          busy={exportBusy}
+          onExportFrame={(format) => void exportCurrentFrame(format)}
+          onExportCopy={() => void exportOriginalCopy()}
+          onClose={() => { if (!exportBusy) setExportOpen(false) }}
+        />
+      )}
+      {file && printSession && <PrintDialog session={printSession} onClose={closePrintDialog} />}
       {shortcutsOpen && <Shortcuts onClose={() => setShortcutsOpen(false)} />}
       {toast && <div className="toast" role="status">{toast}<button type="button" onClick={() => setToast(null)}><X /></button></div>}
     </main>
@@ -521,6 +857,95 @@ interface WelcomeProps {
   onRemoveRecent: (event: React.MouseEvent, filePath: string) => void
   onClearRecents: () => void
   onShowShortcuts: () => void
+}
+
+interface ExportDialogProps {
+  file: VideoFilePayload
+  seconds: number
+  resolution: { width: number; height: number }
+  frameReady: boolean
+  busy: ExportOperation | null
+  onExportFrame: (format: FrameFormat) => void
+  onExportCopy: () => void
+  onClose: () => void
+}
+
+function ExportDialog({ file, seconds, resolution, frameReady, busy, onExportFrame, onExportCopy, onClose }: ExportDialogProps) {
+  const resolutionLabel = resolution.width ? `${resolution.width} × ${resolution.height}` : 'Not decoded yet'
+  const dialogRef = useRef<HTMLElement>(null)
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    dialogRef.current?.querySelector<HTMLElement>('.export-options button:not(:disabled)')?.focus()
+    return () => {
+      if (previouslyFocused?.isConnected) previouslyFocused.focus()
+    }
+  }, [])
+
+  const trapFocus = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key !== 'Tab') return
+    const focusable = [...(dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled)') ?? [])]
+      .filter((element) => element.getClientRects().length > 0)
+    if (!focusable.length) {
+      event.preventDefault()
+      dialogRef.current?.focus()
+      return
+    }
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
+
+  return (
+    <div className="modal-backdrop export-backdrop" onMouseDown={(event) => event.currentTarget === event.target && !busy && onClose()}>
+      <section ref={dialogRef} className="export-modal" role="dialog" aria-modal="true" aria-labelledby="export-title" aria-describedby="export-description" tabIndex={-1} onKeyDown={trapFocus}>
+        <div className="modal-heading export-heading">
+          <span className="modal-mark"><Download /></span>
+          <div>
+            <h2 id="export-title">Export As</h2>
+            <p id="export-description">Create a real image from the current frame or save an unchanged copy.</p>
+          </div>
+          <button type="button" onClick={onClose} disabled={Boolean(busy)} aria-label="Close Export As"><X /></button>
+        </div>
+
+        <div className="export-source">
+          <FileVideo2 />
+          <span><strong>{file.name}</strong><small>Frame at {formatTime(seconds)} · {resolutionLabel}</small></span>
+        </div>
+
+        <div className="export-options">
+          <button type="button" onClick={() => onExportFrame('png')} disabled={!frameReady || Boolean(busy)}>
+            <span className="export-option-icon"><ImageIcon /></span>
+            <span className="export-option-copy"><strong>PNG image</strong><small>Current frame at native resolution · lossless</small></span>
+            <span className="export-format">.PNG</span>
+            {busy === 'png' && <LoaderCircle className="export-spinner" />}
+          </button>
+          <button type="button" onClick={() => onExportFrame('jpeg')} disabled={!frameReady || Boolean(busy)}>
+            <span className="export-option-icon"><ImageIcon /></span>
+            <span className="export-option-copy"><strong>JPEG image</strong><small>Current frame at native resolution · smaller file</small></span>
+            <span className="export-format">.JPG</span>
+            {busy === 'jpeg' && <LoaderCircle className="export-spinner" />}
+          </button>
+          <button type="button" onClick={onExportCopy} disabled={Boolean(busy)}>
+            <span className="export-option-icon"><Copy /></span>
+            <span className="export-option-copy"><strong>Original video copy</strong><small>Copies every byte without changing quality or format</small></span>
+            <span className="export-format">.{file.extension}</span>
+            {busy === 'copy' && <LoaderCircle className="export-spinner" />}
+          </button>
+        </div>
+
+        {!frameReady && <p className="export-status" role="status">PNG and JPEG become available after a frame has decoded.</p>}
+        <p className="export-limitation"><Info /> Video and audio format changes are not offered because this build does not bundle a media encoder. Your original is never modified.</p>
+        <div className="export-footer"><span>Shortcut</span><kbd>Ctrl Shift E</kbd></div>
+      </section>
+    </div>
+  )
 }
 
 function Welcome({ recents, onOpen, onOpenRecent, onRemoveRecent, onClearRecents, onShowShortcuts }: WelcomeProps) {
@@ -569,6 +994,8 @@ function Shortcuts({ onClose }: { onClose: () => void }) {
     ['Beginning / end', 'Home / End'],
     ['Fullscreen', 'F'],
     ['Open video', 'Ctrl O'],
+    ['Export As', 'Ctrl Shift E'],
+    ['Print current frame', 'Ctrl P'],
   ]
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.currentTarget === event.target && onClose()}>

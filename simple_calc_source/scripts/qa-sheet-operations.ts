@@ -9,6 +9,7 @@ import {
   insertRows,
   rewriteFormulaForSheetStructure,
   SheetStructureError,
+  shiftCells,
 } from '../src/lib/sheet-operations.ts'
 
 function sheet(overrides: Partial<SheetData> = {}): SheetData {
@@ -61,7 +62,10 @@ function rowInsertionFixture(): WorkbookModel {
     dataValidations: {
       'D2:D4': { type: 'custom', formulae: ['B2:B4', '"A1,A2"'] },
     },
-    conditionalFormattings: [{ ref: 'E2:E4', rules: [{ type: 'expression', formulae: ['B2>0'] }] }],
+    conditionalFormattings: [{ ref: 'E2:E4', rules: [
+      { type: 'expression', formulae: ['B2>0'] },
+      { type: 'colorScale', cfvo: [{ type: 'formula', value: '$B$3' }, { type: 'num', value: 5 }, { type: 'percent', value: '50' }] },
+    ] }],
     autoFilter: 'A1:D4',
     pageSetup: { printArea: "'Main'!A1:H10", printTitlesRow: '1:1' },
   })
@@ -110,6 +114,11 @@ function rowInsertionFixture(): WorkbookModel {
   assert.deepEqual(
     ((main.conditionalFormattings?.[0] as { rules: Array<{ formulae: string[] }> }).rules[0]).formulae,
     ['B4>0'],
+  )
+  assert.deepEqual(
+    ((main.conditionalFormattings?.[0] as { rules: Array<{ cfvo?: Array<{ value: unknown }> }> }).rules[1]).cfvo?.map((item) => item.value),
+    ['$B$5', 5, '50'],
+    'formula thresholds follow inserted rows; numbers stay',
   )
   assert.equal(main.autoFilter, 'A1:D6')
   assert.equal(main.pageSetup?.printArea, "'Main'!A1:H12")
@@ -277,4 +286,43 @@ function rowInsertionFixture(): WorkbookModel {
   assert.equal(result.workbook.sheets[0].rowCount, 13)
 }
 
-process.stdout.write('Sheet operations QA passed: pure row/column edits preserve formulas, ranges, dimensions, panes, and sheet metadata.\n')
+// ---- Insert/delete cells (shift) -------------------------------------------------------------
+{
+  const base = workbook(sheet({
+    cells: {
+      A1: { value: 1 }, A2: { value: 2 }, A3: { value: 3 }, B1: { value: 10 }, B3: { value: 30 }, C1: { value: 100 },
+      D1: { formula: 'SUM(A1:A5)' }, E1: { formula: 'B3' }, F1: { formula: 'SUM(A1:C1)' }, G1: { formula: 'A3*2' }, H1: { formula: 'C1+B1' },
+    },
+    rowHeights: { '2': 40 },
+    dataValidations: { 'A2:A3': { type: 'whole', formulae: ['0'] } },
+  }))
+  const down = shiftCells(base, 'main', { top: 1, bottom: 1, left: 0, right: 0 }, 'down').sheets[0]
+  assert.equal(down.cells.A2, undefined, 'the inserted cell is blank')
+  assert.equal(down.cells.A3.value, 2)
+  assert.equal(down.cells.A4.value, 3)
+  assert.equal(down.cells.B3.value, 30, 'cells outside the band stay')
+  assert.equal(down.cells.D1.formula, 'SUM(A1:A6)', 'ranges inside the band grow')
+  assert.equal(down.cells.E1.formula, 'B3')
+  assert.equal(down.cells.F1.formula, 'SUM(A1:C1)', 'ranges wider than the band are untouched')
+  assert.equal(down.cells.G1.formula, 'A4*2', 'references follow shifted cells')
+  assert.deepEqual(down.rowHeights, { '2': 40 }, 'row heights do not move with cells')
+  assert.deepEqual(Object.keys(down.dataValidations || {}), ['A3:A4'])
+
+  const left = shiftCells(base, 'main', { top: 0, bottom: 0, left: 1, right: 1 }, 'left').sheets[0]
+  assert.equal(left.cells.B1.value, 100, 'C1 moves into B1')
+  assert.equal(left.cells.B3.value, 30, 'rows outside the band stay')
+  assert.equal(left.cells.C1.formula, 'SUM(A1:A5)')
+  assert.equal(left.cells.D1.formula, 'B3')
+  assert.equal(left.cells.E1.formula, 'SUM(A1:B1)', 'a range across the deleted cell shrinks')
+  assert.equal(left.cells.F1.formula, 'A3*2')
+  assert.equal(left.cells.G1.formula, 'B1+#REF!', 'references to the deleted cell become #REF!')
+  assert.equal(left.cells.H1, undefined)
+}
+{
+  const merged = workbook(sheet({ cells: { A1: { value: 1 } }, merges: ['A2:B2'] }))
+  assert.throws(() => shiftCells(merged, 'main', { top: 0, bottom: 0, left: 0, right: 0 }, 'down'), (error: unknown) => error instanceof SheetStructureError && error.code === 'SHIFT_CONFLICT')
+  const inside = shiftCells(merged, 'main', { top: 0, bottom: 0, left: 0, right: 1 }, 'down').sheets[0]
+  assert.deepEqual(inside.merges, ['A3:B3'], 'merges inside the band move')
+}
+
+process.stdout.write('Sheet operations QA passed: pure row/column edits and cell shifts preserve formulas, ranges, dimensions, panes, and sheet metadata.\n')

@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "pixels": 12582912,
+  "openMilliseconds": 129.7119,
+  "pngAndWebpUnchangedSaveExact": true,
+  "undoRestoresAlphaAndFit": true,
+  "rotatedQuadrantsAndHalfAlphaExact": true,
+  "paintPixelCorrect": true,
+  "editedWebpAlpha": true,
+  "exifAndManualJpegRotation": true,
+  "pdfPages": 1,
+  "pdfSoftMask": true,
+  "pdfRenderedColorAndAlpha": true,
+  "temporaryCanvasPixels": 9,
+  "originalsUnchanged": true
+}

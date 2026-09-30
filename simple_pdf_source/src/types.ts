@@ -83,12 +83,18 @@ export interface TextOverlay {
   pageIndex: number
   rect: PdfRect
   originalRect?: PdfRect
+  /** Actual source glyph extents, including descenders outside the em box. */
+  inkRect?: PdfRect
   originalText?: string
   text: string
   fontSize: number
   fontFamily: string
   fontWeight?: number
   fontStyle?: 'normal' | 'italic'
+  /** Fit each line to the box, or wrap at its right edge. */
+  textFit?: 'fit' | 'wrap'
+  /** False after an intentional font/size/spacing change. */
+  preserveSourceMetrics?: boolean
   lineHeight?: number
   letterSpacing?: number
   scaleX?: number
@@ -142,12 +148,17 @@ export interface PageTextEdit {
   pageIndex: number
   rect: PdfRect
   originalRect?: PdfRect
+  inkRect?: PdfRect
   originalText: string
   text: string
   fontSize: number
   fontFamily: string
   fontWeight?: number
   fontStyle?: 'normal' | 'italic'
+  /** Fit each line to the box, or wrap at its right edge. */
+  textFit?: 'fit' | 'wrap'
+  /** False after an intentional font/size/spacing change. */
+  preserveSourceMetrics?: boolean
   lineHeight?: number
   letterSpacing?: number
   scaleX?: number
@@ -228,23 +239,29 @@ export interface ActiveSearchMatch {
 export interface PrinterSummary {
   name: string
   displayName: string
-  isDefault: boolean
   supportsDuplex: boolean
   supportsColor: boolean
 }
 
 export type PrintDuplexMode = 'simplex' | 'longEdge' | 'shortEdge'
+export type PrintPaperSize = 'Letter' | 'A4' | 'Legal'
+export type PrintMarginMode = 'none' | 'minimum' | 'normal'
+export type PrintScaleMode = 'fit' | 'actual' | 'shrink' | 'custom'
 
 export interface PrintDirectOptions {
   deviceName?: string
   copies?: number
   /** Zero-based page indices, already resolved; omit to print every page. */
-  pageIndices?: number[]
+  pageIndices?: number[] | null
   landscape?: boolean
   color?: boolean
   duplexMode?: PrintDuplexMode
   collate?: boolean
-  scaleFitToPage?: boolean
+  paperSize: PrintPaperSize
+  marginMode: PrintMarginMode
+  scaleMode: PrintScaleMode
+  /** Decimal scale, where 1 is 100%. */
+  customScale: number
 }
 
 export interface PrintDirectResult {
@@ -252,12 +269,26 @@ export interface PrintDirectResult {
   failureReason: string
 }
 
+export type PdfExportFormat = 'pdf' | 'png' | 'jpeg' | 'webp' | 'docx' | 'txt' | 'md' | 'html'
+
+export interface ExportTextPage {
+  pageNumber: number
+  text: string
+}
+
+export interface ImageExportSession {
+  id: string
+  targetPath: string
+}
+
 export interface SimpleApi {
   openFile: () => Promise<DocumentPayload | null>
   openInNewWindow: (filePath?: string) => Promise<boolean>
   openPath: (filePath: string) => Promise<DocumentPayload>
   openBytes: (name: string, data: ArrayBuffer) => Promise<DocumentPayload>
+  unlockPdf: (data: Uint8Array, password: string) => Promise<{ status: 'none' | 'needs-password' | 'wrong-password' | 'unlocked'; data?: Uint8Array }>
   mutatePdf: (data: Uint8Array, operation: Record<string, unknown>) => Promise<Uint8Array>
+  textBackground: (data: Uint8Array, pageIndex: number, edits: Array<{ type: 'text'; cover: boolean; originalRect: PdfRect; originalText?: string }>) => Promise<Uint8Array>
   flattenOverlays: (
     data: Uint8Array,
     overlays: PdfOverlay[],
@@ -267,9 +298,14 @@ export interface SimpleApi {
   insertFiles: (data: Uint8Array, insertIndex: number) => Promise<{ data: Uint8Array; added: number } | null>
   insertDroppedFiles: (data: Uint8Array, insertIndex: number, files: Array<{ name: string; data: ArrayBuffer }>) => Promise<{ data: Uint8Array; added: number }>
   pickImage: () => Promise<{ dataUrl: string; name: string } | null>
+  exportAsPdf: (input: { data: Uint8Array; indices: number[]; fullDocument: boolean; suggestedName: string }) => Promise<string | null>
+  exportTextDocument: (input: { format: 'docx' | 'txt' | 'md' | 'html'; pages: ExportTextPage[]; title: string; baseName: string }) => Promise<string | null>
+  beginImageExport: (input: { format: 'png' | 'jpeg' | 'webp'; pageCount: number; baseName: string }) => Promise<ImageExportSession | null>
+  writeImageExportPage: (input: { id: string; pageNumber: number; data: Uint8Array }) => Promise<string>
+  finishImageExport: (id: string) => Promise<string>
+  cancelImageExport: (id: string) => Promise<boolean>
   exportPages: (data: Uint8Array, indices: number[], suggestedName: string) => Promise<string | null>
   startPageDrag: (data: Uint8Array, indices: number[], suggestedName: string) => Promise<string | null>
-  printPdf: (data: Uint8Array, name: string) => Promise<boolean>
   listPrinters: () => Promise<PrinterSummary[]>
   printPdfDirect: (data: Uint8Array, name: string, options: PrintDirectOptions) => Promise<PrintDirectResult>
   savePdf: (input: { data: Uint8Array; path: string | null; name: string; forceDialog: boolean }) => Promise<{ path: string; name: string } | null>

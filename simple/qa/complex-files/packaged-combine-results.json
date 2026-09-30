@@ -1,0 +1,29 @@
+{
+  "passed": true,
+  "runtime": "packaged-asar",
+  "files": 4,
+  "pages": 5,
+  "wordReferencePages": 1,
+  "wordTextMatches": true,
+  "spreadsheetNativePages": 1,
+  "spreadsheetTextAndPaperMatch": true,
+  "spreadsheetRangeValidated": true,
+  "spreadsheetPreviewRoutesToSource": true,
+  "spreadsheetHeaderColorTokenVisible": false,
+  "pageOrder": [
+    "Word original layout",
+    "PDF page 3",
+    "PDF page 1",
+    "spreadsheet printed page 1",
+    "oriented photo"
+  ],
+  "invalidRangeRejected": true,
+  "sourceOverwriteRefused": true,
+  "inputHashesUnchanged": true,
+  "workerSaveMilliseconds": 130.1234999999997,
+  "dialogReorderRemoveAndEditingLock": true,
+  "dialogDismissedWhileWorking": true,
+  "completionToast": true,
+  "interactiveFormsRejected": true,
+  "outputBytes": 125429
+}

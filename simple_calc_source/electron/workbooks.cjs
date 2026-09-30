@@ -2,10 +2,50 @@
 
 const fs = require('fs')
 const path = require('path')
+// ExcelJS's builtin number-format table has no entry for the locale-reserved ids Excel
+// reserves for its Currency / Comma / Accounting cell styles, and those ids are never
+// written into <numFmts>.  Without them getStyleModel leaves cell.numFmt undefined and the
+// format is lost, so a workbook formatted with the toolbar's comma or accounting button
+// renders as raw digits.  Seeding the table before exceljs loads also keeps its reverse
+// lookup intact so the ids survive a save.
+const RESERVED_BUILTIN_NUMBER_FORMATS = Object.freeze({
+  5: '"$"#,##0_);("$"#,##0)',
+  6: '"$"#,##0_);[Red]("$"#,##0)',
+  7: '"$"#,##0.00_);("$"#,##0.00)',
+  8: '"$"#,##0.00_);[Red]("$"#,##0.00)',
+  41: '_(* #,##0_);_(* (#,##0);_(* "-"_);_(@_)',
+  42: '_("$"* #,##0_);_("$"* (#,##0);_("$"* "-"_);_(@_)',
+  43: '_(* #,##0.00_);_(* (#,##0.00);_(* "-"??_);_(@_)',
+  44: '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)',
+})
+
+try {
+  const defaultNumberFormats = require('exceljs/lib/xlsx/defaultnumformats')
+  for (const [id, format] of Object.entries(RESERVED_BUILTIN_NUMBER_FORMATS)) {
+    if (!defaultNumberFormats[id] || !defaultNumberFormats[id].f) defaultNumberFormats[id] = { f: format }
+  }
+} catch {
+  // A future ExcelJS layout can hide the table; the reader still works without the seed.
+}
+
 const ExcelJS = require('exceljs')
+// Conditional formatting: ExcelJS 4.4 drops several rule types and attributes on read/write
+// (duplicate/unique/beginsWith/endsWith rules, stopIfTrue, text, formula thresholds, x14 data
+// bars...). The idempotent prototype patches in this module make Excel files round-trip.
+require('./conditional-format-exceljs.cjs').installConditionalFormattingPatches()
+const { installTablePatches, tablesFromWorksheet, applyTablesToWorksheet } = require('./table-xlsx.cjs')
+const { installValidationPatches } = require('./validation-xlsx.cjs')
+const { installOutlinePatches, applyOutlineToWorksheet } = require('./outline-xlsx.cjs')
+const { imagesFromWorksheet, applyImagesToWorksheet } = require('./image-xlsx.cjs')
+installTablePatches()
+installValidationPatches()
+installOutlinePatches()
 const JSZip = require('jszip')
 const XLSX = require('xlsx')
 const { extractLegacyBiffStyles } = require('./legacy-biff-styles.cjs')
+const { importChartsIntoSheets, writeChartsToPackage } = require('./chart-xlsx.cjs')
+const { importPivotDefinitions, writePivotPackage } = require('./pivot-xlsx.cjs')
+const { importSparklineGroups, writeSparklinesToPackage } = require('./sparkline-xlsx.cjs')
 
 // SheetJS is deliberately used for the long tail of spreadsheet formats.  The
 // model itself is format-neutral and JSON serializable, so it can cross an
@@ -229,6 +269,12 @@ function normalizeFill(fill) {
   if (Number.isFinite(fill.degree)) result.degree = fill.degree
   if (fill.center && typeof fill.center === 'object') result.center = plainClone(fill.center)
   if (Array.isArray(fill.stops)) result.stops = plainClone(fill.stops)
+  // A bare <patternFill/> — what Google Sheets writes for the unused fills[0] — and a
+  // pattern whose colour elements carry no usable value both survive the guards above but
+  // paint nothing.  Keeping them would mark ordinary cells as filled, which costs them
+  // their gridlines and inflates the used range.
+  const paintsNothing = !result.fgColor && !result.bgColor && !(Array.isArray(result.stops) && result.stops.length)
+  if (paintsNothing && (!result.pattern || result.pattern === 'none' || result.pattern === 'gray125')) return undefined
   return Object.keys(result).length ? result : undefined
 }
 
@@ -275,6 +321,21 @@ function normalizeAlignment(alignment) {
     }
   }
   return Object.keys(result).length ? result : undefined
+}
+
+// ExcelJS hands back the raw OOXML spellings for the locale-dependent builtin number
+// formats.  Excel and Sheets render builtin 14 as the system short date and builtin 22 as
+// short date + time, so the literal spellings would show "03-15-23" and a stray "h" here.
+const BUILTIN_NUMBER_FORMAT_ALIASES = Object.freeze({
+  'mm-dd-yy': 'm/d/yyyy',
+  'm/d/yy "h":mm': 'm/d/yyyy h:mm',
+})
+
+function normalizeNumberFormat(numFmt) {
+  if (typeof numFmt !== 'string') return undefined
+  const format = numFmt.trim()
+  if (!format || format === 'General') return undefined
+  return BUILTIN_NUMBER_FORMAT_ALIASES[format] || format
 }
 
 function normalizeStyle(style) {
@@ -588,6 +649,29 @@ function xmlScalar(value) {
   return value
 }
 
+// Style records address theme colours by index, so the palette has to come from the
+// workbook's own clrScheme.  The index order is the OOXML one — lt1 and dk1 are swapped
+// relative to the document order in the XML.
+const THEME_COLOR_ORDER = Object.freeze(['lt1', 'dk1', 'lt2', 'dk2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6', 'hlink', 'folHlink'])
+const SYSTEM_COLOR_FALLBACKS = Object.freeze({ window: 'FFFFFF', windowtext: '000000' })
+
+function themeColorsFromXml(xml) {
+  if (typeof xml !== 'string' || !xml) return undefined
+  const scheme = /<a:clrScheme[ >][^]*?<[/]a:clrScheme[^>]*>/i.exec(xml)
+  if (!scheme) return undefined
+  const colors = THEME_COLOR_ORDER.map((slot) => {
+    const entry = new RegExp('<a:' + slot + '(?=[ />])[^>]*>([^]*?)<[/]a:' + slot + '[^>]*>', 'i').exec(scheme[0])
+    if (!entry) return ''
+    const srgb = /<a:srgbClr[^>]* val="([0-9A-Fa-f]{6})"/.exec(entry[1])
+    if (srgb) return srgb[1].toUpperCase()
+    const system = /<a:sysClr[^>]* lastClr="([0-9A-Fa-f]{6})"/.exec(entry[1])
+    if (system) return system[1].toUpperCase()
+    const named = /<a:sysClr[^>]* val="([A-Za-z]+)"/.exec(entry[1])
+    return named ? SYSTEM_COLOR_FALLBACKS[named[1].toLowerCase()] || '' : ''
+  })
+  return colors.some((hex) => hex) ? colors : undefined
+}
+
 async function workbookXmlFromOoxml(buffer) {
   const zip = await JSZip.loadAsync(buffer)
   const entry = zip.file('xl/workbook.xml')
@@ -598,17 +682,63 @@ async function workbookXmlFromOoxml(buffer) {
   }
   const data = await entry.async('nodebuffer')
   if (data.length > MAX_WORKBOOK_XML_BYTES) throw new RangeError('The OOXML workbook metadata is unexpectedly large.')
-  return { xml: data.toString('utf8'), partNames: Object.keys(zip.files) }
+  const partNames = Object.keys(zip.files)
+  const themePart = partNames.find((partName) => /^xl\/theme\/theme\d*\.xml$/i.test(partName))
+  let themeColors
+  if (themePart) {
+    const themeEntry = zip.file(themePart)
+    const themeSize = themeEntry && themeEntry._data && Number(themeEntry._data.uncompressedSize)
+    if (themeEntry && (!Number.isFinite(themeSize) || themeSize <= MAX_WORKBOOK_XML_BYTES)) {
+      themeColors = themeColorsFromXml((await themeEntry.async('nodebuffer')).toString('utf8'))
+    }
+  }
+  let normalFont, fontSizes
+  const stylesEntry = zip.file('xl/styles.xml')
+  if (stylesEntry && Number(stylesEntry._data?.uncompressedSize || 0) <= MAX_WORKBOOK_XML_BYTES) {
+    const styles = await stylesEntry.async('string')
+    if (Buffer.byteLength(styles) <= MAX_WORKBOOK_XML_BYTES) {
+      normalFont = normalFontFromStylesXml(styles)
+      const fonts = /<fonts\b[^>]*>([\s\S]*?)<\/fonts>/i.exec(styles)?.[1] || ''
+      fontSizes = [...fonts.matchAll(/<font\b(?:[^>]*\/>|[^>]*>[\s\S]*?<\/font>)/gi)].map(match => {
+        const attributes = /<sz\b([^>]*)>/i.exec(match[0])?.[1]
+        const size = Number(attributes ? parseXmlAttributes(attributes).val : NaN)
+        return Number.isFinite(size) && size > 0 && size <= 409 ? size : undefined
+      })
+    }
+  }
+  return { xml: data.toString('utf8'), partNames, themeColors, normalFont, fontSizes }
+}
+
+function normalFontFromStylesXml(xml) {
+  // Column widths use the built-in Normal style's font, not the first cell font.
+  const section = (name) => new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i').exec(xml)?.[1] || ''
+  const styles = [...section('cellStyles').matchAll(/<cellStyle\b([^>]*)\/?\s*>/gi)]
+  const normal = styles.map(match => parseXmlAttributes(match[1])).find(style => style.builtinId === '0')
+  if (!normal || !/^\d+$/.test(normal.xfId || '')) return undefined
+  const xfs = [...section('cellStyleXfs').matchAll(/<xf\b([^>]*)>/gi)]
+  const xf = xfs[Number(normal.xfId)]
+  if (!xf) return undefined
+  const fontIndex = Number(parseXmlAttributes(xf[1]).fontId)
+  const fonts = [...section('fonts').matchAll(/<font\b[^>]*>([\s\S]*?)<\/font>/gi)]
+  const font = fonts[fontIndex]?.[1]
+  if (!font) return undefined
+  const value = (tag) => { const attributes = new RegExp(`<${tag}\\b([^>]*)>`, 'i').exec(font)?.[1]; return attributes ? parseXmlAttributes(attributes).val : undefined }
+  const name = value('name'), size = Number(value('sz'))
+  if (!name || !Number.isFinite(size) || size <= 0 || size > 409) return undefined
+  const flag = tag => new RegExp(`<${tag}(?:\\s|/|>)`, 'i').test(font) && !['0', 'false'].includes(value(tag))
+  return { name, size, ...(flag('b') ? { bold: true } : {}), ...(flag('i') ? { italic: true } : {}) }
 }
 
 async function extractOoxmlWorkbookMetadata(buffer, warnings) {
   try {
     const packageMetadata = await workbookXmlFromOoxml(buffer)
     if (!packageMetadata) return {}
-    const { xml, partNames } = packageMetadata
+    const { xml, partNames, themeColors, normalFont, fontSizes } = packageMetadata
     const advancedPackageParts = []
+    // Charts on worksheets are modelled and round-tripped by chart-xlsx.cjs (charts
+    // it cannot draw are warned about there and kept byte-for-byte), so only
+    // chart sheets remain an unmodelled part.
     const advancedPartMatchers = [
-      [/^xl\/charts\//i, 'charts'],
       [/^xl\/chartsheets\//i, 'chart sheets'],
       [/^xl\/pivot/i, 'pivot tables or caches'],
       [/^xl\/slicer/i, 'slicers'],
@@ -677,7 +807,15 @@ async function extractOoxmlWorkbookMetadata(buffer, warnings) {
       definedNames.push(item)
     }
     if (namesTruncated) warnings.push('Some defined names exceeded the metadata safety limit and require the original package for preservation.')
-    return { calcProperties, workbookProperties, workbookViews, definedNames, advancedPackageParts }
+    const metadata = { calcProperties, workbookProperties, workbookViews, definedNames, advancedPackageParts }
+    // Charts: only open drawing parts again when the package has any (chart-xlsx.cjs).
+    if (partNames.some((partName) => /^xl\/drawings\/[^/]+\.xml$/i.test(partName))) metadata.hasDrawingParts = true
+    // Pivot definitions: only scan custom XML parts when the package has any (pivot-xlsx.cjs).
+    if (partNames.some((partName) => /^customXml\/item\d+\.xml$/i.test(partName))) metadata.hasCustomXmlParts = true
+    if (themeColors) metadata.themeColors = themeColors
+    if (normalFont) metadata.normalFont = normalFont
+    if (fontSizes) metadata.fontSizes = fontSizes
+    return metadata
   } catch (error) {
     warnings.push(`Some OOXML workbook-level metadata could not be inspected (${error.message || 'invalid metadata'}).`)
     return {}
@@ -733,10 +871,19 @@ function excelJSCellToModel(cell, date1904 = false) {
   } else if (rawValue && typeof rawValue === 'object' && rawValue.hyperlink) {
     modelCell.value = serializeCellValue(rawValue.text != null ? rawValue.text : cell.text, date1904)
   } else {
-    modelCell.value = serializeCellValue(rawValue, date1904)
-    if (rawValue instanceof Date) modelCell.type = 'date'
-    else if (rawValue && typeof rawValue === 'object' && rawValue.error != null) modelCell.type = 'error'
-    else if (rawValue && typeof rawValue === 'object' && Array.isArray(rawValue.richText)) modelCell.type = 'richText'
+    const serialized = serializeCellValue(rawValue, date1904)
+    if (serialized && typeof serialized === 'object' && serialized.type === 'richText') {
+      // The model's value is a scalar by contract, so rich text lands as its plain text and
+      // the run formatting travels beside it; the writer re-attaches the runs only while the
+      // text still matches, so an edited cell keeps the user's words instead of stale runs.
+      modelCell.value = richTextToPlainText(serialized)
+      modelCell.richText = plainClone(serialized.runs)
+      modelCell.type = 'richText'
+    } else {
+      modelCell.value = serialized
+      if (rawValue instanceof Date) modelCell.type = 'date'
+      else if (rawValue && typeof rawValue === 'object' && rawValue.error != null) modelCell.type = 'error'
+    }
   }
 
   const cellText = cell.text == null ? '' : String(cell.text)
@@ -744,7 +891,8 @@ function excelJSCellToModel(cell, date1904 = false) {
   modelCell.display = cellText === '[object Object]' && plainResult != null ? String(plainResult) : cellText
   const style = normalizeStyle(cell.style)
   if (style) modelCell.style = style
-  if (typeof cell.numFmt === 'string' && cell.numFmt && cell.numFmt !== 'General') modelCell.numFmt = cell.numFmt
+  const numFmt = normalizeNumberFormat(cell.numFmt)
+  if (numFmt) modelCell.numFmt = numFmt
   const hyperlink = normalizeHyperlink(rawValue && rawValue.hyperlink ? rawValue : cell.hyperlink)
   if (hyperlink) {
     modelCell.hyperlink = hyperlink.target
@@ -818,9 +966,8 @@ function excelJSSheetToModel(worksheet, index, stats, warnings, date1904 = false
       if (column.collapsed === true) properties.collapsed = true
       const style = normalizeStyle(column.style)
       if (style) properties.style = style
-      if (column.style && typeof column.style.numFmt === 'string' && column.style.numFmt !== 'General') {
-        properties.numFmt = column.style.numFmt
-      }
+      const columnNumFmt = column.style && normalizeNumberFormat(column.style.numFmt)
+      if (columnNumFmt) properties.numFmt = columnNumFmt
       if (Object.keys(properties).length) columnProperties[String(columnIndex + 1)] = properties
     }
   })
@@ -843,7 +990,8 @@ function excelJSSheetToModel(worksheet, index, stats, warnings, date1904 = false
     if (row.collapsed === true) properties.collapsed = true
     const style = normalizeStyle(row.style)
     if (style) properties.style = style
-    if (row.style && typeof row.style.numFmt === 'string' && row.style.numFmt !== 'General') properties.numFmt = row.style.numFmt
+    const rowNumFmt = row.style && normalizeNumberFormat(row.style.numFmt)
+    if (rowNumFmt) properties.numFmt = rowNumFmt
     if (Object.keys(properties).length) rowProperties[String(row.number)] = properties
   }
 
@@ -876,7 +1024,7 @@ function excelJSSheetToModel(worksheet, index, stats, warnings, date1904 = false
     frozen: extractFrozenView(worksheet.views),
     views: plainClone(worksheet.views || []),
     properties: plainClone(worksheet.properties || {}),
-    pageSetup: plainClone(worksheet.pageSetup || {}),
+    pageSetup: { showGridLines: false, showRowColHeaders: false, ...plainClone(worksheet.pageSetup || {}) },
     headerFooter: plainClone(worksheet.headerFooter || {}),
     rowBreaks: plainClone(worksheet.rowBreaks || []),
   }
@@ -898,13 +1046,16 @@ function excelJSSheetToModel(worksheet, index, stats, warnings, date1904 = false
     warnings.push(`Sheet "${worksheet.name}" has extensive conditional formatting; the original OOXML package is required to retain every rule.`)
   }
 
+  // Data validation and conditional formatting are modelled, edited, and written back, so
+  // they no longer need a compatibility note; only features the editor cannot author do.
   const advanced = []
-  if (worksheet.dataValidations && worksheet.dataValidations.model && Object.keys(worksheet.dataValidations.model).length) {
-    advanced.push('data validation')
-  }
-  if (conditionalFormattings.length) advanced.push('conditional formatting')
-  if (worksheet.tables && Object.keys(worksheet.tables).length) advanced.push('tables')
-  if (typeof worksheet.getImages === 'function' && worksheet.getImages().length) advanced.push('images')
+  // Tables are modelled (structured references, styles, totals) and written back.
+  model.tables = tablesFromWorksheet(worksheet)
+  // Pictures are modelled (shown, moved, resized, inserted, deleted) unless the workbook's
+  // pictures are too large to hold in the editor; then the package keeps them untouched.
+  const images = imagesFromWorksheet(worksheet, model)
+  if (images && images.length) model.images = images
+  else if (images === null) advanced.push('images')
   if (advanced.length) {
     model.requiresSourcePackage = advanced.slice()
     warnings.push(
@@ -940,10 +1091,29 @@ function activeSheetIndexFromExcelJS(workbook) {
   return Math.max(0, Math.min(index, Math.max(0, workbook.worksheets.length - 1)))
 }
 
+async function loadExcelJSWithExactFonts(workbook, buffer, metadata) {
+  const sizes = metadata?.fontSizes
+  const loader = workbook.xlsx
+  if (!sizes?.some(size => Number.isFinite(size) && !Number.isInteger(size))) return loader.load(buffer)
+  // ExcelJS4.4 parses <sz> with IntegerXform. Restore the bounded OOXML font
+  // table by ID before reconciliation shares those font objects with cells,
+  // rows and columns. This adapter affects only this workbook/load, never the
+  // dependency's global parser or another concurrent import.
+  const reconcile = loader.reconcile
+  loader.reconcile = function (model, ...args) {
+    const fonts = model.styles?.model?.fonts
+    if (!Array.isArray(fonts) || fonts.length !== sizes.length) throw new Error('The workbook font table could not be matched safely.')
+    sizes.forEach((size, index) => { if (Number.isFinite(size) && fonts[index]) fonts[index].size = size })
+    return reconcile.call(this, model, ...args)
+  }
+  try { return await loader.load(buffer) }
+  finally { loader.reconcile = reconcile }
+}
+
 async function importWithExcelJS(buffer, sourceName, warnings) {
   const ooxmlMetadata = await extractOoxmlWorkbookMetadata(buffer, warnings)
   const excelWorkbook = new ExcelJS.Workbook()
-  await excelWorkbook.xlsx.load(buffer)
+  await loadExcelJSWithExactFonts(excelWorkbook, buffer, ooxmlMetadata)
   const stats = initialStats(buffer.length)
   const sourceDate1904 = Boolean(excelWorkbook.properties && excelWorkbook.properties.date1904)
   // The renderer and output model use one canonical 1900-based serial system.
@@ -951,6 +1121,27 @@ async function importWithExcelJS(buffer, sourceName, warnings) {
   // converting those objects to the canonical epoch avoids four-year shifts.
   const sheets = excelWorkbook.worksheets.map((worksheet, index) => excelJSSheetToModel(worksheet, index, stats, warnings, false))
   if (!sheets.length) sheets.push(blankSheetModel())
+  // Charts: ExcelJS ignores DrawingML charts; read them into sheet.charts.
+  if (ooxmlMetadata.hasDrawingParts) {
+    try {
+      await importChartsIntoSheets(buffer, sheets, warnings, ooxmlMetadata.themeColors)
+    } catch (error) {
+      warnings.push(`Charts in this workbook could not be read (${error.message || 'invalid drawing parts'}); they will not be kept when saving.`)
+    }
+  }
+  // Excel sparkline groups live in the worksheet extLst, which ExcelJS does not read.
+  try {
+    await importSparklineGroups(buffer, sheets, ooxmlMetadata.themeColors)
+  } catch {
+    // Sparklines are optional; the cells still open.
+  }
+  if (ooxmlMetadata.hasCustomXmlParts) {
+    try {
+      await importPivotDefinitions(buffer, sheets, warnings)
+    } catch {
+      // Pivot definitions are optional; their last results stay as plain cells.
+    }
+  }
   stats.sheetCount = sheets.length
   stats.sheets = sheets.length
   const activeIndex = activeSheetIndexFromExcelJS(excelWorkbook)
@@ -960,6 +1151,18 @@ async function importWithExcelJS(buffer, sourceName, warnings) {
   const definedNames = attachDefinedNameSheetIds(Array.isArray(ooxmlMetadata.definedNames) && ooxmlMetadata.definedNames.length
     ? ooxmlMetadata.definedNames
     : definedNamesFromExcelJS(excelWorkbook), sheets)
+  // ExcelJS reads only the first range in a multi-area Print_Area name.
+  // Restore every explicit cell range from the original OOXML metadata.
+  const printAreasBySheet = new Map()
+  for (const item of definedNames) {
+    if (item.name !== '_xlnm.Print_Area' || !Number.isInteger(item.localSheetIndex)) continue
+    const areas = [...String(item.ref || (item.ranges || []).join(',')).matchAll(/!\s*(\$?[A-Z]+\$?\d+:\$?[A-Z]+\$?\d+)(?=\s*(?:,|$))/gi)]
+      .map(match => normalizeRange(match[1])).filter(Boolean)
+    if (areas.length) printAreasBySheet.set(item.localSheetIndex, [...(printAreasBySheet.get(item.localSheetIndex) || []), ...areas])
+  }
+  for (const [index, areas] of printAreasBySheet) {
+    if (sheets[index]) sheets[index].pageSetup = { ...sheets[index].pageSetup, printArea: [...new Set(areas)].join('&&') }
+  }
   const workbookViews = Array.isArray(ooxmlMetadata.workbookViews) && ooxmlMetadata.workbookViews.length
     ? ooxmlMetadata.workbookViews
     : plainClone(excelWorkbook.views || [])
@@ -980,6 +1183,10 @@ async function importWithExcelJS(buffer, sourceName, warnings) {
         calcProperties: plainClone(ooxmlMetadata.calcProperties || excelWorkbook.calcProperties || {}),
         workbookViews,
         advancedPackageParts: plainClone(ooxmlMetadata.advancedPackageParts || []),
+        // The workbook's own clrScheme, in OOXML theme-index order, so styles that address a
+        // colour by theme index resolve against this file's palette rather than a default one.
+        ...(ooxmlMetadata.themeColors ? { themeColors: plainClone(ooxmlMetadata.themeColors) } : {}),
+        ...(ooxmlMetadata.normalFont ? { normalFont: plainClone(ooxmlMetadata.normalFont) } : {}),
         definedNames: definedNames.map((item) => ({
           name: item.name,
           ranges: (item.ranges || []).join(','),
@@ -1191,6 +1398,12 @@ function sheetJSSheetToModel(workbook, sheetName, index, stats, warnings, source
   const hiddenRows = []
   const rowProperties = {}
   let rowMetadataMax = 0
+  for (const [row, height] of Object.entries(legacySheet?.rowHeights || {})) {
+    if (Number(row) >= 1 && Number(row) <= MAX_METADATA_ROWS && Number.isFinite(height) && height > 0) {
+      rowHeights[row] = height
+      rowMetadataMax = Math.max(rowMetadataMax, Number(row))
+    }
+  }
   ;(Array.isArray(sheet['!rows']) ? sheet['!rows'] : []).forEach((row, rowIndex) => {
     if (!row) return
     const height = Number.isFinite(row.hpt) ? row.hpt : Number.isFinite(row.hpx) ? row.hpx * 0.75 : undefined
@@ -1238,9 +1451,16 @@ function sheetJSSheetToModel(workbook, sheetName, index, stats, warnings, source
     columnProperties,
     rowProperties,
     frozen: null,
+    ...(legacySheet?.properties ? { properties: plainClone(legacySheet.properties) } : {}),
+    ...(isLegacyHiddenTail ? { properties: { ...plainClone(legacySheet?.properties || {}), legacyHiddenColumnTail: { start: hiddenTailStart, end: 256 } } } : {}),
   }
   if (sheet['!autofilter']) model.autoFilter = plainClone(sheet['!autofilter'])
-  if (sheet['!margins']) model.pageSetup = { margins: plainClone(sheet['!margins']) }
+  if (legacySheet?.pageSetup) model.pageSetup = plainClone(legacySheet.pageSetup)
+  if (sheet['!margins']) model.pageSetup = { ...model.pageSetup, margins: plainClone(sheet['!margins']) }
+  if (legacySheet?.headerFooter) model.headerFooter = plainClone(legacySheet.headerFooter)
+  const printName = (workbook.Workbook?.Names || []).find((name) => name.Name === '_xlnm.Print_Area' && name.Sheet === index)
+  const printArea = printName?.Ref && normalizeRange(String(printName.Ref).split('!').pop())
+  if (printArea) model.pageSetup = { ...model.pageSetup, printArea }
   if (sheet['!protect']) model.sheetProtection = plainClone(sheet['!protect'])
   if (sheet['!outline']) model.outline = plainClone(sheet['!outline'])
   return model
@@ -1285,7 +1505,9 @@ function blankSheetModel() {
 
 function compatibilityWarnings(format) {
   const warnings = []
-  if (format !== MODERN_FORMAT && RICH_OOXML_FORMATS.has(format)) {
+  if (format === 'xls') {
+    warnings.push('Save keeps .xls and creates an original backup. Macros and some advanced Excel features may change after editing.')
+  } else if (format !== MODERN_FORMAT && RICH_OOXML_FORMATS.has(format)) {
     warnings.push(`Opened ${format.toUpperCase()} as an OOXML workbook. Save as XLSX for modern interchange.`)
   } else if (format !== MODERN_FORMAT) {
     warnings.push(`Opened ${format.toUpperCase()} through the compatibility importer. Save as XLSX for the best interchange fidelity.`)
@@ -1649,6 +1871,7 @@ function importWithSheetJS(buffer, sourceName, sourceFormat, warnings) {
   }
 
   const stats = initialStats(buffer.length)
+  if (sheetWorkbook.vbaraw) warnings.push('This workbook contains VBA macros. Macros are not represented in the editor and will be omitted from an edited save.')
   const rawDate1904 = sheetWorkbook.Workbook && sheetWorkbook.Workbook.WBProps && sheetWorkbook.Workbook.WBProps.date1904
   const sourceDate1904 = rawDate1904 === true || rawDate1904 === 1 || rawDate1904 === '1' || rawDate1904 === 'true'
   const sheetNames = Array.isArray(sheetWorkbook.SheetNames) && sheetWorkbook.SheetNames.length ? sheetWorkbook.SheetNames : ['Sheet1']
@@ -1673,6 +1896,9 @@ function importWithSheetJS(buffer, sourceName, sourceFormat, warnings) {
   stats.sheetCount = sheets.length
   stats.sheets = sheets.length
   const activeIndex = activeSheetIndexFromSheetJS(sheetWorkbook, sheets.length)
+  if (sheets.some(sheet => Object.values(sheet.headerFooter || {}).some(value => typeof value === 'string' && /&G/i.test(value)))) {
+    warnings.push('This file has header images. They may not appear in print previews or edited copies. An unchanged save preserves the original file.')
+  }
   const properties = workbookPropertiesFromSheetJS(sheetWorkbook)
   const definedNames = attachDefinedNameSheetIds(definedNamesFromSheetJS(sheetWorkbook), sheets)
   return {
@@ -1684,6 +1910,7 @@ function importWithSheetJS(buffer, sourceName, sourceFormat, warnings) {
       definedNames,
       metadata: {
         importedWith: 'sheetjs',
+        ...(legacyStyles?.normalFont ? { normalFont: normalizeFont(legacyStyles.normalFont) } : {}),
         ...(legacyStyles ? { legacyStyles: { fonts: legacyStyles.fontCount, xfs: legacyStyles.xfCount } } : {}),
         ...properties,
         properties,
@@ -1705,7 +1932,7 @@ function importWithSheetJS(buffer, sourceName, sourceFormat, warnings) {
 
 function finalizePayload(sourceName, sourceFormat, imported, warnings) {
   const safeName = path.basename(sourceName) || `Workbook.${sourceFormat}`
-  const requiresSaveAs = sourceFormat !== MODERN_FORMAT
+  const requiresSaveAs = !['xlsx', 'xls', 'ods', 'csv', 'tsv'].includes(sourceFormat)
   const uniqueWarnings = [...new Set(warnings.filter(Boolean))]
   imported.model.metadata = {
     ...(imported.model.metadata || {}),
@@ -1751,7 +1978,15 @@ async function workbookPayloadFromBytes(name, data) {
     ((buffer[2] === 0x03 && buffer[3] === 0x04) ||
       (buffer[2] === 0x05 && buffer[3] === 0x06) ||
       (buffer[2] === 0x07 && buffer[3] === 0x08))
-  if (RICH_OOXML_FORMATS.has(sourceFormat) && hasZipSignature) {
+  if (sourceFormat === 'ods' && hasZipSignature) {
+    // The compatibility ODS reader drops styles/hidden sheets and leaves XML
+    // entities in sheet names. Use the isolated Office engine for a rich model.
+    const { convertOfficeBytes } = require('./office-converter.cjs')
+    const converted = await convertOfficeBytes({ bytes: buffer, inputExtension: 'ods', outputExtension: 'xlsx', filter: 'Calc MS Excel 2007 XML' })
+    imported = await importWithExcelJS(converted, sourceName, warnings)
+    imported.model.metadata.importedWith = 'office-ods'
+    warnings.push('Save keeps .ods and creates an original backup. Some advanced spreadsheet features may change after editing.')
+  } else if (RICH_OOXML_FORMATS.has(sourceFormat) && hasZipSignature) {
     try {
       imported = await importWithExcelJS(buffer, sourceName, warnings)
     } catch (excelError) {
@@ -1916,6 +2151,10 @@ function setExcelJSCell(cell, modelCell) {
     cell.value = formulaValue
   } else {
     let value = deserializeCellValue(modelCell ? modelCell.value : null)
+    const runs = modelCell && Array.isArray(modelCell.richText) ? modelCell.richText : null
+    if (runs && typeof value === 'string' && runs.map((run) => String(run && run.text != null ? run.text : '')).join('') === value) {
+      value = deserializeCellValue({ type: 'richText', runs })
+    }
     const hyperlink = normalizeHyperlink(modelCell && modelCell.hyperlink)
     if (modelCell && modelCell.type === 'error') value = { error: String(modelCell.value || '#VALUE!') }
     if (hyperlink) {
@@ -2027,6 +2266,9 @@ function applyExcelJSSheetMetadata(worksheet, sheet, preserveBase) {
   if (sheet.properties && typeof sheet.properties === 'object') {
     const properties = hydratePlainClone(sheet.properties)
     worksheet.properties = { ...(worksheet.properties || {}), ...properties }
+    // The model is authoritative for the tab colour: a removed colour must not survive
+    // from the source package.
+    if (properties.tabColor == null) delete worksheet.properties.tabColor
     if (properties.outlineProperties) {
       worksheet.properties.outlineProperties = {
         ...((worksheet.properties && worksheet.properties.outlineProperties) || {}),
@@ -2047,6 +2289,10 @@ function applyExcelJSSheetMetadata(worksheet, sheet, preserveBase) {
   if (sheet.pageSetup && typeof sheet.pageSetup === 'object') {
     const pageSetup = hydratePlainClone(sheet.pageSetup)
     worksheet.pageSetup = { ...(worksheet.pageSetup || {}), ...pageSetup }
+    // ExcelJS treats any firstPageNumber value as an instruction to restart.
+    // Its importer supplies 1 even when the source flag is false, so remove
+    // that dormant default before serializing an automatically numbered sheet.
+    if (pageSetup.useFirstPageNumber === false) delete worksheet.pageSetup.firstPageNumber
     if (pageSetup.margins) {
       worksheet.pageSetup.margins = { ...((worksheet.pageSetup && worksheet.pageSetup.margins) || {}), ...pageSetup.margins }
     }
@@ -2260,10 +2506,12 @@ function renderDefinedNamesBlock(model) {
     : model.metadata && Array.isArray(model.metadata.definedNames)
       ? model.metadata.definedNames
       : undefined
-  if (!source) return undefined
   const items = []
-  for (const item of source.slice(0, MAX_ADVANCED_METADATA_ENTRIES)) {
+  for (const item of (source || []).slice(0, MAX_ADVANCED_METADATA_ENTRIES)) {
     if (!item || typeof item.name !== 'string' || !item.name) continue
+    // Page setup is authoritative for these built-ins. Keeping imported names
+    // here would silently restore old print areas after a layout change.
+    if (item.name === '_xlnm.Print_Area' || item.name === '_xlnm.Print_Titles') continue
     const ranges = Array.isArray(item.ranges) ? item.ranges : typeof item.ranges === 'string' ? [item.ranges] : []
     const ref = typeof item.ref === 'string' && item.ref ? item.ref : ranges.filter((range) => typeof range === 'string').join(',')
     if (!ref || ref.length > 65_536) continue
@@ -2283,6 +2531,27 @@ function renderDefinedNamesBlock(model) {
     if (typeof item.comment === 'string' && item.comment) attributes.comment = item.comment
     items.push(`<definedName${renderXmlAttributes(attributes, DEFINED_NAME_ATTRIBUTE_KEYS)}>${encodeXmlText(xmlSafeString(ref))}</definedName>`)
   }
+  model.sheets.forEach((sheet, localSheetId) => {
+    const setup = sheet.pageSetup || {}
+    const prefix = `'${String(sheet.name).replace(/'/g, "''")}'!`
+    const add = (name, references) => {
+      if (references.length) items.push(`<definedName name="${name}" localSheetId="${localSheetId}">${encodeXmlText(references.join(','))}</definedName>`)
+    }
+    // ExcelJS emits $A1:$B2: some native readers consequently ignore the area.
+    // A print area is an absolute range, including both row and column anchors.
+    const areas = String(setup.printArea || '').split(/&&|,/).filter(Boolean).map(raw => {
+      const range = normalizeRange(raw)
+      if (!range) throw new Error(`The print area for ${sheet.name} is invalid. Choose a valid cell range before saving.`)
+      return prefix + range.replace(/([A-Z]+)(\d+)/g, '$$$1$$$2')
+    })
+    add('_xlnm.Print_Area', areas)
+    const titles = []
+    const rows = /^\$?(\d+):\$?(\d+)$/.exec(String(setup.printTitlesRow || ''))
+    const cols = /^\$?([A-Z]+):\$?([A-Z]+)$/i.exec(String(setup.printTitlesColumn || ''))
+    if (rows) titles.push(`${prefix}$${rows[1]}:$${rows[2]}`)
+    if (cols) titles.push(`${prefix}$${cols[1].toUpperCase()}:$${cols[2].toUpperCase()}`)
+    add('_xlnm.Print_Titles', titles)
+  })
   return items.length ? `<definedNames>${items.join('')}</definedNames>` : ''
 }
 
@@ -2412,9 +2681,40 @@ async function patchXlsxWorkbookMetadata(buffer, model, baseBuffer) {
   }
 
   zip.file('xl/workbook.xml', xml)
+  // Column widths are defined by the Normal style font, independently of each
+  // cell's font. Keep it separate from font0/cellXfs so explicitly styled
+  // Calibri cells do not change when a legacy template uses Arial as Normal.
+  const normalFont = normalizeFont(model.metadata?.normalFont)
+  const stylesEntry = zip.file('xl/styles.xml')
+  if (normalFont?.name && normalFont.size > 0 && stylesEntry) {
+    let styles = await stylesEntry.async('string')
+    const fontsMatch = /<fonts\b[^>]*>([\s\S]*?)<\/fonts>/.exec(styles)
+    const normalStyle = /<cellStyle\b[^>]*\bbuiltinId="0"[^>]*\/>/.exec(styles)
+    const normalIndex = normalStyle ? Number(parseXmlAttributes(normalStyle[0]).xfId || 0) : 0
+    if (fontsMatch && /<cellStyleXfs\b/.test(styles)) {
+      const fontCount = (fontsMatch[1].match(/<font\b/g) || []).length
+      const fontXml = `<font><name val="${encodeXmlAttribute(normalFont.name)}"/><sz val="${Number(normalFont.size)}"/>${normalFont.bold ? '<b/>' : ''}${normalFont.italic ? '<i/>' : ''}${normalFont.family ? `<family val="${Number(normalFont.family)}"/>` : ''}</font>`
+      styles = styles.replace(fontsMatch[0], `<fonts count="${fontCount + 1}">${fontsMatch[1]}${fontXml}</fonts>`)
+      styles = styles.replace(/(<cellStyleXfs\b[^>]*>)([\s\S]*?)(<\/cellStyleXfs>)/, (_all, open, content, close) => {
+        let index = 0
+        const patched = content.replace(/<xf\b[^>]*>/g, (tag) => {
+          if (index++ !== normalIndex) return tag
+          return /\bfontId="[^"]*"/.test(tag) ? tag.replace(/\bfontId="[^"]*"/, `fontId="${fontCount}"`) : tag.replace(/\/?\s*>$/, ` fontId="${fontCount}"/>`)
+        })
+        return open + patched + close
+      })
+      zip.file('xl/styles.xml', styles)
+    }
+  }
   const customProperties = model.metadata && model.metadata.properties && model.metadata.properties.custom
   const customXml = (await customPropertiesXmlFromBase(baseBuffer)) || renderCustomPropertiesXml(customProperties)
   await addCustomPropertiesPart(zip, customXml)
+  // Charts: ExcelJS drops them, so write every model chart (drawing, chart parts,
+  // rels, content types) into the package it produced; unmodified imported charts
+  // are copied byte-for-byte from the source package.
+  await writeChartsToPackage(zip, model, baseBuffer)
+  await writePivotPackage(zip, model)
+  await writeSparklinesToPackage(zip, model)
   return Buffer.from(
     await zip.generateAsync({
       type: 'nodebuffer',
@@ -2474,6 +2774,9 @@ function writeModelSheetToExcelJS(worksheet, sheet, preserveBase) {
   worksheet.state = sheet.state === 'hidden' || sheet.state === 'veryHidden' ? sheet.state : 'visible'
   applyExcelJSSheetMetadata(worksheet, sheet, preserveBase)
   applyExcelJSSheetDimensions(worksheet, sheet)
+  applyOutlineToWorksheet(worksheet, sheet)
+  applyTablesToWorksheet(worksheet, sheet.tables)
+  applyImagesToWorksheet(worksheet, sheet, preserveBase)
 
   const entries = Object.entries(sheet.cells || {}).sort((left, right) => {
     const a = addressPosition(left[0])
@@ -2509,7 +2812,7 @@ async function excelJSWorkbookForSerialization(options) {
   const baseBuffer = bytesToBuffer(options.baseBytes)
   const excelWorkbook = new ExcelJS.Workbook()
   try {
-    await excelWorkbook.xlsx.load(baseBuffer)
+    await loadExcelJSWithExactFonts(excelWorkbook, baseBuffer, await workbookXmlFromOoxml(baseBuffer))
   } catch (error) {
     const wrapped = new Error(`Unable to use the source workbook for fidelity-preserving save: ${error.message || 'invalid OOXML package'}`)
     wrapped.code = 'BASE_WORKBOOK_LOAD_FAILED'
@@ -2628,6 +2931,14 @@ function modelCellToSheetJS(modelCell, targetFormat) {
   }
   const comments = noteToSheetJS(modelCell && modelCell.note)
   if (comments) cell.c = comments
+  // The SheetJS ODS writer emits an empty cell for the blank type, taking any formula,
+  // note or link attached to it along.  Workbooks written without cached results — and
+  // every formula the live engine evaluates to blank — land here, so give those cells an
+  // empty string body that the writer can carry.
+  if (targetFormat === 'ods' && cell.t === 'z' && (cell.f || cell.c || cell.l)) {
+    cell.t = 's'
+    cell.v = String((modelCell && modelCell.display) || '')
+  }
   return cell
 }
 
@@ -2811,8 +3122,8 @@ function normalizeOutputFormat(format) {
   const normalized = format.trim().toLowerCase().replace(/^\./, '')
   if (normalized === 'tab') return 'tsv'
   if (normalized === 'fods') return 'ods'
-  if (!['xlsx', 'csv', 'tsv', 'txt', 'ods'].includes(normalized)) {
-    throw new Error(`Cannot save ${normalized.toUpperCase()} directly. Save as XLSX, ODS, CSV, or TSV.`)
+  if (!['xlsx', 'xls', 'csv', 'tsv', 'txt', 'ods'].includes(normalized)) {
+    throw new Error(`Cannot save ${normalized.toUpperCase()} directly. Save as XLSX, XLS, ODS, CSV, or TSV.`)
   }
   return normalized
 }
@@ -2823,18 +3134,57 @@ async function serializeWorkbook(input, format = MODERN_FORMAT, options = {}) {
   if (options == null) options = {}
   if (typeof options !== 'object' || Array.isArray(options)) throw new TypeError('Workbook serialization options must be an object.')
   if (normalizedFormat === 'xlsx') return serializeXlsx(model, options)
+  if (normalizedFormat === 'ods') {
+    // SheetJS CE's ODS writer omits rich styles and hidden-sheet state. A real
+    // ODF conversion keeps them and quoted sheet names attached to formulas.
+    const { convertOfficeBytes } = require('./office-converter.cjs')
+    const intermediate = await serializeXlsx(model, { ...options, baseBytes: null })
+    const output = await convertOfficeBytes({ bytes: intermediate, inputExtension: 'xlsx', outputExtension: 'ods', filter: 'calc8' })
+    const archive = await JSZip.loadAsync(output)
+    if (await archive.file('mimetype')?.async('string') !== 'application/vnd.oasis.opendocument.spreadsheet') throw new Error('The conversion did not produce a valid ODS workbook. The original file is unchanged.')
+    const content = archive.file('content.xml')
+    if (!content || Number(content._data?.uncompressedSize || 0) > MAX_SOURCE_BYTES) throw new Error('The ODS workbook content is missing or too large.')
+    const names = [...(await content.async('string')).matchAll(/<table:table(?=\s|>)([^>]*)>/g)].map(match => parseXmlAttributes(match[1])['table:name'])
+    if (names.length !== model.sheets.length || names.some((name,index) => name !== model.sheets[index].name)) throw new Error('The ODS conversion changed worksheet names or order. Save as XLSX to retain the workbook.')
+    return output
+  }
+  if (normalizedFormat === 'xls') {
+    for (const sheet of model.sheets) {
+      for (const address of Object.keys(sheet.cells || {})) {
+        const position = addressPosition(address)
+        if (position && (position.row > 65_536 || position.col > 256)) throw new Error(`XLS supports at most 65,536 rows and 256 columns. Cell ${address} in "${sheet.name}" is outside those limits. Save as XLSX to keep all cells.`)
+      }
+      for (const merge of sheet.merges || []) {
+        const range = XLSX.utils.decode_range(merge)
+        if (range.e.r >= 65_536 || range.e.c >= 256) throw new Error('A merged range exceeds the XLS limits. Save as XLSX to keep the entire worksheet.')
+      }
+    }
+    const { convertOfficeBytes } = require('./office-converter.cjs')
+    const intermediate = await serializeXlsx(model, { ...options, baseBytes: null })
+    const convertedOutput = await convertOfficeBytes({ bytes: intermediate, inputExtension: 'xlsx', outputExtension: 'xls', filter: 'MS Excel 97' })
+    const output = require('./legacy-layout-patch.cjs').retainLegacyLayout(convertedOutput, model)
+    if (!output.subarray(0, 8).equals(CFB_SIGNATURE)) throw new Error('The Office engine did not produce a valid XLS workbook. The original file has not been changed.')
+    const reopened = XLSX.read(output, { type: 'buffer', cellFormula: true })
+    if (reopened.SheetNames.length !== model.sheets.length) throw new Error('The XLS conversion changed the number of worksheets. Save as XLSX to keep the entire workbook.')
+    for (const sheet of model.sheets) {
+      const convertedSheet = reopened.Sheets[sheet.name]
+      if (!convertedSheet) throw new Error(`The XLS conversion omitted worksheet "${sheet.name}". Save as XLSX to keep it.`)
+      for (const [address, cell] of Object.entries(sheet.cells || {})) {
+        const converted = convertedSheet[address]
+        const value = cell.value
+        const invalidFormula = cell.formula && !converted?.f
+        const invalidScalar = !cell.formula && value != null && value !== '' &&
+          (cell.type === 'error' ? converted?.t !== 'e' || sheetJSErrorValue(converted) !== value
+            : typeof value === 'number' ? typeof converted?.v !== 'number' || Math.abs(converted.v - value) > Math.max(1, Math.abs(value)) * 1e-12 : converted?.v !== value)
+        if (invalidFormula || invalidScalar) throw new Error(`The XLS conversion could not retain cell ${address} in "${sheet.name}". Save as XLSX to keep all values and formulas.`)
+      }
+    }
+    return output
+  }
 
   const sheetWorkbook = workbookToSheetJS(model, normalizedFormat)
   let result
-  if (normalizedFormat === 'ods') {
-    result = XLSX.write(sheetWorkbook, {
-      type: 'buffer',
-      bookType: 'ods',
-      cellStyles: true,
-      bookSST: true,
-      compression: true,
-    })
-  } else {
+  {
     const activeSheet = model.sheets.find((sheet) => sheet.id === model.activeSheetId) || model.sheets[0]
     result = XLSX.write(sheetWorkbook, {
       type: 'buffer',

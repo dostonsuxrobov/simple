@@ -24,6 +24,7 @@
           <p class="lede">Open documents, spreadsheets, PDFs, images, videos, and text with one portable app. The file extension picks the right workspace automatically.</p>
           <div class="hero-actions">
             <button id="open" class="primary">Choose files</button>
+            <button id="combine" class="secondary">Combine files</button>
             <span>or drop them anywhere</span>
           </div>
         </div>
@@ -34,8 +35,8 @@
         <button class="workspace-card" data-mode="docs">
           <span class="card-index">01</span>
           <strong>Documents</strong>
-          <small>DOCX editing, PDF export, print</small>
-          <span class="formats">DOCX</span>
+          <small>DOCX editing, legacy DOC import, PDF export, print</small>
+          <span class="formats">DOCX · DOC</span>
         </button>
         <button class="workspace-card" data-mode="calc">
           <span class="card-index">02</span>
@@ -47,7 +48,7 @@
           <span class="card-index">03</span>
           <strong>PDF & text</strong>
           <small>Read, annotate, edit, and convert</small>
-          <span class="formats">PDF · TXT · MD · DOC</span>
+          <span class="formats">PDF · TXT · MD</span>
         </button>
         <button class="workspace-card" data-mode="image">
           <span class="card-index">04</span>
@@ -79,6 +80,16 @@
       <div id="drop-overlay" hidden><img src="../build/icon.png" alt="" /><strong>Open with simple</strong><span>Release to route each file</span></div>
       <div id="status" role="status" aria-live="polite"></div>
     </main>
+
+    <dialog id="combine-dialog" aria-labelledby="combine-title">
+      <div class="combine-header"><div><h2 id="combine-title">Combine files</h2><p>Arrange PDFs, Word documents, spreadsheets, and photos into one PDF.</p></div><button id="combine-close" class="text-button" aria-label="Close combine files">×</button></div>
+      <div class="combine-list-head"><span>File order</span><span>Pages to include</span></div>
+      <ol id="combine-list"></ol>
+      <p id="combine-empty">Add files or drop them here to begin.</p>
+      <p class="combine-hint">Leave pages blank for all pages, or enter a range such as 1-3, 5. Spreadsheets use their saved print layout. Preview opens the source file.</p>
+      <p id="combine-message" role="status" aria-live="polite"></p>
+      <div class="combine-footer"><button id="combine-add" class="secondary">Add files</button><span id="combine-count">0 files</span><button id="combine-save" class="primary" disabled>Save combined PDF</button></div>
+    </dialog>
 
     <script src="./renderer.js"></script>
   </body>

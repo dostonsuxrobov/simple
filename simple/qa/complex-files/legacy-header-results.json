@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "sourceSha256": "0b7c348b35dc5624ae134c09043708b85b980648c89bfda587522f4f9c0c8787",
+  "sourceBytes": 372224,
+  "changedBytes": 91,
+  "recordChanges": [
+    {
+      "type": 20,
+      "offset": 356991,
+      "length": 96
+    }
+  ],
+  "pages": 1,
+  "retainedTextItems": 22,
+  "bodyAndTitleTextMetricsUnchanged": true,
+  "sourceAndOtherStreamsUnchanged": true,
+  "adapterMilliseconds": 1.5334000000000003
+}

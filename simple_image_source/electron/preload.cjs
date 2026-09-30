@@ -11,12 +11,14 @@ ipcRenderer.on('file:open-external', (_event, filePath) => {
 contextBridge.exposeInMainWorld('simpleImage', {
   openFile: () => ipcRenderer.invoke('file:open-dialog'),
   openPath: (filePath) => ipcRenderer.invoke('file:open-path', filePath),
+  listSiblings: (filePath) => ipcRenderer.invoke('file:list-siblings', filePath),
   openBytes: (name, data) => ipcRenderer.invoke('file:open-bytes', { name, data }),
   openInNewWindow: (filePath) => ipcRenderer.invoke('file:open-in-new-window', filePath),
   newWindow: () => ipcRenderer.invoke('app:new-window'),
   saveImage: (input) => ipcRenderer.invoke('file:save', input),
   convertToPdf: (input) => ipcRenderer.invoke('image:convert-to-pdf', input),
   printImage: (input) => ipcRenderer.invoke('image:print', input),
+  copyPng: (data) => ipcRenderer.invoke('clipboard:write-png', data),
   getVersion: () => ipcRenderer.invoke('app:get-version'),
   pathForFile: (file) => {
     try { return webUtils.getPathForFile(file) || null } catch { return null }

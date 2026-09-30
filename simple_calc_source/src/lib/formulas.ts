@@ -63,9 +63,43 @@ export interface FormulaEvaluationHooks {
     bounds: FormulaRangeBounds,
     visit: (row: number, column: number) => void,
   ) => void;
-  resolveDefinedName?: (name: string) => FormulaPrimitive;
+  resolveDefinedName?: (name: string, sheetId?: string) => FormulaPrimitive;
   currentCell?: { row: number; column: number };
   isFormulaCell?: (sheetId: string, address: string) => boolean;
+  /**
+   * Called once per reference the formula reads: a single cell, a rectangle, or an
+   * unclamped whole column/row. Hosts use it to build a dependency graph.
+   */
+  trackRange?: (sheetId: string, bounds: FormulaRangeBounds) => void;
+  /** Called when a volatile function (NOW, RAND, OFFSET, INDIRECT, ...) is evaluated. */
+  markVolatile?: () => void;
+  /** Bounds of the array currently spilled from an anchor cell, or null. */
+  resolveSpill?: (sheetId: string, row: number, column: number) => FormulaRangeBounds | null;
+  /** Resolve an Excel table by name, or (name === null) the table containing the current cell. */
+  resolveTable?: (name: string | null, sheetId: string) => FormulaTableInfo | null;
+  /** Whether a row is manually hidden, for SUBTOTAL 101-111 and AGGREGATE. */
+  isRowHidden?: (sheetId: string, row: number) => boolean;
+  /** Whether a row is hidden by a filter; SUBTOTAL and AGGREGATE always skip these. */
+  isRowFiltered?: (sheetId: string, row: number) => boolean;
+  /** Formula text of a cell (without "="), for FORMULATEXT. */
+  getCellFormula?: (sheetId: string, address: string) => string | null;
+  /** Sheet names in workbook order, for SHEET/SHEETS and 3-D references. */
+  getSheetNames?: () => string[];
+  /** Resolve a sheet reference (id or name) to its display name. */
+  getSheetName?: (sheetId: string) => string | null;
+}
+
+/** One-based bounds of an Excel table and its column names. */
+export interface FormulaTableInfo {
+  sheetId: string;
+  name: string;
+  startRow: number;
+  endRow: number;
+  startColumn: number;
+  endColumn: number;
+  headerRowCount: number;
+  totalsRowCount: number;
+  columns: string[];
 }
 
 /** Public scalar result. Errors are returned as spreadsheet-style strings. */
@@ -79,16 +113,18 @@ export interface A1Address {
   columnAbsolute: boolean;
 }
 
-const MAX_EXCEL_ROW = 1_048_576;
-const MAX_EXCEL_COLUMN = 16_384;
-const MAX_RANGE_CELLS = 100_000;
+export const MAX_EXCEL_ROW = 1_048_576;
+export const MAX_EXCEL_COLUMN = 16_384;
+export const MAX_RANGE_CELLS = 100_000;
+/** Populated cells a sparse (very large) range may visit, e.g. SUM(A:Z) on a big sheet. */
+const MAX_SPARSE_CELLS = 2_000_000;
 const MAX_FORMULA_LENGTH = 100_000;
 const MAX_CALCULATION_DEPTH = 256;
-const MAX_TEXT_RESULT_LENGTH = 1_000_000;
-const MAX_WILDCARD_STEPS = 5_000_000;
-const MILLISECONDS_PER_DAY = 86_400_000;
-const EXCEL_EPOCH_UTC = Date.UTC(1899, 11, 30);
-const MAX_DATE_SERIAL = 2_958_465;
+export const MAX_TEXT_RESULT_LENGTH = 1_000_000;
+export const MAX_WILDCARD_STEPS = 5_000_000;
+export const MILLISECONDS_PER_DAY = 86_400_000;
+export const EXCEL_EPOCH_UTC = Date.UTC(1899, 11, 30);
+export const MAX_DATE_SERIAL = 2_958_465;
 const FALLBACK_USED_RANGE_ROWS = 10_000;
 const FALLBACK_USED_RANGE_COLUMNS = 256;
 
@@ -179,6 +215,8 @@ type TokenKind =
   | "string"
   | "identifier"
   | "cell"
+  | "spill"
+  | "structured"
   | "columnRange"
   | "rowRange"
   | "sheet"
@@ -198,7 +236,27 @@ interface Token {
   kind: TokenKind;
   text: string;
   value?: string | number;
+  /** Table name of a structured reference (`Table1[Column]`), "" when unqualified. */
+  table?: string;
   position: number;
+}
+
+/** Read a balanced `[...]` block starting at `start`; returns the index after the closing bracket. */
+function structuredBlockEnd(source: string, start: number): number | null {
+  let depth = 0;
+  for (let position = start; position < source.length; position += 1) {
+    const character = source[position];
+    if (character === "'") {
+      position += 1;
+      continue;
+    }
+    if (character === "[") depth += 1;
+    else if (character === "]") {
+      depth -= 1;
+      if (depth === 0) return position + 1;
+    }
+  }
+  return null;
 }
 
 class FormulaParseError extends Error {
@@ -325,21 +383,55 @@ function tokenize(source: string): Token[] {
       const looksLikeFunction =
         !cellMatch[0].includes("$") && nextNonWhitespace(source, end) === "(";
       if (isComplete && !looksLikeFunction) {
+        // `A1#` addresses the whole array spilled from A1.
+        if (following === "#" && !/^#[A-Za-z0-9/]+[!?]/.test(source.slice(end))) {
+          tokens.push({ kind: "spill", text: `${cellMatch[0]}#`, value: cellMatch[0], position });
+          position = end + 1;
+          continue;
+        }
         tokens.push({ kind: "cell", text: cellMatch[0], value: cellMatch[0], position });
         position = end;
         continue;
       }
     }
 
-    const identifierMatch = /^[A-Za-z_\\][A-Za-z0-9_.]*/.exec(source.slice(position));
+    const identifierMatch = /^[A-Za-z_\\À-￿][A-Za-z0-9_.?À-￿]*/.exec(source.slice(position));
     if (identifierMatch) {
+      const end = position + identifierMatch[0].length;
+      if (source[end] === "[") {
+        const blockEnd = structuredBlockEnd(source, end);
+        if (blockEnd === null) throw new FormulaParseError();
+        tokens.push({
+          kind: "structured",
+          text: source.slice(position, blockEnd),
+          value: source.slice(end, blockEnd),
+          table: identifierMatch[0],
+          position,
+        });
+        position = blockEnd;
+        continue;
+      }
       tokens.push({
         kind: "identifier",
         text: identifierMatch[0],
         value: identifierMatch[0],
         position,
       });
-      position += identifierMatch[0].length;
+      position = end;
+      continue;
+    }
+
+    if (character === "[") {
+      const blockEnd = structuredBlockEnd(source, position);
+      if (blockEnd === null) throw new FormulaParseError();
+      tokens.push({
+        kind: "structured",
+        text: source.slice(position, blockEnd),
+        value: source.slice(position, blockEnd),
+        table: "",
+        position,
+      });
+      position = blockEnd;
       continue;
     }
 
@@ -349,7 +441,7 @@ function tokenize(source: string): Token[] {
       position += 2;
       continue;
     }
-    if (["+", "-", "*", "/", "^", "&", "=", "<", ">", "%"].includes(character)) {
+    if (["+", "-", "*", "/", "^", "&", "=", "<", ">", "%", "@"].includes(character)) {
       tokens.push({ kind: "operator", text: character, position });
       position += 1;
       continue;
@@ -382,6 +474,13 @@ function tokenize(source: string): Token[] {
 interface LiteralNode {
   kind: "literal";
   value: number | string | boolean;
+}
+
+// Excel accepts an omitted argument (`IF(A1>5,1,)`) and treats the slot as the empty value,
+// which is what keeps VLOOKUP's range_lookup and MATCH's match_type at their exact-match
+// meaning rather than falling back to the sorted-search defaults.
+interface OmittedNode {
+  kind: "omitted";
 }
 
 interface ErrorNode {
@@ -423,7 +522,7 @@ interface NameNode {
 
 interface UnaryNode {
   kind: "unary";
-  operator: "+" | "-" | "%";
+  operator: "+" | "-" | "%" | "@";
   operand: FormulaNode;
 }
 
@@ -440,8 +539,37 @@ interface CallNode {
   arguments: FormulaNode[];
 }
 
-type FormulaNode =
+/** `A1#`: the dynamic array spilled from an anchor cell. */
+interface SpillNode {
+  kind: "spill";
+  sheet?: string;
+  address: A1Address;
+}
+
+/** `Table1[Column]`, `[@Column]`, `Table1[[#Headers],[A]:[C]]`. */
+interface StructuredNode {
+  kind: "structured";
+  table: string;
+  specifier: string;
+}
+
+/** A range whose corners are computed references, e.g. `A1:INDEX(A:A, n)`. */
+interface RangeOperatorNode {
+  kind: "rangeOp";
+  left: FormulaNode;
+  right: FormulaNode;
+}
+
+/** Calling a computed LAMBDA: `LAMBDA(x, x + 1)(2)`. */
+interface InvokeNode {
+  kind: "invoke";
+  callee: FormulaNode;
+  arguments: FormulaNode[];
+}
+
+export type FormulaNode =
   | LiteralNode
+  | OmittedNode
   | ErrorNode
   | ReferenceNode
   | RangeNode
@@ -450,7 +578,11 @@ type FormulaNode =
   | NameNode
   | UnaryNode
   | BinaryNode
-  | CallNode;
+  | CallNode
+  | SpillNode
+  | StructuredNode
+  | RangeOperatorNode
+  | InvokeNode;
 
 class FormulaParser {
   private position = 0;
@@ -528,6 +660,9 @@ class FormulaParser {
       const operator = this.advance().text as "+" | "-";
       return { kind: "unary", operator, operand: this.parseUnary() };
     }
+    if (this.match("operator", "@")) {
+      return { kind: "unary", operator: "@", operand: this.parseUnary() };
+    }
     return this.parsePower();
   }
 
@@ -559,20 +694,31 @@ class FormulaParser {
     }
 
     if (this.current.kind === "identifier" && this.next.kind === "leftParen") {
-      return this.parseCall();
+      return this.withRangeOperator(this.withInvocations(this.parseCall()));
     }
 
     if (this.current.kind === "leftBrace") {
       return this.parseArray();
     }
 
+    if (this.current.kind === "structured") {
+      const token = this.advance();
+      return this.withRangeOperator({ kind: "structured", table: token.table ?? "", specifier: String(token.value) });
+    }
+
     const reference = this.parseReference();
     if (reference) {
-      if (reference.kind === "wholeRange") return reference;
+      if (reference.kind === "wholeRange" || reference.kind === "spill") return this.withRangeOperator(reference);
       if (this.match("colon")) {
-        const end = this.parseReference();
-        if (!end || end.kind !== "reference") throw new FormulaParseError("#REF!");
-        return { kind: "range", start: reference, end };
+        const end = this.parseRangeEnd();
+        if (end.kind === "reference") {
+          return this.withRangeOperator({
+            kind: "range",
+            start: reference,
+            end: end.sheet === undefined && reference.sheet !== undefined ? { ...end, sheet: reference.sheet } : end,
+          });
+        }
+        return this.withRangeOperator({ kind: "rangeOp", left: reference, right: end });
       }
       return reference;
     }
@@ -583,29 +729,77 @@ class FormulaParser {
       if (name === "TRUE" || name === "FALSE") {
         return { kind: "literal", value: name === "TRUE" };
       }
-      return { kind: "name", name: text };
+      return this.withRangeOperator({ kind: "name", name: text });
     }
 
     if (this.match("leftParen")) {
       const expression = this.parseComparison();
       if (!this.match("rightParen")) throw new FormulaParseError();
-      return expression;
+      return this.withInvocations(expression);
     }
 
     throw new FormulaParseError();
   }
 
-  private parseCall(): CallNode {
-    const name = String(this.advance().value);
-    if (!this.match("leftParen")) throw new FormulaParseError();
+  /** `LAMBDA(x, x + 1)(2)` and `(LAMBDA(x, x))(1)` call a computed function value. */
+  private withInvocations(node: FormulaNode): FormulaNode {
+    let current = node;
+    while (this.current.kind === "leftParen") {
+      this.advance();
+      const args = this.parseArgumentList();
+      current = { kind: "invoke", callee: current, arguments: args };
+    }
+    return current;
+  }
+
+  /** `start:end` where either corner may itself be a computed reference. */
+  private withRangeOperator(node: FormulaNode): FormulaNode {
+    let current = node;
+    while (this.current.kind === "colon") {
+      this.advance();
+      current = { kind: "rangeOp", left: current, right: this.parseRangeEnd() };
+    }
+    return current;
+  }
+
+  private parseRangeEnd(): FormulaNode {
+    if (this.current.kind === "identifier" && this.next.kind === "leftParen") {
+      return this.withInvocations(this.parseCall());
+    }
+    if (this.current.kind === "structured") {
+      const token = this.advance();
+      return { kind: "structured", table: token.table ?? "", specifier: String(token.value) };
+    }
+    const reference = this.parseReference();
+    if (reference) return reference;
+    if (this.current.kind === "identifier") {
+      return { kind: "name", name: String(this.advance().value) };
+    }
+    if (this.match("leftParen")) {
+      const expression = this.parseComparison();
+      if (!this.match("rightParen")) throw new FormulaParseError();
+      return expression;
+    }
+    throw new FormulaParseError("#REF!");
+  }
+
+  private parseArgumentList(): FormulaNode[] {
     const args: FormulaNode[] = [];
     if (!this.match("rightParen")) {
       do {
-        args.push(this.parseComparison());
+        const kind = this.current.kind;
+        if (kind === "comma" || kind === "semicolon" || kind === "rightParen") args.push({ kind: "omitted" });
+        else args.push(this.parseComparison());
       } while (this.match("comma") || this.match("semicolon"));
       if (!this.match("rightParen")) throw new FormulaParseError();
     }
-    return { kind: "call", name, arguments: args };
+    return args;
+  }
+
+  private parseCall(): CallNode {
+    const name = String(this.advance().value);
+    if (!this.match("leftParen")) throw new FormulaParseError();
+    return { kind: "call", name, arguments: this.parseArgumentList() };
   }
 
   private parseArray(): ArrayNode {
@@ -655,7 +849,7 @@ class FormulaParser {
     throw new FormulaParseError();
   }
 
-  private parseReference(): ReferenceNode | WholeRangeNode | null {
+  private parseReference(): ReferenceNode | WholeRangeNode | SpillNode | null {
     let sheet: string | undefined;
     if (
       ["sheet", "identifier", "cell"].includes(this.current.kind) &&
@@ -667,6 +861,12 @@ class FormulaParser {
 
     if (this.current.kind === "columnRange" || this.current.kind === "rowRange") {
       return this.parseWholeRange(sheet);
+    }
+
+    if (this.current.kind === "spill") {
+      const address = parseA1Address(String(this.advance().value));
+      if (!address) throw new FormulaParseError("#REF!");
+      return { kind: "spill", sheet, address };
     }
 
     if (this.current.kind !== "cell") {
@@ -714,23 +914,40 @@ class FormulaParser {
   }
 }
 
-interface EvaluationError {
+export interface EvaluationError {
   kind: "evaluationError";
   code: FormulaError;
 }
 
-type EvaluationScalar = number | string | boolean | null | EvaluationError;
+export type EvaluationScalar = number | string | boolean | null | EvaluationError;
 
-interface EvaluationRange {
+export interface EvaluationRange {
   kind: "evaluationRange";
   values: EvaluationScalar[];
   rowCount: number;
   columnCount: number;
   /** Sparse ranges hold only populated cells; positional lookups are unavailable. */
   sparse?: boolean;
+  /** The sheet rectangle this range was read from, when it came from a reference. */
+  origin?: RectangleBounds;
 }
 
-type EvaluationValue = EvaluationScalar | EvaluationRange;
+/** A LAMBDA value. Its body closes over the LET/LAMBDA scope it was created in. */
+export interface LambdaValue {
+  kind: "lambda";
+  parameters: string[];
+  body: FormulaNode;
+  scope: EvaluationScope | null;
+  sheetId: string;
+}
+
+export interface EvaluationScope {
+  names: Map<string, EvaluationValue>;
+  omitted: Set<string>;
+  parent: EvaluationScope | null;
+}
+
+export type EvaluationValue = EvaluationScalar | EvaluationRange | LambdaValue;
 
 interface EvaluationContext {
   resolver: FormulaResolver;
@@ -739,13 +956,16 @@ interface EvaluationContext {
   memo: Map<string, EvaluationScalar>;
   now: Date;
   calculationDepth: number;
+  scope: EvaluationScope | null;
+  /** Sheet/cell the top-level formula belongs to (for [@Column], ROW(), implicit intersection). */
+  formulaSheetId: string;
 }
 
-function evaluationError(code: FormulaError): EvaluationError {
+export function evaluationError(code: FormulaError): EvaluationError {
   return { kind: "evaluationError", code };
 }
 
-function isEvaluationError(value: unknown): value is EvaluationError {
+export function isEvaluationError(value: unknown): value is EvaluationError {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -754,11 +974,15 @@ function isEvaluationError(value: unknown): value is EvaluationError {
   );
 }
 
-function isEvaluationRange(value: EvaluationValue): value is EvaluationRange {
+export function isEvaluationRange(value: EvaluationValue | undefined): value is EvaluationRange {
   return typeof value === "object" && value !== null && value.kind === "evaluationRange";
 }
 
-function localDateToExcelSerial(date: Date): number {
+export function isLambdaValue(value: unknown): value is LambdaValue {
+  return typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "lambda";
+}
+
+export function localDateToExcelSerial(date: Date): number {
   const day =
     (Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) - EXCEL_EPOCH_UTC) /
     MILLISECONDS_PER_DAY;
@@ -785,21 +1009,32 @@ function normalizePrimitive(value: FormulaPrimitive): EvaluationScalar {
     : evaluationError("#VALUE!");
 }
 
-function toNumber(value: EvaluationValue): number | EvaluationError {
+export function toNumber(value: EvaluationValue): number | EvaluationError {
   if (isEvaluationError(value)) return value;
-  if (isEvaluationRange(value)) return evaluationError("#VALUE!");
+  if (isEvaluationRange(value) || isLambdaValue(value)) return evaluationError("#VALUE!");
   if (value === null) return 0;
   if (typeof value === "number") return value;
   if (typeof value === "boolean") return value ? 1 : 0;
   const trimmed = value.trim();
   if (trimmed === "") return 0;
   const number = Number(trimmed);
-  return Number.isFinite(number) ? number : evaluationError("#VALUE!");
+  if (Number.isFinite(number)) return number;
+  // Excel coerces numeric-looking text such as "$1,200", "15%", and dates in arithmetic.
+  const invariant = parseInvariantValue(trimmed);
+  if (invariant !== null) return invariant;
+  const date = parseDatePrefix(trimmed);
+  if (date) {
+    if (!date.rest) return date.serial;
+    const time = parseTimeOfDay(date.rest);
+    if (time !== null) return date.serial + time;
+  }
+  const time = parseTimeOfDay(trimmed);
+  return time !== null ? time : evaluationError("#VALUE!");
 }
 
-function toBoolean(value: EvaluationValue): boolean | EvaluationError {
+export function toBoolean(value: EvaluationValue): boolean | EvaluationError {
   if (isEvaluationError(value)) return value;
-  if (isEvaluationRange(value)) return evaluationError("#VALUE!");
+  if (isEvaluationRange(value) || isLambdaValue(value)) return evaluationError("#VALUE!");
   if (value === null) return false;
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;
@@ -811,41 +1046,121 @@ function toBoolean(value: EvaluationValue): boolean | EvaluationError {
     : evaluationError("#VALUE!");
 }
 
-function toText(value: EvaluationValue): string | EvaluationError {
+export function toText(value: EvaluationValue): string | EvaluationError {
   if (isEvaluationError(value)) return value;
-  if (isEvaluationRange(value)) return evaluationError("#VALUE!");
+  if (isEvaluationRange(value) || isLambdaValue(value)) return evaluationError("#VALUE!");
   if (value === null) return "";
   if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+  if (typeof value === "number") return numberToText(value);
   return String(value);
 }
 
-function compareValues(left: EvaluationScalar, right: EvaluationScalar): number | EvaluationError {
+/** Excel's General rendering of a number when it is concatenated or converted to text. */
+export function numberToText(value: number): string {
+  if (!Number.isFinite(value)) return String(value);
+  if (Object.is(value, -0) || value === 0) return "0";
+  const magnitude = Math.abs(value);
+  if (magnitude >= 1e15 || magnitude < 1e-9) {
+    const [mantissa, exponent] = value.toExponential(14).split("e");
+    const trimmed = mantissa.includes(".") ? mantissa.replace(/\.?0+$/, "") : mantissa;
+    const power = Number(exponent);
+    return `${trimmed}E${power < 0 ? "-" : "+"}${String(Math.abs(power)).padStart(2, "0")}`;
+  }
+  // 15 significant digits: the precision Excel keeps when a number becomes text.
+  const decimals = Math.min(100, Math.max(0, 14 - Math.floor(Math.log10(magnitude))));
+  const fixed = value.toFixed(decimals);
+  return fixed.includes(".") ? fixed.replace(/\.?0+$/, "") : fixed;
+}
+
+function comparisonTypeRank(value: EvaluationScalar): number {
+  return typeof value === "number" ? 0 : typeof value === "string" ? 1 : 2;
+}
+
+/**
+ * Excel comparison semantics: numbers sort before text, text before logicals, text is
+ * compared case-insensitively, and a blank compares as 0, "" or FALSE to match the
+ * other operand. Numeric-looking text is never coerced (`=1="1"` is FALSE).
+ */
+export function compareValues(left: EvaluationScalar, right: EvaluationScalar): number | EvaluationError {
   if (isEvaluationError(left)) return left;
   if (isEvaluationError(right)) return right;
 
-  const leftNumber = toNumber(left);
-  const rightNumber = toNumber(right);
-  if (!isEvaluationError(leftNumber) && !isEvaluationError(rightNumber)) {
-    return leftNumber === rightNumber ? 0 : leftNumber < rightNumber ? -1 : 1;
-  }
+  let a: EvaluationScalar = left;
+  let b: EvaluationScalar = right;
+  if (a === null && b === null) return 0;
+  if (a === null) a = typeof b === "number" ? 0 : typeof b === "boolean" ? false : "";
+  if (b === null) b = typeof a === "number" ? 0 : typeof a === "boolean" ? false : "";
 
-  const leftText = toText(left);
-  const rightText = toText(right);
-  if (isEvaluationError(leftText)) return leftText;
-  if (isEvaluationError(rightText)) return rightText;
-  const normalizedLeft = leftText.toLowerCase();
-  const normalizedRight = rightText.toLowerCase();
-  return normalizedLeft === normalizedRight ? 0 : normalizedLeft < normalizedRight ? -1 : 1;
+  const leftRank = comparisonTypeRank(a);
+  const rightRank = comparisonTypeRank(b);
+  if (leftRank !== rightRank) return leftRank < rightRank ? -1 : 1;
+  if (typeof a === "number" && typeof b === "number") {
+    return a === b ? 0 : a < b ? -1 : 1;
+  }
+  if (typeof a === "boolean" && typeof b === "boolean") {
+    return a === b ? 0 : a ? 1 : -1;
+  }
+  const normalizedLeft = String(a).toLocaleLowerCase();
+  const normalizedRight = String(b).toLocaleLowerCase();
+  if (normalizedLeft === normalizedRight) return 0;
+  return normalizedLeft.localeCompare(normalizedRight, undefined, { sensitivity: "base" }) < 0 ? -1 : 1;
 }
 
-function applyBinaryOperator(
+// Excel evaluates an operator over a range element-wise, which is what makes the
+// SUMPRODUCT((A2:A100="x")*(B2:B100)) idiom work.  Sparse ranges hold only their populated
+// cells, so pairing them positionally would silently line up the wrong rows — those stay an
+// honest #VALUE!.
+export function applyBinaryOperator(
   operator: string,
   left: EvaluationValue,
   right: EvaluationValue,
 ): EvaluationValue {
+  if (isLambdaValue(left) || isLambdaValue(right)) return evaluationError("#VALUE!");
   if (isEvaluationError(left)) return left;
   if (isEvaluationError(right)) return right;
-  if (isEvaluationRange(left) || isEvaluationRange(right)) return evaluationError("#VALUE!");
+  if (isEvaluationRange(left) || isEvaluationRange(right)) {
+    if ((isEvaluationRange(left) && left.sparse) || (isEvaluationRange(right) && right.sparse)) {
+      return evaluationError("#VALUE!");
+    }
+    // Excel broadcasting: a single row/column stretches across the other operand, and
+    // positions outside a smaller array are #N/A.
+    const leftRows = isEvaluationRange(left) ? left.rowCount : 1;
+    const leftColumns = isEvaluationRange(left) ? left.columnCount : 1;
+    const rightRows = isEvaluationRange(right) ? right.rowCount : 1;
+    const rightColumns = isEvaluationRange(right) ? right.columnCount : 1;
+    const rowCount = Math.max(leftRows, rightRows);
+    const columnCount = Math.max(leftColumns, rightColumns);
+    if (rowCount > MAX_RANGE_CELLS / columnCount) return evaluationError("#VALUE!");
+    const pick = (value: EvaluationScalar | EvaluationRange, rows: number, columns: number, row: number, column: number): EvaluationScalar => {
+      if (!isEvaluationRange(value)) return value;
+      const sourceRow = rows === 1 ? 0 : row;
+      const sourceColumn = columns === 1 ? 0 : column;
+      if (sourceRow >= rows || sourceColumn >= columns) return evaluationError("#N/A");
+      return value.values[sourceRow * columns + sourceColumn] ?? null;
+    };
+    const values: EvaluationScalar[] = new Array(rowCount * columnCount);
+    for (let row = 0; row < rowCount; row += 1) {
+      for (let column = 0; column < columnCount; column += 1) {
+        const result = applyScalarBinaryOperator(
+          operator,
+          pick(left, leftRows, leftColumns, row, column),
+          pick(right, rightRows, rightColumns, row, column),
+        );
+        values[row * columnCount + column] = isEvaluationRange(result) || isLambdaValue(result) ? evaluationError("#VALUE!") : result;
+      }
+    }
+    return { kind: "evaluationRange", values, rowCount, columnCount };
+  }
+  return applyScalarBinaryOperator(operator, left, right);
+}
+
+function applyScalarBinaryOperator(
+  operator: string,
+  left: EvaluationScalar,
+  right: EvaluationScalar,
+): EvaluationValue {
+  if (isEvaluationError(left)) return left;
+  if (isEvaluationError(right)) return right;
 
   if (operator === "&") {
     const leftText = toText(left);
@@ -896,10 +1211,19 @@ function resolveReference(
   reference: ReferenceNode,
   currentSheetId: string,
   context: EvaluationContext,
+  track = true,
 ): EvaluationScalar {
   const sheetId = reference.sheet ?? currentSheetId;
   const address = addressWithoutAnchors(reference.address);
   if (address.startsWith("#")) return evaluationError("#REF!");
+  if (track) {
+    context.hooks.trackRange?.(sheetId, {
+      startRow: reference.address.row,
+      endRow: reference.address.row,
+      startColumn: reference.address.column,
+      endColumn: reference.address.column,
+    });
+  }
   const key = `${sheetId.toLowerCase()}\u0000${address}`;
 
   const cached = context.memo.get(key);
@@ -935,12 +1259,21 @@ function resolveReference(
   return value;
 }
 
-interface RectangleBounds {
+export interface RectangleBounds {
   sheetId: string;
   firstRow: number;
   lastRow: number;
   firstColumn: number;
   lastColumn: number;
+}
+
+function trackBounds(context: EvaluationContext, bounds: RectangleBounds): void {
+  context.hooks.trackRange?.(bounds.sheetId, {
+    startRow: bounds.firstRow,
+    endRow: bounds.lastRow,
+    startColumn: bounds.firstColumn,
+    endColumn: bounds.lastColumn,
+  });
 }
 
 function wholeRangeBounds(
@@ -964,39 +1297,60 @@ function wholeRangeBounds(
     MAX_EXCEL_COLUMN,
   );
   return range.axis === "column"
-    ? { sheetId, firstRow: 1, lastRow: maxRow, firstColumn: range.start, lastColumn: range.end }
-    : { sheetId, firstRow: range.start, lastRow: range.end, firstColumn: 1, lastColumn: maxColumn };
+    ? { sheetId, firstRow: 1, lastRow: Math.max(1, maxRow), firstColumn: range.start, lastColumn: range.end }
+    : { sheetId, firstRow: range.start, lastRow: range.end, firstColumn: 1, lastColumn: Math.max(1, maxColumn) };
 }
 
-function resolveRectangle(
+/** The full, unclamped extent of `A:A` / `1:1`, which is what a dependency really covers. */
+function wholeRangeTrackingBounds(range: WholeRangeNode, currentSheetId: string): RectangleBounds {
+  const sheetId = range.sheet ?? currentSheetId;
+  return range.axis === "column"
+    ? { sheetId, firstRow: 1, lastRow: MAX_EXCEL_ROW, firstColumn: range.start, lastColumn: range.end }
+    : { sheetId, firstRow: range.start, lastRow: range.end, firstColumn: 1, lastColumn: MAX_EXCEL_COLUMN };
+}
+
+export function resolveRectangle(
   bounds: RectangleBounds,
   currentSheetId: string,
   context: EvaluationContext,
+  track = true,
 ): EvaluationValue {
   const { sheetId, firstRow, lastRow, firstColumn, lastColumn } = bounds;
+  if (
+    firstRow < 1 ||
+    firstColumn < 1 ||
+    lastRow > MAX_EXCEL_ROW ||
+    lastColumn > MAX_EXCEL_COLUMN ||
+    lastRow < firstRow ||
+    lastColumn < firstColumn
+  ) {
+    return evaluationError("#REF!");
+  }
+  if (track) trackBounds(context, bounds);
   const rowCount = lastRow - firstRow + 1;
   const columnCount = lastColumn - firstColumn + 1;
   if (rowCount > MAX_RANGE_CELLS / columnCount) {
     return resolveSparseRectangle(bounds, currentSheetId, context);
   }
 
-  const values: EvaluationScalar[] = [];
+  const values: EvaluationScalar[] = new Array(rowCount * columnCount);
+  let index = 0;
   for (let row = firstRow; row <= lastRow; row += 1) {
     for (let column = firstColumn; column <= lastColumn; column += 1) {
-      values.push(
-        resolveReference(
-          {
-            kind: "reference",
-            sheet: sheetId,
-            address: { row, column, rowAbsolute: false, columnAbsolute: false },
-          },
-          currentSheetId,
-          context,
-        ),
+      values[index] = resolveReference(
+        {
+          kind: "reference",
+          sheet: sheetId,
+          address: { row, column, rowAbsolute: false, columnAbsolute: false },
+        },
+        currentSheetId,
+        context,
+        false,
       );
+      index += 1;
     }
   }
-  return { kind: "evaluationRange", values, rowCount, columnCount };
+  return { kind: "evaluationRange", values, rowCount, columnCount, origin: { ...bounds } };
 }
 
 function resolveSparseRectangle(
@@ -1023,7 +1377,7 @@ function resolveSparseRectangle(
         if (row < firstRow || row > lastRow || column < firstColumn || column > lastColumn) {
           return;
         }
-        if (coordinates.length >= MAX_RANGE_CELLS) {
+        if (coordinates.length >= MAX_SPARSE_CELLS) {
           overflowed = true;
           return;
         }
@@ -1042,6 +1396,7 @@ function resolveSparseRectangle(
           },
           currentSheetId,
           context,
+          false,
         ),
       );
     }
@@ -1054,6 +1409,7 @@ function resolveSparseRectangle(
     rowCount: lastRow - firstRow + 1,
     columnCount: lastColumn - firstColumn + 1,
     sparse: true,
+    origin: { ...bounds },
   };
 }
 
@@ -1063,12 +1419,13 @@ function resolveRange(
   context: EvaluationContext,
 ): EvaluationValue {
   if (range.kind === "wholeRange") {
-    return resolveRectangle(wholeRangeBounds(range, currentSheetId, context), currentSheetId, context);
+    trackBounds(context, wholeRangeTrackingBounds(range, currentSheetId));
+    return resolveRectangle(wholeRangeBounds(range, currentSheetId, context), currentSheetId, context, false);
   }
 
   const startSheet = range.start.sheet ?? currentSheetId;
   const endSheet = range.end.sheet ?? startSheet;
-  if (startSheet !== endSheet) return evaluationError("#REF!");
+  if (startSheet.toLowerCase() !== endSheet.toLowerCase()) return evaluationError("#REF!");
 
   return resolveRectangle(
     {
@@ -1083,16 +1440,18 @@ function resolveRange(
   );
 }
 
-interface CollectedValue {
+export interface CollectedValue {
   value: EvaluationScalar;
   fromRange: boolean;
 }
 
-function collectValues(values: EvaluationValue[]): CollectedValue[] {
+export function collectValues(values: EvaluationValue[]): CollectedValue[] {
   const collected: CollectedValue[] = [];
   for (const value of values) {
     if (isEvaluationRange(value)) {
       for (const entry of value.values) collected.push({ value: entry, fromRange: true });
+    } else if (isLambdaValue(value)) {
+      collected.push({ value: evaluationError("#VALUE!"), fromRange: false });
     } else {
       collected.push({ value, fromRange: false });
     }
@@ -1100,7 +1459,7 @@ function collectValues(values: EvaluationValue[]): CollectedValue[] {
   return collected;
 }
 
-function collectNumbers(
+export function collectNumbers(
   values: EvaluationValue[],
 ): { values: number[]; error?: EvaluationError } {
   const numbers: number[] = [];
@@ -1118,31 +1477,37 @@ function collectNumbers(
   return { values: numbers };
 }
 
-interface RectangularValues {
+export interface RectangularValues {
   values: EvaluationScalar[];
   rowCount: number;
   columnCount: number;
 }
 
-function asRectangularValues(
+export function asRectangularValues(
   value: EvaluationValue,
 ): RectangularValues | EvaluationError {
   if (isEvaluationError(value)) return value;
+  if (isLambdaValue(value)) return evaluationError("#VALUE!");
   if (isEvaluationRange(value)) {
     return value.sparse ? evaluationError("#VALUE!") : value;
   }
   return { values: [value], rowCount: 1, columnCount: 1 };
 }
 
-function sameRangeShape(left: RectangularValues, right: RectangularValues): boolean {
+export function sameRangeShape(left: RectangularValues, right: RectangularValues): boolean {
   return left.rowCount === right.rowCount && left.columnCount === right.columnCount;
 }
 
-function scalarArgument(value: EvaluationValue): EvaluationScalar | EvaluationError {
-  return isEvaluationRange(value) ? evaluationError("#VALUE!") : value;
+/** A single-value argument. A 1x1 range unwraps to its value; larger arrays are #VALUE!. */
+export function scalarArgument(value: EvaluationValue): EvaluationScalar | EvaluationError {
+  if (isLambdaValue(value)) return evaluationError("#VALUE!");
+  if (isEvaluationRange(value)) {
+    return !value.sparse && value.values.length === 1 ? value.values[0] : evaluationError("#VALUE!");
+  }
+  return value;
 }
 
-function numericTextValue(value: string): number | null {
+export function numericTextValue(value: string): number | null {
   const trimmed = value.trim();
   if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?$/.test(trimmed)) {
     return null;
@@ -1151,12 +1516,12 @@ function numericTextValue(value: string): number | null {
   return Number.isFinite(number) ? number : null;
 }
 
-interface WildcardToken {
+export interface WildcardToken {
   kind: "literal" | "single" | "many";
   value?: string;
 }
 
-function wildcardTokens(pattern: string, caseInsensitive: boolean): WildcardToken[] {
+export function wildcardTokens(pattern: string, caseInsensitive: boolean): WildcardToken[] {
   const characters = Array.from(pattern);
   const tokens: WildcardToken[] = [];
   for (let index = 0; index < characters.length; index += 1) {
@@ -1223,7 +1588,7 @@ function wildcardPrefixMatches(
   return tokenIndex === tokens.length;
 }
 
-function wildcardMatches(
+export function wildcardMatches(
   value: string,
   tokens: WildcardToken[],
   caseInsensitive: boolean,
@@ -1242,7 +1607,7 @@ function wildcardMatches(
   return wildcardPrefixMatches([...characters, sentinel], 0, fullTokens, work);
 }
 
-function wildcardSearchPosition(value: string, pattern: string): number | EvaluationError {
+export function wildcardSearchPosition(value: string, pattern: string): number | EvaluationError {
   const characters = Array.from(value.toLocaleLowerCase());
   const tokens = wildcardTokens(pattern, true);
   const work = { steps: 0 };
@@ -1254,7 +1619,7 @@ function wildcardSearchPosition(value: string, pattern: string): number | Evalua
   return evaluationError("#VALUE!");
 }
 
-function compareCriterionValue(
+export function compareCriterionValue(
   value: EvaluationScalar,
   operand: EvaluationScalar,
 ): number | null | EvaluationError {
@@ -1284,11 +1649,11 @@ function compareCriterionValue(
   return left === right ? 0 : left < right ? -1 : 1;
 }
 
-type CriterionTest = (
+export type CriterionTest = (
   value: EvaluationScalar,
 ) => boolean | EvaluationError;
 
-function createCriterionTest(
+export function createCriterionTest(
   criterion: EvaluationScalar,
 ): CriterionTest | EvaluationError {
   if (isEvaluationError(criterion)) return criterion;
@@ -1333,7 +1698,7 @@ function createCriterionTest(
   };
 }
 
-function conditionalAggregate(
+export function conditionalAggregate(
   name:
     | "SUMIF"
     | "SUMIFS"
@@ -1456,13 +1821,13 @@ function conditionalAggregate(
   return sum;
 }
 
-function decimalShift(value: number, places: number): number {
+export function decimalShift(value: number, places: number): number {
   if (value === 0) return value;
   const [coefficient, exponent = "0"] = String(value).split(/[Ee]/);
   return Number(`${coefficient}e${Number(exponent) + places}`);
 }
 
-function directedRound(
+export function directedRound(
   value: number,
   digits: number,
   direction: "up" | "down",
@@ -1475,13 +1840,13 @@ function directedRound(
   return Number.isFinite(result) ? (Object.is(result, -0) ? 0 : result) : evaluationError("#NUM!");
 }
 
-function safeTextResult(value: string): EvaluationValue {
+export function safeTextResult(value: string): EvaluationValue {
   return value.length <= MAX_TEXT_RESULT_LENGTH
     ? value
     : evaluationError("#VALUE!");
 }
 
-function properCase(value: string): string {
+export function properCase(value: string): string {
   return value
     .toLocaleLowerCase()
     .replace(/(^|[^\p{L}])(\p{L})/gu, (_match, prefix: string, letter: string) =>
@@ -1489,7 +1854,7 @@ function properCase(value: string): string {
     );
 }
 
-function parseInvariantValue(value: string): number | null {
+export function parseInvariantValue(value: string): number | null {
   let source = value.trim();
   if (!source) return null;
 
@@ -1518,31 +1883,31 @@ function parseInvariantValue(value: string): number | null {
   return Number.isFinite(result) ? result : null;
 }
 
-function utcDateFromSerial(serial: number): Date | null {
+export function utcDateFromSerial(serial: number): Date | null {
   if (!Number.isFinite(serial)) return null;
   const milliseconds = EXCEL_EPOCH_UTC + Math.floor(serial) * MILLISECONDS_PER_DAY;
   const date = new Date(milliseconds);
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
-function serialFromUtcDate(date: Date): number | EvaluationError {
+export function serialFromUtcDate(date: Date): number | EvaluationError {
   const serial = (date.getTime() - EXCEL_EPOCH_UTC) / MILLISECONDS_PER_DAY;
   return Number.isFinite(serial) ? serial : evaluationError("#NUM!");
 }
 
-function createUtcDate(year: number, monthIndex: number, day: number): Date | null {
+export function createUtcDate(year: number, monthIndex: number, day: number): Date | null {
   const date = new Date(0);
   date.setUTCHours(0, 0, 0, 0);
   date.setUTCFullYear(year, monthIndex, day);
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
-function daysInUtcMonth(year: number, monthIndex: number): number | null {
+export function daysInUtcMonth(year: number, monthIndex: number): number | null {
   const date = createUtcDate(year, monthIndex + 1, 0);
   return date ? date.getUTCDate() : null;
 }
 
-function lookupComparison(
+export function lookupComparison(
   candidate: EvaluationScalar,
   searchKey: EvaluationScalar,
 ): number | null | EvaluationError {
@@ -1564,7 +1929,7 @@ function lookupComparison(
   return left === right ? 0 : left < right ? -1 : 1;
 }
 
-function findLookupIndex(
+export function findLookupIndex(
   candidates: EvaluationScalar[],
   searchKey: EvaluationScalar,
   searchType: -1 | 0 | 1,
@@ -1595,7 +1960,7 @@ function findLookupIndex(
   return result >= 0 ? result : evaluationError("#N/A");
 }
 
-function rangeSlice(
+export function rangeSlice(
   range: RectangularValues,
   row: number,
   column: number,
@@ -1762,7 +2127,7 @@ function monthIndexFromName(token: string): number | null {
   return index >= 0 ? index : null;
 }
 
-function dateSerialFromParts(year: number, month: number, day: number): number | null {
+export function dateSerialFromParts(year: number, month: number, day: number): number | null {
   const fullYear = year < 100 ? (year < 30 ? 2000 + year : 1900 + year) : year;
   const date = createUtcDate(fullYear, month - 1, day);
   if (
@@ -1779,7 +2144,7 @@ function dateSerialFromParts(year: number, month: number, day: number): number |
     : serial;
 }
 
-function parseDatePrefix(text: string): { serial: number; rest: string } | null {
+export function parseDatePrefix(text: string): { serial: number; rest: string } | null {
   const source = text.trim();
   let match = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/.exec(source);
   if (match) {
@@ -1812,7 +2177,7 @@ function parseDatePrefix(text: string): { serial: number; rest: string } | null 
   return null;
 }
 
-function parseTimeOfDay(text: string): number | null {
+export function parseTimeOfDay(text: string): number | null {
   const match = /^(\d{1,2}):(\d{1,2})(?::(\d{1,2}(?:\.\d+)?))?(?:\s*([AaPp])\.?[Mm]\.?)?$/.exec(
     text.trim(),
   );
@@ -1832,11 +2197,11 @@ function parseTimeOfDay(text: string): number | null {
   return (hours * 3600 + minutes * 60 + seconds) / 86_400;
 }
 
-function dowFromSerial(serial: number): number {
+export function dowFromSerial(serial: number): number {
   return ((((serial % 7) + 7) % 7) + 6) % 7;
 }
 
-function isoWeekNumber(date: Date): number {
+export function isoWeekNumber(date: Date): number {
   const target = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
   target.setUTCDate(target.getUTCDate() - ((target.getUTCDay() + 6) % 7) + 3);
   const thursday = target.getTime();
@@ -1847,7 +2212,7 @@ function isoWeekNumber(date: Date): number {
   return 1 + Math.round((thursday - target.getTime()) / (7 * MILLISECONDS_PER_DAY));
 }
 
-function collectHolidaySerials(
+export function collectHolidaySerials(
   value: EvaluationValue | undefined,
 ): Set<number> | EvaluationError {
   const holidays = new Set<number>();
@@ -1858,12 +2223,12 @@ function collectHolidaySerials(
   return holidays;
 }
 
-function finiteResult(value: number): number | EvaluationError {
+export function finiteResult(value: number): number | EvaluationError {
   if (!Number.isFinite(value)) return evaluationError("#NUM!");
   return Object.is(value, -0) ? 0 : value;
 }
 
-function significanceRound(
+export function significanceRound(
   value: number,
   significance: number,
   direction: "up" | "down",
@@ -1879,18 +2244,18 @@ function significanceRound(
   return finiteResult(steps * significance);
 }
 
-function roundToDigits(value: number, digits: number): number | EvaluationError {
+export function roundToDigits(value: number, digits: number): number | EvaluationError {
   if (Math.abs(digits) > 308) return evaluationError("#NUM!");
   const shifted = decimalShift(Math.abs(value), digits);
   if (!Number.isFinite(shifted)) return evaluationError("#NUM!");
   return finiteResult(Math.sign(value) * decimalShift(Math.round(shifted), -digits));
 }
 
-function groupThousands(integerDigits: string): string {
+export function groupThousands(integerDigits: string): string {
   return integerDigits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-function fixedNumberText(
+export function fixedNumberText(
   value: number,
   decimals: number,
   withCommas: boolean,
@@ -1905,7 +2270,7 @@ function fixedNumberText(
   return rounded < 0 ? `-${magnitude}` : magnitude;
 }
 
-function occurrenceIndices(text: string, search: string): number[] {
+export function occurrenceIndices(text: string, search: string): number[] {
   const indices: number[] = [];
   let from = 0;
   while (from <= text.length - search.length) {
@@ -1917,7 +2282,7 @@ function occurrenceIndices(text: string, search: string): number[] {
   return indices;
 }
 
-function percentileInc(numbers: number[], k: number): number | EvaluationError {
+export function percentileInc(numbers: number[], k: number): number | EvaluationError {
   if (numbers.length === 0 || k < 0 || k > 1) return evaluationError("#NUM!");
   const sorted = [...numbers].sort((left, right) => left - right);
   const position = k * (sorted.length - 1);
@@ -1928,7 +2293,7 @@ function percentileInc(numbers: number[], k: number): number | EvaluationError {
   return finiteResult(base + fraction * (next - base));
 }
 
-function annuityFutureValue(
+export function annuityFutureValue(
   rate: number,
   nper: number,
   pmt: number,
@@ -1940,7 +2305,7 @@ function annuityFutureValue(
   return -(pv * growth + (pmt * (1 + rate * type) * (growth - 1)) / rate);
 }
 
-function annuityPayment(
+export function annuityPayment(
   rate: number,
   nper: number,
   pv: number,
@@ -1955,7 +2320,7 @@ function annuityPayment(
   return finiteResult((-(pv * growth + fv) * rate) / denominator);
 }
 
-function financialArguments(
+export function financialArguments(
   values: EvaluationValue[],
   totalCount: number,
   optionalDefaults: number[],
@@ -1996,7 +2361,7 @@ function periodicPaymentPart(
   return finiteResult(payment - interest);
 }
 
-function rectangleRows(range: RectangularValues): EvaluationScalar[][] {
+export function rectangleRows(range: RectangularValues): EvaluationScalar[][] {
   const rows: EvaluationScalar[][] = [];
   for (let row = 0; row < range.rowCount; row += 1) {
     rows.push(range.values.slice(row * range.columnCount, (row + 1) * range.columnCount));
@@ -2004,7 +2369,7 @@ function rectangleRows(range: RectangularValues): EvaluationScalar[][] {
   return rows;
 }
 
-function transposedRows(rows: EvaluationScalar[][]): EvaluationScalar[][] {
+export function transposedRows(rows: EvaluationScalar[][]): EvaluationScalar[][] {
   const result: EvaluationScalar[][] = [];
   for (let column = 0; column < (rows[0]?.length ?? 0); column += 1) {
     result.push(rows.map((row) => row[column]));
@@ -2012,14 +2377,14 @@ function transposedRows(rows: EvaluationScalar[][]): EvaluationScalar[][] {
   return result;
 }
 
-function rangeFromRows(rows: EvaluationScalar[][]): EvaluationValue {
+export function rangeFromRows(rows: EvaluationScalar[][]): EvaluationValue {
   if (rows.length === 0 || rows[0].length === 0) return evaluationError("#CALC!");
   const values: EvaluationScalar[] = [];
   for (const row of rows) values.push(...row);
   return { kind: "evaluationRange", values, rowCount: rows.length, columnCount: rows[0].length };
 }
 
-function arrayEntryKey(value: EvaluationScalar): string {
+export function arrayEntryKey(value: EvaluationScalar): string {
   if (isEvaluationError(value)) return `e:${value.code}`;
   if (value === null) return "n";
   if (typeof value === "boolean") return `b:${value}`;
@@ -2027,7 +2392,7 @@ function arrayEntryKey(value: EvaluationScalar): string {
   return `s:${JSON.stringify(value.toLocaleLowerCase())}`;
 }
 
-function sortScalarCompare(left: EvaluationScalar, right: EvaluationScalar): number {
+export function sortScalarCompare(left: EvaluationScalar, right: EvaluationScalar): number {
   const rank = (value: EvaluationScalar): number => {
     if (value === null) return 4;
     if (isEvaluationError(value)) return 3;
@@ -2084,12 +2449,19 @@ function referenceNodeBounds(
   return null;
 }
 
-interface FunctionEvaluation {
+export interface FunctionEvaluation {
   currentSheetId: string;
   context: EvaluationContext;
   depth: number;
   argumentNodes: FormulaNode[];
   evaluate: (node: FormulaNode) => EvaluationValue;
+  /** Call a LAMBDA value with already-evaluated arguments. */
+  invokeLambda: (lambda: EvaluationValue, args: EvaluationValue[]) => EvaluationValue;
+  /** The sheet rectangle an argument node refers to, or null when it is not a reference. */
+  referenceBounds: (node: FormulaNode) => RectangleBounds | EvaluationError | null;
+  /** Read a sheet rectangle (tracked as a dependency). */
+  resolveBounds: (bounds: RectangleBounds) => EvaluationValue;
+  hooks: FormulaEvaluationHooks;
 }
 
 function evaluateXlookup(call: FunctionEvaluation): EvaluationValue {
@@ -2255,8 +2627,8 @@ function scalarTestSpec(test: (value: EvaluationScalar) => boolean): FunctionSpe
     minArgs: 1,
     maxArgs: 1,
     impl: (values) => {
-      const value = values[0];
-      if (isEvaluationRange(value)) return evaluationError("#VALUE!");
+      const value = scalarArgument(values[0]);
+      if (isEvaluationRange(values[0]) && isEvaluationError(value)) return value;
       return test(value);
     },
   };
@@ -2400,7 +2772,8 @@ function rankSpec(): FunctionSpec {
       if (isEvaluationError(number)) return number;
       const collected = collectNumbers([values[1]]);
       if (collected.error) return collected.error;
-      if (collected.values.length === 0) return evaluationError("#N/A");
+      // Excel: a number that does not occur in ref has no rank.
+      if (!collected.values.includes(number)) return evaluationError("#N/A");
       let ascending = false;
       if (values[2] !== undefined) {
         const order = toBoolean(scalarArgument(values[2]));
@@ -2767,10 +3140,22 @@ function timePartSpec(name: "HOUR" | "MINUTE" | "SECOND"): FunctionSpec {
   };
 }
 
-interface FunctionSpec {
+export interface FunctionSpec {
   minArgs: number;
   maxArgs: number;
+  /** Receive unevaluated argument nodes (call.argumentNodes) instead of values. */
   lazy?: boolean;
+  /**
+   * Arguments that take a single value. When an array is passed in one of these positions the
+   * function is applied element-wise and returns an array (Excel "lifting"), e.g. LEN(A1:A5).
+   */
+  liftArgs?: number[] | "all" | ((index: number) => boolean);
+  /** Recalculate on every change (NOW, RAND, OFFSET, INDIRECT, ...). */
+  volatile?: boolean;
+  /** Reference form: the rectangle the call refers to, for `A1:INDEX(...)`, ROW(OFFSET(...)). */
+  reference?: (call: FunctionEvaluation) => RectangleBounds | EvaluationError | null;
+  /** The function returns an array (spill anchor candidate). */
+  returnsArray?: boolean;
   impl: (values: EvaluationValue[], call: FunctionEvaluation) => EvaluationValue;
 }
 
@@ -2784,7 +3169,24 @@ function logicalSpec(name: "AND" | "OR" | "XOR"): FunctionSpec {
   };
 }
 
-const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
+// SUBTOTAL's first argument selects one of the plain aggregates.  The 101-111 range asks
+// Excel to skip manually hidden rows; row visibility is not part of the evaluation context,
+// so those codes fall back to their 1-11 counterparts.
+const SUBTOTAL_AGGREGATES: Record<number, string> = {
+  1: "AVERAGE",
+  2: "COUNT",
+  3: "COUNTA",
+  4: "MAX",
+  5: "MIN",
+  6: "PRODUCT",
+  7: "STDEV.S",
+  8: "STDEV.P",
+  9: "SUM",
+  10: "VAR.S",
+  11: "VAR.P",
+};
+
+export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
   IF: {
     minArgs: 2,
     maxArgs: 3,
@@ -2830,6 +3232,27 @@ const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
         if (condition) return call.evaluate(call.argumentNodes[index + 1]);
       }
       return evaluationError("#N/A");
+    },
+  },
+  SWITCH: {
+    minArgs: 3,
+    maxArgs: Infinity,
+    lazy: true,
+    impl: (_values, call) => {
+      const subject = scalarArgument(call.evaluate(call.argumentNodes[0]));
+      if (isEvaluationError(subject)) return subject;
+      let index = 1;
+      for (; index + 1 < call.argumentNodes.length; index += 2) {
+        const candidate = scalarArgument(call.evaluate(call.argumentNodes[index]));
+        if (isEvaluationError(candidate)) return candidate;
+        const comparison = compareValues(subject, candidate);
+        if (isEvaluationError(comparison)) continue;
+        if (comparison === 0) return call.evaluate(call.argumentNodes[index + 1]);
+      }
+      // A trailing odd argument is the default result.
+      return index < call.argumentNodes.length
+        ? call.evaluate(call.argumentNodes[index])
+        : evaluationError("#N/A");
     },
   },
   AND: logicalSpec("AND"),
@@ -2957,6 +3380,19 @@ const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
   AVERAGE: numericAggregateSpec("AVERAGE"),
   MIN: numericAggregateSpec("MIN"),
   MAX: numericAggregateSpec("MAX"),
+  SUBTOTAL: {
+    minArgs: 2,
+    maxArgs: Infinity,
+    impl: (values, call) => {
+      const selector = toNumber(scalarArgument(values[0]));
+      if (isEvaluationError(selector)) return selector;
+      const code = Math.trunc(selector);
+      const aggregate = SUBTOTAL_AGGREGATES[code > 100 ? code - 100 : code];
+      const spec = aggregate ? FUNCTION_REGISTRY[aggregate] : undefined;
+      if (!spec || spec.lazy) return evaluationError("#VALUE!");
+      return spec.impl(values.slice(1), call);
+    },
+  },
 
   PRODUCT: productMedianSpec("PRODUCT"),
   MEDIAN: productMedianSpec("MEDIAN"),
@@ -3823,11 +4259,12 @@ const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
       const [nper, pmt, pv, fv, rawType, guess] = parts;
       const type = rawType ? 1 : 0;
       if (nper <= 0) return evaluationError("#NUM!");
+      // expm1/log1p keep (1+r)^n - 1 accurate near r = 0, so zero-interest loans converge.
       const balance = (rate: number): number =>
         rate === 0
           ? pv + pmt * nper + fv
           : pv * (1 + rate) ** nper +
-            (pmt * (1 + rate * type) * ((1 + rate) ** nper - 1)) / rate +
+            (pmt * (1 + rate * type) * Math.expm1(nper * Math.log1p(rate))) / rate +
             fv;
       let rate = guess <= -1 ? 0.1 : guess;
       const step = 1e-7;
@@ -3992,33 +4429,959 @@ const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
   },
 };
 
+// ---------------------------------------------------------------------------------------------
+// Core functions that need the evaluator itself: LET/LAMBDA and the lambda helpers, reference
+// forms (INDEX/OFFSET/INDIRECT/CHOOSE/IF), SUBTOTAL/AGGREGATE visibility rules, and volatility.
+// ---------------------------------------------------------------------------------------------
+
+function lambdaParameterName(node: FormulaNode): string | null {
+  if (node.kind !== "name") return null;
+  const name = normalizedLocalName(node.name);
+  if (!/^[A-Z_\\À-￿][A-Z0-9_.À-￿]*$/i.test(name)) return null;
+  if (name === "TRUE" || name === "FALSE") return null;
+  return name;
+}
+
+function rangeElements(value: EvaluationValue): RectangularValues | EvaluationError {
+  return asRectangularValues(value);
+}
+
+export function lambdaScalarResult(result: EvaluationValue): EvaluationScalar {
+  if (isLambdaValue(result)) return evaluationError("#CALC!");
+  if (isEvaluationRange(result)) {
+    if (!result.sparse && result.values.length === 1) return result.values[0];
+    // Nested arrays are not allowed inside MAP/SCAN/BYROW/BYCOL/MAKEARRAY.
+    return evaluationError("#CALC!");
+  }
+  return result;
+}
+
+function subRange(range: RectangularValues, rowIndex: number | null, columnIndex: number | null): EvaluationRange {
+  if (rowIndex !== null) {
+    return {
+      kind: "evaluationRange",
+      values: range.values.slice(rowIndex * range.columnCount, (rowIndex + 1) * range.columnCount),
+      rowCount: 1,
+      columnCount: range.columnCount,
+    };
+  }
+  const values: EvaluationScalar[] = [];
+  for (let row = 0; row < range.rowCount; row += 1) values.push(range.values[row * range.columnCount + (columnIndex ?? 0)]);
+  return { kind: "evaluationRange", values, rowCount: range.rowCount, columnCount: 1 };
+}
+
+function indexReference(call: FunctionEvaluation): RectangleBounds | EvaluationError | null {
+  const bounds = call.referenceBounds(call.argumentNodes[0]);
+  if (bounds === null || isEvaluationError(bounds)) return bounds;
+  const readIndex = (node: FormulaNode | undefined): number | EvaluationError => {
+    if (!node || node.kind === "omitted") return 0;
+    const value = toNumber(scalarArgument(call.evaluate(node)));
+    if (isEvaluationError(value)) return value;
+    const index = Math.trunc(value);
+    return index < 0 ? evaluationError("#VALUE!") : index;
+  };
+  let row = readIndex(call.argumentNodes[1]);
+  if (isEvaluationError(row)) return row;
+  let column = readIndex(call.argumentNodes[2]);
+  if (isEvaluationError(column)) return column;
+  const rows = bounds.lastRow - bounds.firstRow + 1;
+  const columns = bounds.lastColumn - bounds.firstColumn + 1;
+  // INDEX(A1:A9, 3) addresses the third row of a single column (or column of a single row).
+  if (call.argumentNodes.length === 2 && rows === 1 && columns > 1) {
+    column = row;
+    row = 0;
+  }
+  if (row > rows || column > columns) return evaluationError("#REF!");
+  return {
+    sheetId: bounds.sheetId,
+    firstRow: row ? bounds.firstRow + row - 1 : bounds.firstRow,
+    lastRow: row ? bounds.firstRow + row - 1 : bounds.lastRow,
+    firstColumn: column ? bounds.firstColumn + column - 1 : bounds.firstColumn,
+    lastColumn: column ? bounds.firstColumn + column - 1 : bounds.lastColumn,
+  };
+}
+
+function offsetReference(call: FunctionEvaluation): RectangleBounds | EvaluationError | null {
+  const bounds = call.referenceBounds(call.argumentNodes[0]);
+  if (bounds === null) return evaluationError("#VALUE!");
+  if (isEvaluationError(bounds)) return bounds;
+  const numberArgument = (index: number, fallback: number): number | EvaluationError => {
+    const node = call.argumentNodes[index];
+    if (!node || node.kind === "omitted") return fallback;
+    const value = toNumber(scalarArgument(call.evaluate(node)));
+    return isEvaluationError(value) ? value : Math.trunc(value);
+  };
+  const rows = numberArgument(1, 0);
+  if (isEvaluationError(rows)) return rows;
+  const columns = numberArgument(2, 0);
+  if (isEvaluationError(columns)) return columns;
+  const height = numberArgument(3, bounds.lastRow - bounds.firstRow + 1);
+  if (isEvaluationError(height)) return height;
+  const width = numberArgument(4, bounds.lastColumn - bounds.firstColumn + 1);
+  if (isEvaluationError(width)) return width;
+  if (height === 0 || width === 0) return evaluationError("#REF!");
+  // Negative height/width extend up/left from the offset corner, as in Excel.
+  const anchorRow = bounds.firstRow + rows;
+  const anchorColumn = bounds.firstColumn + columns;
+  const firstRow = height > 0 ? anchorRow : anchorRow + height + 1;
+  const lastRow = height > 0 ? anchorRow + height - 1 : anchorRow;
+  const firstColumn = width > 0 ? anchorColumn : anchorColumn + width + 1;
+  const lastColumn = width > 0 ? anchorColumn + width - 1 : anchorColumn;
+  if (firstRow < 1 || firstColumn < 1 || lastRow > MAX_EXCEL_ROW || lastColumn > MAX_EXCEL_COLUMN) {
+    return evaluationError("#REF!");
+  }
+  return { sheetId: bounds.sheetId, firstRow, lastRow, firstColumn, lastColumn };
+}
+
+function indirectReference(call: FunctionEvaluation): RectangleBounds | EvaluationError | null {
+  const text = toText(scalarArgument(call.evaluate(call.argumentNodes[0])));
+  if (isEvaluationError(text)) return text;
+  let a1 = true;
+  if (call.argumentNodes[1] && call.argumentNodes[1].kind !== "omitted") {
+    const style = toBoolean(scalarArgument(call.evaluate(call.argumentNodes[1])));
+    if (isEvaluationError(style)) return style;
+    a1 = style;
+  }
+  let source = text.trim().replace(/^=/, "");
+  if (!a1) {
+    // R1C1 absolute references: R2C3 or R2C3:R4C5, optionally sheet-qualified.
+    const match = /^(?:(.+)!)?R(\d+)C(\d+)(?::R(\d+)C(\d+))?$/i.exec(source);
+    if (!match) return evaluationError("#REF!");
+    const start = `${columnNumberToLabel(Number(match[3])) ?? ""}${match[2]}`;
+    const end = match[4] ? `${columnNumberToLabel(Number(match[5])) ?? ""}${match[4]}` : "";
+    source = `${match[1] ? `${match[1]}!` : ""}${start}${end ? `:${end}` : ""}`;
+  }
+  const node = cachedParse(source);
+  if (typeof node === "string") return evaluationError("#REF!");
+  if (!["reference", "range", "wholeRange", "name", "structured", "spill", "rangeOp"].includes(node.kind)) {
+    return evaluationError("#REF!");
+  }
+  const bounds = call.referenceBounds(node);
+  return bounds === null ? evaluationError("#REF!") : bounds;
+}
+
+function referenceValue(call: FunctionEvaluation, bounds: RectangleBounds | EvaluationError | null): EvaluationValue {
+  if (bounds === null) return evaluationError("#REF!");
+  if (isEvaluationError(bounds)) return bounds;
+  const value = call.resolveBounds(bounds);
+  if (isEvaluationRange(value) && !value.sparse && value.values.length === 1) return value.values[0];
+  return value;
+}
+
+function isNestedAggregateFormula(call: FunctionEvaluation, sheetId: string, row: number, column: number): boolean {
+  const getFormula = call.hooks.getCellFormula;
+  if (!getFormula) return false;
+  const address = `${columnNumberToLabel(column) ?? ""}${row}`;
+  let formula: string | null = null;
+  try {
+    formula = getFormula(sheetId, address);
+  } catch {
+    formula = null;
+  }
+  return Boolean(formula && /(^|[^A-Za-z0-9_.])(?:_xlfn\.)?(SUBTOTAL|AGGREGATE)\s*\(/i.test(formula));
+}
+
+/**
+ * Values of SUBTOTAL/AGGREGATE reference arguments with Excel's visibility rules applied:
+ * nested SUBTOTAL/AGGREGATE cells are skipped, and hidden rows optionally so.
+ */
+function visibleReferenceValues(
+  call: FunctionEvaluation,
+  nodes: FormulaNode[],
+  options: { skipHidden: boolean; skipFiltered: boolean; skipErrors: boolean; skipNested: boolean },
+): EvaluationValue[] | EvaluationError {
+  const output: EvaluationValue[] = [];
+  for (const node of nodes) {
+    const bounds = call.referenceBounds(node);
+    if (bounds === null) {
+      output.push(call.evaluate(node));
+      continue;
+    }
+    if (isEvaluationError(bounds)) return bounds;
+    const value = call.resolveBounds(bounds);
+    if (!isEvaluationRange(value) || value.sparse) {
+      output.push(value);
+      continue;
+    }
+    const kept: EvaluationScalar[] = [];
+    const isHidden = call.hooks.isRowHidden;
+    const isFiltered = call.hooks.isRowFiltered;
+    for (let rowOffset = 0; rowOffset < value.rowCount; rowOffset += 1) {
+      const row = bounds.firstRow + rowOffset;
+      if (options.skipHidden && isHidden?.(bounds.sheetId, row)) continue;
+      if (options.skipFiltered && isFiltered?.(bounds.sheetId, row)) continue;
+      for (let columnOffset = 0; columnOffset < value.columnCount; columnOffset += 1) {
+        const entry = value.values[rowOffset * value.columnCount + columnOffset];
+        if (options.skipErrors && isEvaluationError(entry)) continue;
+        if (options.skipNested && entry !== null && isNestedAggregateFormula(call, bounds.sheetId, row, bounds.firstColumn + columnOffset)) continue;
+        kept.push(entry);
+      }
+    }
+    output.push({ kind: "evaluationRange", values: kept, rowCount: kept.length ? 1 : 0, columnCount: kept.length });
+  }
+  return output;
+}
+
+const AGGREGATE_FUNCTIONS: Record<number, string> = {
+  1: "AVERAGE", 2: "COUNT", 3: "COUNTA", 4: "MAX", 5: "MIN", 6: "PRODUCT", 7: "STDEV.S", 8: "STDEV.P",
+  9: "SUM", 10: "VAR.S", 11: "VAR.P", 12: "MEDIAN", 13: "MODE.SNGL", 14: "LARGE", 15: "SMALL",
+  16: "PERCENTILE.INC", 17: "QUARTILE.INC", 18: "PERCENTILE.EXC", 19: "QUARTILE.EXC",
+};
+
+function rowColumnValues(name: "ROW" | "COLUMN", call: FunctionEvaluation): EvaluationValue {
+  const node = call.argumentNodes[0];
+  if (!node || node.kind === "omitted") {
+    const cell = call.hooks.currentCell;
+    if (!cell) return evaluationError("#VALUE!");
+    return name === "ROW" ? cell.row : cell.column;
+  }
+  let bounds: RectangleBounds | EvaluationError | null;
+  if (node.kind === "wholeRange") {
+    bounds = {
+      sheetId: node.sheet ?? call.currentSheetId,
+      firstRow: node.axis === "row" ? node.start : 1,
+      lastRow: node.axis === "row" ? node.end : 1,
+      firstColumn: node.axis === "column" ? node.start : 1,
+      lastColumn: node.axis === "column" ? node.end : 1,
+    };
+  } else {
+    bounds = call.referenceBounds(node);
+  }
+  if (bounds === null) return evaluationError("#VALUE!");
+  if (isEvaluationError(bounds)) return bounds;
+  const first = name === "ROW" ? bounds.firstRow : bounds.firstColumn;
+  const last = name === "ROW" ? bounds.lastRow : bounds.lastColumn;
+  if (first === last) return first;
+  if (last - first + 1 > MAX_RANGE_CELLS) return evaluationError("#VALUE!");
+  const values: EvaluationScalar[] = [];
+  for (let index = first; index <= last; index += 1) values.push(index);
+  return name === "ROW"
+    ? { kind: "evaluationRange", values, rowCount: values.length, columnCount: 1 }
+    : { kind: "evaluationRange", values, rowCount: 1, columnCount: values.length };
+}
+
+const CORE_FUNCTIONS: Record<string, FunctionSpec> = {
+  LET: {
+    minArgs: 3,
+    maxArgs: 253,
+    lazy: true,
+    impl: (_values, call) => {
+      const nodes = call.argumentNodes;
+      if (nodes.length % 2 === 0) return evaluationError("#VALUE!");
+      const scope: EvaluationScope = { names: new Map(), omitted: new Set(), parent: call.context.scope };
+      const saved = call.context.scope;
+      call.context.scope = scope;
+      try {
+        for (let index = 0; index < nodes.length - 1; index += 2) {
+          const name = lambdaParameterName(nodes[index]);
+          if (!name) return evaluationError("#NAME?");
+          scope.names.set(name, call.evaluate(nodes[index + 1]));
+        }
+        return call.evaluate(nodes[nodes.length - 1]);
+      } finally {
+        call.context.scope = saved;
+      }
+    },
+  },
+  LAMBDA: {
+    minArgs: 1,
+    maxArgs: 254,
+    lazy: true,
+    returnsArray: true,
+    impl: (_values, call) => {
+      const nodes = call.argumentNodes;
+      const parameters: string[] = [];
+      for (const node of nodes.slice(0, -1)) {
+        const name = lambdaParameterName(node);
+        if (!name || parameters.includes(name)) return evaluationError("#VALUE!");
+        parameters.push(name);
+      }
+      return {
+        kind: "lambda",
+        parameters,
+        body: nodes[nodes.length - 1],
+        scope: call.context.scope,
+        sheetId: call.currentSheetId,
+      };
+    },
+  },
+  ISOMITTED: {
+    minArgs: 1,
+    maxArgs: 1,
+    lazy: true,
+    impl: (_values, call) => {
+      const node = call.argumentNodes[0];
+      if (node.kind === "omitted") return true;
+      if (node.kind !== "name") return false;
+      const scoped = lookupScope(call.context, node.name);
+      return scoped.found ? scoped.omitted : false;
+    },
+  },
+  MAP: {
+    minArgs: 2,
+    maxArgs: 254,
+    returnsArray: true,
+    impl: (values, call) => {
+      const lambda = values[values.length - 1];
+      if (!isLambdaValue(lambda)) return evaluationError("#VALUE!");
+      const arrays: RectangularValues[] = [];
+      for (const value of values.slice(0, -1)) {
+        const range = rangeElements(value);
+        if (isEvaluationError(range)) return range;
+        arrays.push(range);
+      }
+      const rowCount = Math.max(...arrays.map((array) => array.rowCount));
+      const columnCount = Math.max(...arrays.map((array) => array.columnCount));
+      if (rowCount > MAX_RANGE_CELLS / columnCount) return evaluationError("#VALUE!");
+      const output: EvaluationScalar[] = [];
+      for (let row = 0; row < rowCount; row += 1) {
+        for (let column = 0; column < columnCount; column += 1) {
+          const args = arrays.map((array): EvaluationScalar => {
+            const sourceRow = array.rowCount === 1 ? 0 : row;
+            const sourceColumn = array.columnCount === 1 ? 0 : column;
+            if (sourceRow >= array.rowCount || sourceColumn >= array.columnCount) return evaluationError("#N/A");
+            return array.values[sourceRow * array.columnCount + sourceColumn];
+          });
+          output.push(lambdaScalarResult(call.invokeLambda(lambda, args)));
+        }
+      }
+      return { kind: "evaluationRange", values: output, rowCount, columnCount };
+    },
+  },
+  REDUCE: {
+    minArgs: 2,
+    maxArgs: 3,
+    impl: (values, call) => {
+      const [initial, arrayValue, lambda] = values.length === 2 ? [null, values[0], values[1]] : values;
+      if (!isLambdaValue(lambda)) return evaluationError("#VALUE!");
+      const array = rangeElements(arrayValue);
+      if (isEvaluationError(array)) return array;
+      let accumulator: EvaluationValue = initial ?? null;
+      for (const entry of array.values) {
+        accumulator = call.invokeLambda(lambda, [accumulator, entry]);
+      }
+      return accumulator;
+    },
+  },
+  SCAN: {
+    minArgs: 2,
+    maxArgs: 3,
+    returnsArray: true,
+    impl: (values, call) => {
+      const [initial, arrayValue, lambda] = values.length === 2 ? [null, values[0], values[1]] : values;
+      if (!isLambdaValue(lambda)) return evaluationError("#VALUE!");
+      const array = rangeElements(arrayValue);
+      if (isEvaluationError(array)) return array;
+      let accumulator: EvaluationValue = initial ?? null;
+      const output: EvaluationScalar[] = [];
+      for (const entry of array.values) {
+        accumulator = call.invokeLambda(lambda, [accumulator, entry]);
+        output.push(lambdaScalarResult(accumulator));
+      }
+      return { kind: "evaluationRange", values: output, rowCount: array.rowCount, columnCount: array.columnCount };
+    },
+  },
+  BYROW: {
+    minArgs: 2,
+    maxArgs: 2,
+    returnsArray: true,
+    impl: (values, call) => {
+      const lambda = values[1];
+      if (!isLambdaValue(lambda)) return evaluationError("#VALUE!");
+      const array = rangeElements(values[0]);
+      if (isEvaluationError(array)) return array;
+      const output: EvaluationScalar[] = [];
+      for (let row = 0; row < array.rowCount; row += 1) {
+        output.push(lambdaScalarResult(call.invokeLambda(lambda, [subRange(array, row, null)])));
+      }
+      return { kind: "evaluationRange", values: output, rowCount: array.rowCount, columnCount: 1 };
+    },
+  },
+  BYCOL: {
+    minArgs: 2,
+    maxArgs: 2,
+    returnsArray: true,
+    impl: (values, call) => {
+      const lambda = values[1];
+      if (!isLambdaValue(lambda)) return evaluationError("#VALUE!");
+      const array = rangeElements(values[0]);
+      if (isEvaluationError(array)) return array;
+      const output: EvaluationScalar[] = [];
+      for (let column = 0; column < array.columnCount; column += 1) {
+        output.push(lambdaScalarResult(call.invokeLambda(lambda, [subRange(array, null, column)])));
+      }
+      return { kind: "evaluationRange", values: output, rowCount: 1, columnCount: array.columnCount };
+    },
+  },
+  MAKEARRAY: {
+    minArgs: 3,
+    maxArgs: 3,
+    returnsArray: true,
+    impl: (values, call) => {
+      const rows = toNumber(scalarArgument(values[0]));
+      if (isEvaluationError(rows)) return rows;
+      const columns = toNumber(scalarArgument(values[1]));
+      if (isEvaluationError(columns)) return columns;
+      const lambda = values[2];
+      if (!isLambdaValue(lambda)) return evaluationError("#VALUE!");
+      const rowCount = Math.trunc(rows);
+      const columnCount = Math.trunc(columns);
+      if (rowCount < 1 || columnCount < 1) return evaluationError("#VALUE!");
+      if (rowCount > MAX_RANGE_CELLS / columnCount) return evaluationError("#VALUE!");
+      const output: EvaluationScalar[] = [];
+      for (let row = 1; row <= rowCount; row += 1) {
+        for (let column = 1; column <= columnCount; column += 1) {
+          output.push(lambdaScalarResult(call.invokeLambda(lambda, [row, column])));
+        }
+      }
+      return { kind: "evaluationRange", values: output, rowCount, columnCount };
+    },
+  },
+  SINGLE: {
+    minArgs: 1,
+    maxArgs: 1,
+    lazy: true,
+    impl: (_values, call) => implicitIntersection(call.evaluate(call.argumentNodes[0]), call.context),
+  },
+  ANCHORARRAY: {
+    minArgs: 1,
+    maxArgs: 1,
+    lazy: true,
+    returnsArray: true,
+    reference: (call) => {
+      const node = call.argumentNodes[0];
+      if (node.kind !== "reference") return evaluationError("#REF!");
+      return spillBounds({ kind: "spill", sheet: node.sheet, address: node.address }, call.currentSheetId, call.context);
+    },
+    impl: (_values, call) => {
+      const node = call.argumentNodes[0];
+      if (node.kind !== "reference") return evaluationError("#REF!");
+      const bounds = spillBounds({ kind: "spill", sheet: node.sheet, address: node.address }, call.currentSheetId, call.context);
+      return isEvaluationError(bounds) ? bounds : call.resolveBounds(bounds);
+    },
+  },
+  ROW: { minArgs: 0, maxArgs: 1, lazy: true, impl: (_values, call) => rowColumnValues("ROW", call) },
+  COLUMN: { minArgs: 0, maxArgs: 1, lazy: true, impl: (_values, call) => rowColumnValues("COLUMN", call) },
+  INDEX: {
+    ...lookupSpec("INDEX"),
+    liftArgs: [1, 2],
+    reference: indexReference,
+  },
+  OFFSET: {
+    minArgs: 3,
+    maxArgs: 5,
+    lazy: true,
+    volatile: true,
+    reference: offsetReference,
+    impl: (_values, call) => referenceValue(call, offsetReference(call)),
+  },
+  INDIRECT: {
+    minArgs: 1,
+    maxArgs: 2,
+    lazy: true,
+    volatile: true,
+    reference: indirectReference,
+    impl: (_values, call) => referenceValue(call, indirectReference(call)),
+  },
+  CHOOSE: {
+    minArgs: 2,
+    maxArgs: 255,
+    lazy: true,
+    reference: (call) => {
+      const index = toNumber(scalarArgument(call.evaluate(call.argumentNodes[0])));
+      if (isEvaluationError(index)) return index;
+      const chosen = Math.trunc(index);
+      if (chosen < 1 || chosen >= call.argumentNodes.length) return evaluationError("#VALUE!");
+      return call.referenceBounds(call.argumentNodes[chosen]);
+    },
+    impl: (_values, call) => {
+      const selector = call.evaluate(call.argumentNodes[0]);
+      const pick = (value: EvaluationScalar): EvaluationValue => {
+        const index = toNumber(value);
+        if (isEvaluationError(index)) return index;
+        const chosen = Math.trunc(index);
+        if (chosen < 1 || chosen >= call.argumentNodes.length) return evaluationError("#VALUE!");
+        return call.evaluate(call.argumentNodes[chosen]);
+      };
+      if (isEvaluationRange(selector) && !selector.sparse && selector.values.length > 1) {
+        return {
+          kind: "evaluationRange",
+          values: selector.values.map((value) => lambdaScalarResult(pick(value))),
+          rowCount: selector.rowCount,
+          columnCount: selector.columnCount,
+        };
+      }
+      const scalar = scalarArgument(selector);
+      return isEvaluationError(scalar) ? scalar : pick(scalar);
+    },
+  },
+  IF: {
+    minArgs: 2,
+    maxArgs: 3,
+    lazy: true,
+    reference: (call) => {
+      const condition = toBoolean(scalarArgument(call.evaluate(call.argumentNodes[0])));
+      if (isEvaluationError(condition)) return condition;
+      const branch = condition ? call.argumentNodes[1] : call.argumentNodes[2];
+      return branch ? call.referenceBounds(branch) : null;
+    },
+    impl: (_values, call) => {
+      const condition = call.evaluate(call.argumentNodes[0]);
+      const whenFalse = (): EvaluationValue =>
+        call.argumentNodes[2] ? call.evaluate(call.argumentNodes[2]) : false;
+      if (isEvaluationRange(condition) && !condition.sparse && condition.values.length > 1) {
+        // An array condition selects element-wise between both (broadcast) branches.
+        const whenTrue = call.evaluate(call.argumentNodes[1]);
+        const otherwise = whenFalse();
+        const rowCount = Math.max(condition.rowCount, isEvaluationRange(whenTrue) ? whenTrue.rowCount : 1, isEvaluationRange(otherwise) ? otherwise.rowCount : 1);
+        const columnCount = Math.max(condition.columnCount, isEvaluationRange(whenTrue) ? whenTrue.columnCount : 1, isEvaluationRange(otherwise) ? otherwise.columnCount : 1);
+        if (rowCount > MAX_RANGE_CELLS / columnCount) return evaluationError("#VALUE!");
+        const element = (value: EvaluationValue, row: number, column: number): EvaluationScalar => {
+          if (isLambdaValue(value)) return evaluationError("#CALC!");
+          if (!isEvaluationRange(value)) return value;
+          if (value.sparse) return evaluationError("#VALUE!");
+          const sourceRow = value.rowCount === 1 ? 0 : row;
+          const sourceColumn = value.columnCount === 1 ? 0 : column;
+          if (sourceRow >= value.rowCount || sourceColumn >= value.columnCount) return evaluationError("#N/A");
+          return value.values[sourceRow * value.columnCount + sourceColumn] ?? null;
+        };
+        const values: EvaluationScalar[] = [];
+        for (let row = 0; row < rowCount; row += 1) {
+          for (let column = 0; column < columnCount; column += 1) {
+            const test = toBoolean(element(condition, row, column));
+            values.push(isEvaluationError(test) ? test : element(test ? whenTrue : otherwise, row, column));
+          }
+        }
+        return { kind: "evaluationRange", values, rowCount, columnCount };
+      }
+      const test = toBoolean(scalarArgument(condition));
+      if (isEvaluationError(test)) return test;
+      if (test) return call.evaluate(call.argumentNodes[1]);
+      return whenFalse();
+    },
+  },
+  IFERROR: {
+    minArgs: 1,
+    maxArgs: 2,
+    lazy: true,
+    impl: (_values, call) => {
+      const value = call.evaluate(call.argumentNodes[0]);
+      const fallbackNode = call.argumentNodes[1];
+      if (isEvaluationRange(value) && !value.sparse) {
+        if (!value.values.some(isEvaluationError)) return value;
+        const fallback: EvaluationValue = fallbackNode && fallbackNode.kind !== "omitted" ? call.evaluate(fallbackNode) : "";
+        return {
+          ...value,
+          origin: undefined,
+          values: value.values.map((entry, index) => {
+            if (!isEvaluationError(entry)) return entry;
+            if (isEvaluationRange(fallback)) {
+              const row = Math.floor(index / value.columnCount);
+              const column = index % value.columnCount;
+              const sourceRow = fallback.rowCount === 1 ? 0 : row;
+              const sourceColumn = fallback.columnCount === 1 ? 0 : column;
+              return fallback.values[sourceRow * fallback.columnCount + sourceColumn] ?? evaluationError("#N/A");
+            }
+            return isLambdaValue(fallback) ? evaluationError("#CALC!") : fallback;
+          }),
+        };
+      }
+      if (!isEvaluationError(value)) return value;
+      return !fallbackNode || fallbackNode.kind === "omitted" ? "" : call.evaluate(fallbackNode);
+    },
+  },
+  IFNA: {
+    minArgs: 2,
+    maxArgs: 2,
+    lazy: true,
+    impl: (_values, call) => {
+      const value = call.evaluate(call.argumentNodes[0]);
+      const isNa = (entry: EvaluationScalar) => isEvaluationError(entry) && entry.code === "#N/A";
+      if (isEvaluationRange(value) && !value.sparse) {
+        if (!value.values.some(isNa)) return value;
+        const fallback = scalarArgument(call.evaluate(call.argumentNodes[1]));
+        return { ...value, origin: undefined, values: value.values.map((entry) => (isNa(entry) ? fallback : entry)) };
+      }
+      return isEvaluationError(value) && value.code === "#N/A" ? call.evaluate(call.argumentNodes[1]) : value;
+    },
+  },
+  SUBTOTAL: {
+    minArgs: 2,
+    maxArgs: 255,
+    lazy: true,
+    impl: (_values, call) => {
+      const selector = toNumber(scalarArgument(call.evaluate(call.argumentNodes[0])));
+      if (isEvaluationError(selector)) return selector;
+      const code = Math.trunc(selector);
+      const aggregate = SUBTOTAL_AGGREGATES[code > 100 ? code - 100 : code];
+      const spec = aggregate ? FUNCTION_REGISTRY[aggregate] : undefined;
+      if (!spec || spec.lazy) return evaluationError("#VALUE!");
+      const values = visibleReferenceValues(call, call.argumentNodes.slice(1), {
+        // Filtered rows are always excluded; 101-111 also exclude manually hidden rows.
+        skipHidden: code > 100,
+        skipFiltered: true,
+        skipErrors: false,
+        skipNested: true,
+      });
+      if (isEvaluationError(values)) return values;
+      return spec.impl(values, call);
+    },
+  },
+  AGGREGATE: {
+    minArgs: 3,
+    maxArgs: 255,
+    lazy: true,
+    impl: (_values, call) => {
+      const functionNumber = toNumber(scalarArgument(call.evaluate(call.argumentNodes[0])));
+      if (isEvaluationError(functionNumber)) return functionNumber;
+      const optionValue = call.argumentNodes[1].kind === "omitted" ? 0 : toNumber(scalarArgument(call.evaluate(call.argumentNodes[1])));
+      if (isEvaluationError(optionValue)) return optionValue;
+      const name = AGGREGATE_FUNCTIONS[Math.trunc(functionNumber)];
+      const spec = name ? FUNCTION_REGISTRY[name] : undefined;
+      if (!spec || spec.lazy) return evaluationError("#VALUE!");
+      const option = Math.trunc(optionValue);
+      if (option < 0 || option > 7) return evaluationError("#VALUE!");
+      const settings = {
+        skipNested: option <= 3,
+        skipHidden: option === 1 || option === 3 || option === 5 || option === 7,
+        skipFiltered: option === 1 || option === 3 || option === 5 || option === 7,
+        skipErrors: option === 2 || option === 3 || option === 6 || option === 7,
+      };
+      const numberOfFunction = Math.trunc(functionNumber);
+      if (numberOfFunction >= 14) {
+        if (call.argumentNodes.length < 4) return evaluationError("#VALUE!");
+        const values = visibleReferenceValues(call, [call.argumentNodes[2]], settings);
+        if (isEvaluationError(values)) return values;
+        return callWithLifting(spec, [values[0], call.evaluate(call.argumentNodes[3])], call);
+      }
+      const values = visibleReferenceValues(call, call.argumentNodes.slice(2), settings);
+      if (isEvaluationError(values)) return values;
+      return spec.impl(values, call);
+    },
+  },
+  ISREF: {
+    minArgs: 1,
+    maxArgs: 1,
+    lazy: true,
+    impl: (_values, call) => {
+      const bounds = call.referenceBounds(call.argumentNodes[0]);
+      return bounds !== null && !isEvaluationError(bounds);
+    },
+  },
+  FORMULATEXT: {
+    minArgs: 1,
+    maxArgs: 1,
+    lazy: true,
+    impl: (_values, call) => {
+      const bounds = call.referenceBounds(call.argumentNodes[0]);
+      if (bounds === null) return evaluationError("#VALUE!");
+      if (isEvaluationError(bounds)) return bounds;
+      const address = `${columnNumberToLabel(bounds.firstColumn) ?? ""}${bounds.firstRow}`;
+      const formula = call.hooks.getCellFormula?.(bounds.sheetId, address);
+      call.hooks.trackRange?.(bounds.sheetId, { startRow: bounds.firstRow, endRow: bounds.firstRow, startColumn: bounds.firstColumn, endColumn: bounds.firstColumn });
+      return formula ? `=${formula.replace(/^=/, "")}` : evaluationError("#N/A");
+    },
+  },
+  SHEET: {
+    minArgs: 0,
+    maxArgs: 1,
+    lazy: true,
+    impl: (_values, call) => {
+      const names = call.hooks.getSheetNames?.() ?? [];
+      const node = call.argumentNodes[0];
+      let target: string | null = null;
+      if (!node || node.kind === "omitted") target = call.hooks.getSheetName?.(call.context.formulaSheetId) ?? call.context.formulaSheetId;
+      else {
+        const bounds = call.referenceBounds(node);
+        if (bounds && !isEvaluationError(bounds)) target = call.hooks.getSheetName?.(bounds.sheetId) ?? bounds.sheetId;
+        else {
+          const text = toText(scalarArgument(call.evaluate(node)));
+          if (isEvaluationError(text)) return text;
+          target = text;
+        }
+      }
+      const index = names.findIndex((name) => name.toLocaleLowerCase() === String(target).toLocaleLowerCase());
+      return index >= 0 ? index + 1 : evaluationError("#N/A");
+    },
+  },
+  SHEETS: {
+    minArgs: 0,
+    maxArgs: 1,
+    impl: (_values, call) => (call.argumentNodes.length ? 1 : Math.max(1, call.hooks.getSheetNames?.().length ?? 1)),
+  },
+};
+
+const VOLATILE_FUNCTIONS = ["TODAY", "NOW", "RAND", "RANDBETWEEN", "RANDARRAY", "CELL", "INFO"];
+const LIFT_ALL = [
+  "ABS", "INT", "SQRT", "MOD", "POWER", "ROUND", "ROUNDUP", "ROUNDDOWN", "TRUNC", "CEILING", "CEILING.MATH",
+  "FLOOR", "FLOOR.MATH", "MROUND", "EVEN", "ODD", "SIGN", "EXP", "LN", "LOG", "LOG10", "SIN", "COS", "TAN",
+  "ASIN", "ACOS", "ATAN", "ATAN2", "DEGREES", "RADIANS", "SQRTPI", "LEN", "TRIM", "UPPER", "LOWER", "PROPER",
+  "CLEAN", "LEFT", "RIGHT", "MID", "SUBSTITUTE", "FIND", "SEARCH", "EXACT", "VALUE", "TEXT", "REPT", "CHAR",
+  "CODE", "REPLACE", "FIXED", "DOLLAR", "DATE", "YEAR", "MONTH", "DAY", "EDATE", "EOMONTH", "DATEVALUE",
+  "TIMEVALUE", "TIME", "HOUR", "MINUTE", "SECOND", "WEEKDAY", "WEEKNUM", "DATEDIF", "DAYS", "ISBLANK",
+  "ISNUMBER", "ISTEXT", "ISLOGICAL", "ISERROR", "ISERR", "ISNA", "NOT", "RANDBETWEEN",
+];
+const LIFT_SELECTED: Record<string, FunctionSpec["liftArgs"]> = {
+  MATCH: [0],
+  VLOOKUP: [0],
+  HLOOKUP: [0],
+  TEXTBEFORE: [0],
+  TEXTAFTER: [0],
+  COUNTIF: [1],
+  SUMIF: [1],
+  AVERAGEIF: [1],
+  COUNTIFS: (index) => index % 2 === 1,
+  SUMIFS: (index) => index >= 2 && index % 2 === 0,
+  AVERAGEIFS: (index) => index >= 2 && index % 2 === 0,
+  MINIFS: (index) => index >= 2 && index % 2 === 0,
+  MAXIFS: (index) => index >= 2 && index % 2 === 0,
+  NETWORKDAYS: [0, 1],
+  WORKDAY: [0, 1],
+  LARGE: [1],
+  SMALL: [1],
+  PERCENTILE: [1],
+  "PERCENTILE.INC": [1],
+  QUARTILE: [1],
+  "QUARTILE.INC": [1],
+  RANK: [0],
+  "RANK.EQ": [0],
+  PMT: "all",
+  FV: "all",
+  PV: "all",
+  NPER: "all",
+  IPMT: "all",
+  PPMT: "all",
+};
+
+registerFormulaFunctions(CORE_FUNCTIONS);
+for (const name of VOLATILE_FUNCTIONS) {
+  if (FUNCTION_REGISTRY[name]) FUNCTION_REGISTRY[name] = { ...FUNCTION_REGISTRY[name], volatile: true };
+}
+for (const name of LIFT_ALL) {
+  if (FUNCTION_REGISTRY[name] && !FUNCTION_REGISTRY[name].lazy) FUNCTION_REGISTRY[name] = { ...FUNCTION_REGISTRY[name], liftArgs: "all" };
+}
+for (const [name, liftArgs] of Object.entries(LIFT_SELECTED)) {
+  if (FUNCTION_REGISTRY[name] && !FUNCTION_REGISTRY[name].lazy) FUNCTION_REGISTRY[name] = { ...FUNCTION_REGISTRY[name], liftArgs };
+}
+for (const name of ["UNIQUE", "SORT", "FILTER", "SEQUENCE", "TRANSPOSE"]) {
+  if (FUNCTION_REGISTRY[name]) FUNCTION_REGISTRY[name] = { ...FUNCTION_REGISTRY[name], returnsArray: true };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Evaluation: calls, names, LET/LAMBDA scopes, references, spills, and structured references
+// ---------------------------------------------------------------------------------------------
+
+const FILE_FUNCTION_PREFIX = /^(?:_xlfn\.)?(?:_xlws\.)?/i;
+
+function normalizedFunctionName(name: string): string {
+  return name.replace(FILE_FUNCTION_PREFIX, "").toUpperCase();
+}
+
+/** LET/LAMBDA parameter names are stored with an `_xlpm.` prefix in workbook files. */
+function normalizedLocalName(name: string): string {
+  return name.replace(/^_xlpm\./i, "").toUpperCase();
+}
+
+function lookupScope(
+  context: EvaluationContext,
+  name: string,
+): { found: false } | { found: true; value: EvaluationValue; omitted: boolean } {
+  const key = normalizedLocalName(name);
+  for (let scope = context.scope; scope; scope = scope.parent) {
+    if (scope.names.has(key)) {
+      return { found: true, value: scope.names.get(key) ?? null, omitted: scope.omitted.has(key) };
+    }
+  }
+  return { found: false };
+}
+
+function shouldLift(spec: FunctionSpec, index: number): boolean {
+  const lift = spec.liftArgs;
+  if (!lift) return false;
+  if (lift === "all") return true;
+  if (typeof lift === "function") return lift(index);
+  return lift.includes(index);
+}
+
+function scalarFromResult(result: EvaluationValue): EvaluationScalar {
+  if (isLambdaValue(result)) return evaluationError("#CALC!");
+  if (isEvaluationRange(result)) {
+    if (result.sparse) return evaluationError("#VALUE!");
+    return result.values.length ? result.values[0] : evaluationError("#CALC!");
+  }
+  return result;
+}
+
+/** Apply a scalar function element-wise over array arguments with Excel broadcasting. */
+function callWithLifting(
+  spec: FunctionSpec,
+  values: EvaluationValue[],
+  evaluation: FunctionEvaluation,
+): EvaluationValue {
+  if (!spec.liftArgs) return spec.impl(values, evaluation);
+  let rows = 1;
+  let columns = 1;
+  let lifted = false;
+  const normalized = values.slice();
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (!isEvaluationRange(value) || !shouldLift(spec, index)) continue;
+    if (value.values.length === 1 && !value.sparse) {
+      normalized[index] = value.values[0];
+      continue;
+    }
+    if (value.sparse) return evaluationError("#VALUE!");
+    lifted = true;
+    rows = Math.max(rows, value.rowCount);
+    columns = Math.max(columns, value.columnCount);
+  }
+  if (!lifted) return spec.impl(normalized, evaluation);
+  if (rows > MAX_RANGE_CELLS / columns) return evaluationError("#VALUE!");
+  const output: EvaluationScalar[] = new Array(rows * columns);
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const args = normalized.map((value, index): EvaluationValue => {
+        if (!isEvaluationRange(value) || !shouldLift(spec, index)) return value;
+        const sourceRow = value.rowCount === 1 ? 0 : row;
+        const sourceColumn = value.columnCount === 1 ? 0 : column;
+        if (sourceRow >= value.rowCount || sourceColumn >= value.columnCount) {
+          return evaluationError("#N/A");
+        }
+        return value.values[sourceRow * value.columnCount + sourceColumn] ?? null;
+      });
+      output[row * columns + column] = scalarFromResult(spec.impl(args, evaluation));
+    }
+  }
+  return { kind: "evaluationRange", values: output, rowCount: rows, columnCount: columns };
+}
+
+function makeFunctionEvaluation(
+  argumentNodes: FormulaNode[],
+  currentSheetId: string,
+  context: EvaluationContext,
+  depth: number,
+): FunctionEvaluation {
+  return {
+    currentSheetId,
+    context,
+    depth,
+    argumentNodes,
+    hooks: context.hooks,
+    evaluate: (node) => evaluateNode(node, currentSheetId, context, depth + 1),
+    invokeLambda: (lambda, args) => invokeLambdaValue(lambda, args, context, depth + 1),
+    referenceBounds: (node) => referenceBoundsOf(node, currentSheetId, context, depth + 1),
+    resolveBounds: (bounds) => resolveRectangle(bounds, currentSheetId, context),
+  };
+}
+
+function invokeLambdaValue(
+  callee: EvaluationValue,
+  args: EvaluationValue[],
+  context: EvaluationContext,
+  depth: number,
+  omitted: boolean[] = [],
+): EvaluationValue {
+  if (!isLambdaValue(callee)) {
+    return isEvaluationError(callee) ? callee : evaluationError("#VALUE!");
+  }
+  if (depth > MAX_CALCULATION_DEPTH) return evaluationError("#CALC!");
+  if (args.length > callee.parameters.length) return evaluationError("#VALUE!");
+  const scope: EvaluationScope = { names: new Map(), omitted: new Set(), parent: callee.scope };
+  callee.parameters.forEach((parameter, index) => {
+    if (index < args.length && !omitted[index]) {
+      scope.names.set(parameter, args[index]);
+    } else {
+      scope.names.set(parameter, null);
+      scope.omitted.add(parameter);
+    }
+  });
+  const saved = context.scope;
+  context.scope = scope;
+  try {
+    return evaluateNode(callee.body, callee.sheetId, context, depth + 1);
+  } finally {
+    context.scope = saved;
+  }
+}
+
+function parsedDefinedName(
+  name: string,
+  currentSheetId: string,
+  context: EvaluationContext,
+): FormulaNode | FormulaPrimitive | undefined {
+  const resolveDefinedName = context.hooks.resolveDefinedName;
+  if (!resolveDefinedName) return undefined;
+  let resolved: FormulaPrimitive;
+  try {
+    resolved = resolveDefinedName(name, currentSheetId);
+  } catch {
+    return undefined;
+  }
+  if (resolved === undefined || resolved === null) return undefined;
+  if (typeof resolved !== "string") return resolved;
+  const explicitFormula = resolved.trim().startsWith("=");
+  const source = resolved.trim().replace(/^=/, "");
+  const parsed = cachedParse(source);
+  if (typeof parsed === "string") return resolved;
+  // A host may hand back a plain text constant ("East"); only a "="-prefixed text is a
+  // reference to another name.
+  if (parsed.kind === "name" && !explicitFormula) return resolved;
+  return parsed;
+}
+
+function isFormulaNode(value: unknown): value is FormulaNode {
+  return typeof value === "object" && value !== null && typeof (value as { kind?: unknown }).kind === "string" && !(value instanceof Date);
+}
+
 function evaluateCall(
   call: CallNode,
   currentSheetId: string,
   context: EvaluationContext,
   depth: number,
 ): EvaluationValue {
-  const name = call.name.replace(/^_xlfn\./i, "").toUpperCase();
+  const evaluateArgument = (argument: FormulaNode) => evaluateNode(argument, currentSheetId, context, depth + 1);
+
+  // A LET/LAMBDA-bound name shadows workbook functions.
+  const scoped = lookupScope(context, call.name);
+  if (scoped.found) {
+    return invokeLambdaValue(
+      scoped.value,
+      call.arguments.map(evaluateArgument),
+      context,
+      depth,
+      call.arguments.map((argument) => argument.kind === "omitted"),
+    );
+  }
+
+  const name = normalizedFunctionName(call.name);
   const spec = Object.prototype.hasOwnProperty.call(FUNCTION_REGISTRY, name)
     ? FUNCTION_REGISTRY[name]
     : undefined;
-  if (!spec) return evaluationError("#NAME?");
+  if (!spec) {
+    // Workbook-level LAMBDA functions defined in the Name Manager.
+    const named = parsedDefinedName(call.name, currentSheetId, context);
+    if (isFormulaNode(named)) {
+      const lambda = evaluateNode(named, currentSheetId, context, depth + 1);
+      if (isLambdaValue(lambda)) {
+        return invokeLambdaValue(
+          lambda,
+          call.arguments.map(evaluateArgument),
+          context,
+          depth,
+          call.arguments.map((argument) => argument.kind === "omitted"),
+        );
+      }
+    }
+    return evaluationError("#NAME?");
+  }
   if (call.arguments.length < spec.minArgs || call.arguments.length > spec.maxArgs) {
     return evaluationError("#VALUE!");
   }
-  const evaluation: FunctionEvaluation = {
-    currentSheetId,
-    context,
-    depth,
-    argumentNodes: call.arguments,
-    evaluate: (node) => evaluateNode(node, currentSheetId, context, depth + 1),
-  };
-  const values = spec.lazy
-    ? []
-    : call.arguments.map((argument) =>
-        evaluateNode(argument, currentSheetId, context, depth + 1),
-      );
-  return spec.impl(values, evaluation);
+  if (spec.volatile) context.hooks.markVolatile?.();
+  const evaluation = makeFunctionEvaluation(call.arguments, currentSheetId, context, depth);
+  if (spec.lazy) return spec.impl([], evaluation);
+  const values = call.arguments.map(evaluateArgument);
+  return callWithLifting(spec, values, evaluation);
 }
 
 function resolveName(
@@ -4027,31 +5390,275 @@ function resolveName(
   context: EvaluationContext,
   depth: number,
 ): EvaluationValue {
-  const resolveDefinedName = context.hooks.resolveDefinedName;
-  if (!resolveDefinedName) return evaluationError("#NAME?");
-  let resolved: FormulaPrimitive;
-  try {
-    resolved = resolveDefinedName(node.name);
-  } catch {
-    return evaluationError("#NAME?");
-  }
-  if (resolved === undefined || resolved === null) return evaluationError("#NAME?");
-  if (typeof resolved === "string") {
-    let parsed: FormulaNode | null = null;
-    try {
-      parsed = new FormulaParser(tokenize(resolved)).parse();
-    } catch {
-      parsed = null;
+  const scoped = lookupScope(context, node.name);
+  if (scoped.found) return scoped.value;
+  const resolved = parsedDefinedName(node.name, currentSheetId, context);
+  if (resolved === undefined) return evaluationError("#NAME?");
+  if (isFormulaNode(resolved)) return evaluateNode(resolved, currentSheetId, context, depth + 1);
+  return normalizePrimitive(resolved as FormulaPrimitive);
+}
+
+// ---- Structured references -----------------------------------------------------------------
+
+export interface StructuredSpecifier {
+  thisRow: boolean;
+  specials: Set<string>;
+  columns: string[];
+  span: [string, string] | null;
+}
+
+function unescapeStructuredName(value: string): string {
+  return value.replace(/'(.)/g, "$1").trim();
+}
+
+function splitStructuredItems(inner: string): string[] {
+  const items: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (let index = 0; index < inner.length; index += 1) {
+    const character = inner[index];
+    if (character === "'") {
+      current += character + (inner[index + 1] ?? "");
+      index += 1;
+      continue;
     }
-    if (
-      parsed &&
-      (parsed.kind === "reference" || parsed.kind === "range" || parsed.kind === "wholeRange")
-    ) {
-      return evaluateNode(parsed, currentSheetId, context, depth + 1);
+    if (character === "[") depth += 1;
+    if (character === "]") depth -= 1;
+    if ((character === "," || character === ":") && depth === 0) {
+      items.push(current.trim());
+      items.push(character);
+      current = "";
+      continue;
     }
-    return resolved;
+    current += character;
   }
-  return normalizePrimitive(resolved);
+  if (current.trim()) items.push(current.trim());
+  return items;
+}
+
+export function parseStructuredSpecifier(specifier: string): StructuredSpecifier | null {
+  const trimmed = specifier.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
+  let inner = trimmed.slice(1, -1).trim();
+  const result: StructuredSpecifier = { thisRow: false, specials: new Set(), columns: [], span: null };
+  if (inner.startsWith("@")) {
+    result.thisRow = true;
+    inner = inner.slice(1).trim();
+    if (!inner) return result;
+    if (!inner.startsWith("[")) {
+      result.columns.push(unescapeStructuredName(inner));
+      return result;
+    }
+  }
+  if (!inner) return result;
+  if (!inner.includes("[")) {
+    if (inner.startsWith("#")) result.specials.add(inner.toLowerCase());
+    else result.columns.push(unescapeStructuredName(inner));
+    return result;
+  }
+  const items = splitStructuredItems(inner);
+  const names: string[] = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (item === ",") continue;
+    if (item === ":") continue;
+    const text = item.startsWith("[") && item.endsWith("]") ? item.slice(1, -1).trim() : item;
+    if (text.startsWith("#")) {
+      const special = text.toLowerCase();
+      if (special === "#this row") result.thisRow = true;
+      else result.specials.add(special);
+      continue;
+    }
+    if (text.startsWith("@")) {
+      result.thisRow = true;
+      const rest = text.slice(1).trim();
+      if (rest) names.push(unescapeStructuredName(rest.replace(/^\[|\]$/g, "")));
+      continue;
+    }
+    names.push(unescapeStructuredName(text));
+    if (items[index + 1] === ":" && index + 2 < items.length) {
+      const endItem = items[index + 2];
+      const endText = endItem.startsWith("[") && endItem.endsWith("]") ? endItem.slice(1, -1).trim() : endItem;
+      result.span = [unescapeStructuredName(text), unescapeStructuredName(endText)];
+      names.pop();
+      index += 2;
+    }
+  }
+  result.columns.push(...names);
+  return result;
+}
+
+function structuredBounds(
+  node: StructuredNode,
+  currentSheetId: string,
+  context: EvaluationContext,
+): RectangleBounds | EvaluationError {
+  const resolveTable = context.hooks.resolveTable;
+  if (!resolveTable) return evaluationError("#REF!");
+  const table = resolveTable(node.table ? node.table : null, currentSheetId);
+  if (!table) return evaluationError("#REF!");
+  const specifier = parseStructuredSpecifier(node.specifier);
+  if (!specifier) return evaluationError("#REF!");
+
+  const headerStart = table.startRow;
+  const bodyStart = table.startRow + table.headerRowCount;
+  const bodyEnd = table.endRow - table.totalsRowCount;
+  const totalsStart = bodyEnd + 1;
+  let firstRow = bodyStart;
+  let lastRow = bodyEnd;
+  if (specifier.specials.size) {
+    const rows: Array<[number, number]> = [];
+    for (const special of specifier.specials) {
+      if (special === "#all") rows.push([table.startRow, table.endRow]);
+      else if (special === "#data") rows.push([bodyStart, bodyEnd]);
+      else if (special === "#headers") {
+        if (!table.headerRowCount) return evaluationError("#REF!");
+        rows.push([headerStart, bodyStart - 1]);
+      } else if (special === "#totals") {
+        if (!table.totalsRowCount) return evaluationError("#REF!");
+        rows.push([totalsStart, table.endRow]);
+      } else return evaluationError("#REF!");
+    }
+    firstRow = Math.min(...rows.map(([start]) => start));
+    lastRow = Math.max(...rows.map(([, end]) => end));
+  }
+  if (specifier.thisRow) {
+    const cell = context.hooks.currentCell;
+    if (!cell || cell.row < bodyStart || cell.row > bodyEnd) return evaluationError("#VALUE!");
+    firstRow = cell.row;
+    lastRow = cell.row;
+  }
+
+  const columnIndex = (name: string): number => {
+    const wanted = name.toLocaleLowerCase();
+    return table.columns.findIndex((column) => column.trim().toLocaleLowerCase() === wanted);
+  };
+  let firstColumn = table.startColumn;
+  let lastColumn = table.endColumn;
+  const indices: number[] = [];
+  if (specifier.span) {
+    const start = columnIndex(specifier.span[0]);
+    const end = columnIndex(specifier.span[1]);
+    if (start < 0 || end < 0) return evaluationError("#REF!");
+    indices.push(start, end);
+  }
+  for (const column of specifier.columns) {
+    const index = columnIndex(column);
+    if (index < 0) return evaluationError("#REF!");
+    indices.push(index);
+  }
+  if (indices.length) {
+    firstColumn = table.startColumn + Math.min(...indices);
+    lastColumn = table.startColumn + Math.max(...indices);
+  }
+  if (lastRow < firstRow) return evaluationError("#REF!");
+  return { sheetId: table.sheetId, firstRow, lastRow, firstColumn, lastColumn };
+}
+
+function spillBounds(
+  node: SpillNode,
+  currentSheetId: string,
+  context: EvaluationContext,
+): RectangleBounds | EvaluationError {
+  const sheetId = node.sheet ?? currentSheetId;
+  context.hooks.trackRange?.(sheetId, {
+    startRow: node.address.row,
+    endRow: node.address.row,
+    startColumn: node.address.column,
+    endColumn: node.address.column,
+  });
+  const bounds = context.hooks.resolveSpill?.(sheetId, node.address.row, node.address.column);
+  if (!bounds) return evaluationError("#REF!");
+  return {
+    sheetId,
+    firstRow: bounds.startRow,
+    lastRow: bounds.endRow,
+    firstColumn: bounds.startColumn,
+    lastColumn: bounds.endColumn,
+  };
+}
+
+/** The rectangle a node refers to, when it is (or computes) a reference. */
+function referenceBoundsOf(
+  node: FormulaNode,
+  currentSheetId: string,
+  context: EvaluationContext,
+  depth: number,
+): RectangleBounds | EvaluationError | null {
+  if (depth > MAX_CALCULATION_DEPTH) return evaluationError("#CALC!");
+  switch (node.kind) {
+    case "reference":
+    case "range":
+    case "wholeRange":
+      return referenceNodeBounds(node, currentSheetId, context);
+    case "spill":
+      return spillBounds(node, currentSheetId, context);
+    case "structured":
+      return structuredBounds(node, currentSheetId, context);
+    case "rangeOp": {
+      const left = referenceBoundsOf(node.left, currentSheetId, context, depth + 1);
+      const right = referenceBoundsOf(node.right, currentSheetId, context, depth + 1);
+      if (left === null || right === null) return evaluationError("#VALUE!");
+      if (isEvaluationError(left)) return left;
+      if (isEvaluationError(right)) return right;
+      if (left.sheetId.toLowerCase() !== right.sheetId.toLowerCase()) return evaluationError("#REF!");
+      return {
+        sheetId: left.sheetId,
+        firstRow: Math.min(left.firstRow, right.firstRow),
+        lastRow: Math.max(left.lastRow, right.lastRow),
+        firstColumn: Math.min(left.firstColumn, right.firstColumn),
+        lastColumn: Math.max(left.lastColumn, right.lastColumn),
+      };
+    }
+    case "name": {
+      const scoped = lookupScope(context, node.name);
+      if (scoped.found) {
+        return isEvaluationRange(scoped.value) && scoped.value.origin ? scoped.value.origin : null;
+      }
+      const resolved = parsedDefinedName(node.name, currentSheetId, context);
+      return isFormulaNode(resolved) ? referenceBoundsOf(resolved, currentSheetId, context, depth + 1) : null;
+    }
+    case "call": {
+      if (lookupScope(context, node.name).found) return null;
+      const spec = FUNCTION_REGISTRY[normalizedFunctionName(node.name)];
+      if (!spec?.reference) return null;
+      if (spec.volatile) context.hooks.markVolatile?.();
+      return spec.reference(makeFunctionEvaluation(node.arguments, currentSheetId, context, depth));
+    }
+    default:
+      return null;
+  }
+}
+
+function resolveBoundsValue(
+  bounds: RectangleBounds | EvaluationError,
+  currentSheetId: string,
+  context: EvaluationContext,
+  unwrapSingle: boolean,
+): EvaluationValue {
+  if (isEvaluationError(bounds)) return bounds;
+  const value = resolveRectangle(bounds, currentSheetId, context);
+  if (unwrapSingle && isEvaluationRange(value) && !value.sparse && value.values.length === 1) {
+    return value.values[0];
+  }
+  return value;
+}
+
+/** `@range`: the value in the formula's own row or column (Excel implicit intersection). */
+function implicitIntersection(value: EvaluationValue, context: EvaluationContext): EvaluationValue {
+  if (isLambdaValue(value)) return evaluationError("#VALUE!");
+  if (!isEvaluationRange(value)) return value;
+  if (value.sparse) return evaluationError("#VALUE!");
+  if (value.values.length === 1) return value.values[0];
+  const origin = value.origin;
+  const cell = context.hooks.currentCell;
+  if (!origin || !cell) return value.values[0] ?? null;
+  const rowIndex = value.rowCount === 1 ? 0 : cell.row - origin.firstRow;
+  const columnIndex = value.columnCount === 1 ? 0 : cell.column - origin.firstColumn;
+  if (rowIndex < 0 || rowIndex >= value.rowCount || columnIndex < 0 || columnIndex >= value.columnCount) {
+    return evaluationError("#VALUE!");
+  }
+  return value.values[rowIndex * value.columnCount + columnIndex] ?? null;
 }
 
 function evaluateNode(
@@ -4062,34 +5669,140 @@ function evaluateNode(
 ): EvaluationValue {
   if (depth > MAX_CALCULATION_DEPTH) return evaluationError("#CALC!");
 
-  if (node.kind === "literal") return node.value;
-  if (node.kind === "error") return evaluationError(node.value);
-  if (node.kind === "reference") return resolveReference(node, currentSheetId, context);
-  if (node.kind === "range" || node.kind === "wholeRange") {
-    return resolveRange(node, currentSheetId, context);
+  switch (node.kind) {
+    case "literal":
+      return node.value;
+    case "omitted":
+      return null;
+    case "error":
+      return evaluationError(node.value);
+    case "reference":
+      return resolveReference(node, currentSheetId, context);
+    case "range":
+    case "wholeRange":
+      return resolveRange(node, currentSheetId, context);
+    case "array":
+      return {
+        kind: "evaluationRange",
+        values: node.values.slice(),
+        rowCount: node.rowCount,
+        columnCount: node.columnCount,
+      };
+    case "name":
+      return resolveName(node, currentSheetId, context, depth);
+    case "call":
+      return evaluateCall(node, currentSheetId, context, depth);
+    case "spill":
+      return resolveBoundsValue(spillBounds(node, currentSheetId, context), currentSheetId, context, false);
+    case "structured":
+      return resolveBoundsValue(structuredBounds(node, currentSheetId, context), currentSheetId, context, true);
+    case "rangeOp": {
+      const bounds = referenceBoundsOf(node, currentSheetId, context, depth + 1);
+      if (bounds === null) return evaluationError("#VALUE!");
+      return resolveBoundsValue(bounds, currentSheetId, context, false);
+    }
+    case "invoke": {
+      const callee = evaluateNode(node.callee, currentSheetId, context, depth + 1);
+      return invokeLambdaValue(
+        callee,
+        node.arguments.map((argument) => evaluateNode(argument, currentSheetId, context, depth + 1)),
+        context,
+        depth,
+        node.arguments.map((argument) => argument.kind === "omitted"),
+      );
+    }
+    case "unary": {
+      const operand = evaluateNode(node.operand, currentSheetId, context, depth + 1);
+      if (node.operator === "@") return implicitIntersection(operand, context);
+      // `--(A2:A100="x")` coerces a boolean mask to 1/0, so unary operators broadcast too.
+      if (isEvaluationRange(operand)) {
+        if (operand.sparse) return evaluationError("#VALUE!");
+        return {
+          kind: "evaluationRange",
+          values: operand.values.map((entry) => {
+            const number = toNumber(entry);
+            if (isEvaluationError(number)) return number;
+            if (node.operator === "-") return -number;
+            if (node.operator === "%") return number / 100;
+            return number;
+          }),
+          rowCount: operand.rowCount,
+          columnCount: operand.columnCount,
+        };
+      }
+      const value = toNumber(operand);
+      if (isEvaluationError(value)) return value;
+      if (node.operator === "-") return -value;
+      if (node.operator === "%") return value / 100;
+      return value;
+    }
+    case "binary": {
+      const left = evaluateNode(node.left, currentSheetId, context, depth + 1);
+      const right = evaluateNode(node.right, currentSheetId, context, depth + 1);
+      if (isLambdaValue(left) || isLambdaValue(right)) return evaluationError("#VALUE!");
+      return applyBinaryOperator(node.operator, left, right);
+    }
   }
-  if (node.kind === "array") {
-    return {
-      kind: "evaluationRange",
-      values: node.values,
-      rowCount: node.rowCount,
-      columnCount: node.columnCount,
-    };
-  }
-  if (node.kind === "name") return resolveName(node, currentSheetId, context, depth);
-  if (node.kind === "call") return evaluateCall(node, currentSheetId, context, depth);
+}
 
-  if (node.kind === "unary") {
-    const value = toNumber(evaluateNode(node.operand, currentSheetId, context, depth + 1));
-    if (isEvaluationError(value)) return value;
-    if (node.operator === "-") return -value;
-    if (node.operator === "%") return value / 100;
-    return value;
-  }
+// ---- Parsing cache ---------------------------------------------------------------------------
 
-  const left = evaluateNode(node.left, currentSheetId, context, depth + 1);
-  const right = evaluateNode(node.right, currentSheetId, context, depth + 1);
-  return applyBinaryOperator(node.operator, left, right);
+const PARSE_CACHE = new Map<string, FormulaNode | FormulaError>();
+const PARSE_CACHE_LIMIT = 50_000;
+
+/** Parse a formula body (without "="); results are cached by source text. Errors are returned as codes. */
+function cachedParse(source: string): FormulaNode | FormulaError {
+  let entry = PARSE_CACHE.get(source);
+  if (entry === undefined) {
+    try {
+      entry = new FormulaParser(tokenize(source)).parse();
+    } catch (error) {
+      entry = error instanceof FormulaParseError ? error.formulaError : "#PARSE!";
+    }
+    if (PARSE_CACHE.size >= PARSE_CACHE_LIMIT) PARSE_CACHE.clear();
+    PARSE_CACHE.set(source, entry);
+  }
+  return entry;
+}
+
+function formulaBody(formula: string): string {
+  let source = formula.trim();
+  if (source.startsWith("=")) source = source.slice(1).trim();
+  return source;
+}
+
+/** Parse a formula to its syntax tree, or return the error code it would evaluate to. */
+export function parseFormula(formula: string): FormulaNode | FormulaError {
+  const source = formulaBody(formula);
+  if (!source) return "#PARSE!";
+  return cachedParse(source);
+}
+
+function evaluateFormulaValue(
+  formula: string,
+  currentSheetId: string,
+  context: EvaluationContext,
+): EvaluationValue {
+  if (context.calculationDepth >= MAX_CALCULATION_DEPTH) {
+    return evaluationError("#CALC!");
+  }
+  const source = formulaBody(formula);
+  if (!source) return evaluationError("#PARSE!");
+  const node = cachedParse(source);
+  if (typeof node === "string") return evaluationError(node);
+
+  context.calculationDepth += 1;
+  // Another cell's formula never sees this formula's LET/LAMBDA names.
+  const savedScope = context.scope;
+  context.scope = null;
+  try {
+    return evaluateNode(node, currentSheetId, context);
+  } catch (error) {
+    return evaluationError(error instanceof FormulaParseError ? error.formulaError : "#VALUE!");
+  } finally {
+    context.scope = savedScope;
+    context.calculationDepth -= 1;
+  }
 }
 
 function evaluateFormulaText(
@@ -4097,35 +5810,41 @@ function evaluateFormulaText(
   currentSheetId: string,
   context: EvaluationContext,
 ): EvaluationScalar {
-  if (context.calculationDepth >= MAX_CALCULATION_DEPTH) {
-    return evaluationError("#CALC!");
+  const value = evaluateFormulaValue(formula, currentSheetId, context);
+  if (isLambdaValue(value)) return evaluationError("#CALC!");
+  if (isEvaluationRange(value)) {
+    return value.sparse ? evaluationError("#VALUE!") : (value.values[0] ?? null);
   }
+  return value;
+}
 
-  context.calculationDepth += 1;
-  try {
-    let source = formula.trim();
-    if (source.startsWith("=")) source = source.slice(1).trim();
-    if (!source) return evaluationError("#PARSE!");
-    const node = new FormulaParser(tokenize(source)).parse();
-    const value = evaluateNode(node, currentSheetId, context);
-    if (isEvaluationRange(value)) {
-      return value.sparse ? evaluationError("#VALUE!") : (value.values[0] ?? null);
-    }
-    return value;
-  } catch (error) {
-    return evaluationError(
-      error instanceof FormulaParseError ? error.formulaError : "#PARSE!",
-    );
-  } finally {
-    context.calculationDepth -= 1;
-  }
+function createContext(
+  resolver: FormulaResolver,
+  hooks: FormulaEvaluationHooks | undefined,
+  currentSheetId: string,
+): EvaluationContext {
+  return {
+    resolver,
+    hooks: hooks ?? {},
+    visiting: new Set(),
+    memo: new Map(),
+    now: new Date(),
+    calculationDepth: 0,
+    scope: null,
+    formulaSheetId: currentSheetId,
+  };
+}
+
+function publicScalar(value: EvaluationScalar): FormulaResult {
+  if (isEvaluationError(value)) return value.code;
+  return value === null ? 0 : value;
 }
 
 /**
  * Safely evaluate a common Excel-style formula without executing JavaScript.
  * `TODAY` and `NOW` return Excel serial date numbers. A formula evaluating to
  * a rectangular array (dynamic-array functions, `A1:B2`, `{1,2;3,4}`) returns
- * its top-left value; spilling is not supported.
+ * its top-left value; use `evaluateFormulaDetailed` to receive the whole array.
  */
 export function evaluateFormula(
   formula: string,
@@ -4134,17 +5853,113 @@ export function evaluateFormula(
   hooks?: FormulaEvaluationHooks,
 ): FormulaResult {
   if (typeof formula !== "string" || typeof resolver !== "function") return "#PARSE!";
-  const context: EvaluationContext = {
-    resolver,
-    hooks: hooks ?? {},
-    visiting: new Set(),
-    memo: new Map(),
-    now: new Date(),
-    calculationDepth: 0,
+  const context = createContext(resolver, hooks, currentSheetId);
+  return publicScalar(evaluateFormulaText(formula, currentSheetId, context));
+}
+
+export interface FormulaArrayResult {
+  rowCount: number;
+  columnCount: number;
+  /** Row-major values; blanks inside a spilled reference read as 0, as in Excel. */
+  values: FormulaResult[];
+}
+
+export interface DetailedFormulaResult {
+  /** The anchor (top-left) value. */
+  value: FormulaResult;
+  /** Present when the formula returns more than one value and should spill. */
+  array?: FormulaArrayResult;
+}
+
+/** Evaluate a formula and return its full array result for dynamic-array spilling. */
+export function evaluateFormulaDetailed(
+  formula: string,
+  currentSheetId: string,
+  resolver: FormulaResolver,
+  hooks?: FormulaEvaluationHooks,
+): DetailedFormulaResult {
+  if (typeof formula !== "string" || typeof resolver !== "function") return { value: "#PARSE!" };
+  const context = createContext(resolver, hooks, currentSheetId);
+  const value = evaluateFormulaValue(formula, currentSheetId, context);
+  if (isLambdaValue(value)) return { value: "#CALC!" };
+  if (!isEvaluationRange(value)) return { value: publicScalar(value) };
+  if (value.sparse) return { value: "#VALUE!" };
+  if (value.values.length === 0) return { value: "#CALC!" };
+  const values = value.values.map(publicScalar);
+  if (values.length === 1) return { value: values[0] };
+  return {
+    value: values[0],
+    array: { rowCount: value.rowCount, columnCount: value.columnCount, values },
   };
-  const result = evaluateFormulaText(formula, currentSheetId, context);
-  if (isEvaluationError(result)) return result.code;
-  return result === null ? 0 : result;
+}
+
+const ARRAY_RESULT_FUNCTIONS = new Set([
+  "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "TRANSPOSE", "MMULT", "MINVERSE",
+  "MUNIT", "FREQUENCY", "LINEST", "LOGEST", "TREND", "GROWTH", "TOCOL", "TOROW", "CHOOSECOLS",
+  "CHOOSEROWS", "TAKE", "DROP", "VSTACK", "HSTACK", "WRAPROWS", "WRAPCOLS", "EXPAND", "TEXTSPLIT",
+  "MAKEARRAY", "MAP", "SCAN", "BYROW", "BYCOL", "REDUCE", "LAMBDA", "XLOOKUP", "MODE.MULT", "ROW",
+  "COLUMN", "SPLIT", "ARRAYFORMULA", "INDEX", "OFFSET", "INDIRECT", "ANCHORARRAY", "GROUPBY",
+  "PIVOTBY", "TRIMRANGE", "REGEXEXTRACT", "LET", "IF", "IFS", "IFERROR", "IFNA", "CHOOSE", "SWITCH",
+]);
+
+function nodeMayReturnArray(node: FormulaNode, depth = 0): boolean {
+  if (depth > 64) return true;
+  switch (node.kind) {
+    case "range":
+    case "wholeRange":
+    case "spill":
+    case "array":
+    case "rangeOp":
+    case "structured":
+    case "name":
+    case "invoke":
+      return true;
+    case "unary":
+      return node.operator !== "@" && nodeMayReturnArray(node.operand, depth + 1);
+    case "binary":
+      return nodeMayReturnArray(node.left, depth + 1) || nodeMayReturnArray(node.right, depth + 1);
+    case "call": {
+      const name = normalizedFunctionName(node.name);
+      const spec = FUNCTION_REGISTRY[name];
+      if (!spec) return true;
+      if (spec.returnsArray) return true;
+      if (ARRAY_RESULT_FUNCTIONS.has(name)) {
+        if (["IF", "IFS", "IFERROR", "IFNA", "CHOOSE", "SWITCH", "LET"].includes(name)) {
+          return node.arguments.some((argument) => nodeMayReturnArray(argument, depth + 1));
+        }
+        return true;
+      }
+      if (!spec.liftArgs) return false;
+      return node.arguments.some((argument, index) => shouldLift(spec, index) && nodeMayReturnArray(argument, depth + 1));
+    }
+    default:
+      return false;
+  }
+}
+
+/**
+ * Static check used by hosts to find dynamic-array anchors: false means the formula can
+ * only ever produce a single value, so it cannot spill.
+ */
+export function formulaMayReturnArray(formula: string): boolean {
+  const node = parseFormula(formula);
+  return typeof node !== "string" && nodeMayReturnArray(node);
+}
+
+/** Add (or replace) worksheet functions. Names are case-insensitive. */
+export function registerFormulaFunctions(specs: Record<string, FunctionSpec>): void {
+  for (const [name, spec] of Object.entries(specs)) {
+    FUNCTION_REGISTRY[name.toUpperCase()] = spec;
+  }
+}
+
+/** Every worksheet function the engine can calculate. */
+export function getFormulaFunctionNames(): string[] {
+  return Object.keys(FUNCTION_REGISTRY).sort();
+}
+
+export function hasFormulaFunction(name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(FUNCTION_REGISTRY, normalizedFunctionName(name));
 }
 
 function hasReferenceBoundaryBefore(source: string, position: number): boolean {

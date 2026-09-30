@@ -1,0 +1,186 @@
+[
+  {
+    "id": "napoleon",
+    "pages": 1277,
+    "originalFont": "TimesNewRomanPSMT",
+    "originalColor": 0,
+    "sourceBox": [
+      73.99219512939453,
+      200.38333129882812,
+      536.5322265625,
+      222.99465942382812
+    ],
+    "changedPixels": 5856,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      94.5,
+      206.5,
+      533.0,
+      220.0
+    ],
+    "openMs": 939,
+    "saveMs": 1995,
+    "allOtherPageContentStreamsUnchanged": true
+  },
+  {
+    "id": "garamond",
+    "pages": 873,
+    "originalFont": "EBGaramond-Regular",
+    "originalColor": 0,
+    "sourceBox": [
+      73.99219512939453,
+      140.14501953125,
+      345.47698974609375,
+      165.7200164794922
+    ],
+    "changedPixels": 4722,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      77.0,
+      142.5,
+      341.5,
+      162.5
+    ],
+    "openMs": 789,
+    "saveMs": 1922,
+    "allOtherPageContentStreamsUnchanged": true
+  },
+  {
+    "id": "colored-cover",
+    "pages": 260,
+    "originalFont": "MyriadPro-Regular",
+    "originalColor": 16777215,
+    "sourceBox": [
+      89.51480102539062,
+      364.3974914550781,
+      400.7547302246094,
+      396.3974914550781
+    ],
+    "changedPixels": 6949,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      101.0,
+      368.5,
+      396.5,
+      392.5
+    ],
+    "openMs": 468,
+    "saveMs": 570,
+    "allOtherPageContentStreamsUnchanged": true
+  },
+  {
+    "id": "berling",
+    "pages": 260,
+    "originalFont": "Berling-Roman",
+    "originalColor": 2301728,
+    "sourceBox": [
+      57.0,
+      93.99898529052734,
+      374.9969177246094,
+      110.15898132324219
+    ],
+    "changedPixels": 4929,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      62.5,
+      97.0,
+      371.0,
+      107.0
+    ],
+    "openMs": 683,
+    "saveMs": 473,
+    "allOtherPageContentStreamsUnchanged": true
+  },
+  {
+    "id": "mixed-style",
+    "pages": 91,
+    "originalFont": "DejaVu-Serif",
+    "originalColor": 1710618,
+    "sourceBox": [
+      191.013427734375,
+      83.64282989501953,
+      451.6632995605469,
+      101.63123321533203
+    ],
+    "changedPixels": 3671,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      199.0,
+      88.0,
+      444.0,
+      98.0
+    ],
+    "openMs": 360,
+    "saveMs": 164,
+    "allOtherPageContentStreamsUnchanged": true
+  },
+  {
+    "id": "cyrillic",
+    "pages": 783,
+    "originalFont": "LiberationMono",
+    "originalColor": 0,
+    "sourceBox": [
+      53.79999923706055,
+      53.73078155517578,
+      539.7999877929688,
+      71.05078125
+    ],
+    "changedPixels": 419,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      170.5,
+      59.5,
+      200.0,
+      67.0
+    ],
+    "openMs": 704,
+    "saveMs": 3608,
+    "allOtherPageContentStreamsUnchanged": true
+  },
+  {
+    "id": "tall-page",
+    "pages": 1,
+    "originalFont": "CrimsonText-Regular",
+    "originalColor": 2845890,
+    "sourceBox": [
+      169.57598876953125,
+      180.36143493652344,
+      379.0093078613281,
+      211.7247772216797
+    ],
+    "changedPixels": 5032,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      172.5,
+      188.5,
+      375.0,
+      207.0
+    ],
+    "openMs": 309,
+    "saveMs": 55,
+    "allOtherPageContentStreamsUnchanged": true
+  },
+  {
+    "id": "calibri",
+    "pages": 1,
+    "originalFont": "Calibri",
+    "originalColor": 0,
+    "sourceBox": [
+      69.02400207519531,
+      43.439971923828125,
+      509.1828918457031,
+      60.4799690246582
+    ],
+    "changedPixels": 6772,
+    "outsideSourceLineChangedPixels": 0,
+    "changedBounds": [
+      72.5,
+      47.0,
+      503.0,
+      56.0
+    ],
+    "openMs": 275,
+    "saveMs": 103,
+    "allOtherPageContentStreamsUnchanged": true
+  }
+]

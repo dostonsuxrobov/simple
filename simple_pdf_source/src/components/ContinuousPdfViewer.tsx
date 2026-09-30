@@ -123,9 +123,18 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
   // relayout; the layout effect below restores the same fractional offset.
   const layoutSignature = `${zoom}|${Object.entries(rotations).map(([index, amount]) => `${index}:${amount}`).join(',')}`
   if (layoutPdfRef.current !== pdf) {
+    const root = viewerRef.current
+    const slot = slotsRef.current.get(currentPage)
+    if (root && slot) {
+      const rootBounds = root.getBoundingClientRect()
+      const slotBounds = slot.getBoundingClientRect()
+      layoutAnchorRef.current = {
+        pageIndex: currentPage,
+        offset: slotBounds.height > 0 ? (rootBounds.top - slotBounds.top) / slotBounds.height : 0,
+      }
+    }
     layoutPdfRef.current = pdf
-    layoutSignatureRef.current = ''
-    layoutAnchorRef.current = null
+    layoutSignatureRef.current = layoutSignature
   }
   if (layoutSignatureRef.current !== layoutSignature) {
     const root = viewerRef.current
@@ -152,7 +161,7 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
     const rootBounds = root.getBoundingClientRect()
     const slotBounds = slot.getBoundingClientRect()
     root.scrollTop += slotBounds.top - rootBounds.top + anchor.offset * slotBounds.height
-  }, [zoom, rotations, viewerRef])
+  }, [pdf, zoom, rotations, viewerRef])
 
   useEffect(() => {
     let cancelled = false
@@ -660,7 +669,7 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
     centerPage()
     const settleTimer = window.setTimeout(centerPage, 220)
     return () => window.clearTimeout(settleTimer)
-  }, [currentPage, pdf])
+  }, [currentPage])
 
   const pageIndices = useMemo(() => Array.from({ length: pdf.numPages }, (_, index) => index), [pdf])
 

@@ -17,11 +17,15 @@ No installation is required. Move the executable anywhere, launch it, and open a
 - Read and save native PDF outline bookmarks that remain available in Acrobat and other compatible readers.
 - Scroll the complete document continuously while only nearby pages are rendered for speed.
 - Select a word or substring and type directly on the page—there is no edit popup—while preserving the source font, baseline, spacing, color, and placement wherever the PDF exposes them.
+- Use the labeled Edit PDF control, see the document's current font, adjust line spacing, and choose Fit to one line or Wrap inside box. Longer wrapped text grows the box down to the page edge; overflow is reported instead of silently omitting words when saved. Font changes preserve your chosen formatting.
+- Enter a zoom percentage, choose Fit page, Fit width, or Actual size, and keep page navigation available even in smaller windows.
+- Search reuses indexed page text across queries and stops obsolete scans when you change or clear the query.
 - Select images on the page to move, resize, rotate, replace, duplicate, or delete them; capture artwork regions for the same direct controls.
 - Add new text and images, then embed all content edits when saving.
 - Add highlights, underlines, and freehand ink directly on pages, then embed their appearance when saving.
 - Open PDF, JPG, PNG, DOC, DOCX, TXT, and Markdown files. DOCX conversion preserves common headings, lists, tables, images, and styling; non-PDF sources are never changed.
-- Open a print preview containing all saved and unsaved edits, then use its printer control for the native Windows print dialog.
+- Use the prominent Export As control to create a PDF copy, PNG/JPEG/WebP page images, an editable text-based Word document, plain text, Markdown, or a printable HTML document. Page scope and image resolution are explicit, and multi-page image exports use a new numbered folder.
+- Print directly from the two-pane setup: choose the Windows default or a named printer, page range, Letter/A4/Legal paper, orientation, margins, color, duplex, copies, and Adobe-style Fit/Actual/Shrink/Custom sizing on the left while the exact paper, crop boundary, and selected page stay visible on the right. The final button sends saved and unsaved edits silently, without opening a second system dialog.
 - Enter distraction-free fullscreen reading with the eye control and leave with Escape; undo and redo document operations, use keyboard shortcuts, and reopen recent local files.
 
 ## Shortcuts
@@ -32,9 +36,14 @@ No installation is required. Move the executable anywhere, launch it, and open a
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Y` |
 | Find a word or sentence | `Ctrl+F`; `Enter` / `Shift+Enter` for next / previous |
 | Print preview | `Ctrl+P` |
+| Export As | `Ctrl+Shift+E` |
 | Previous / next page | `Page Up` / `Page Down` |
 | First / last page | `Ctrl+Home` / `Ctrl+End` |
 | Hand / Select / Edit / Add text / Crop | `H` / `V` / `E` / `T` / `C` |
+| Fit page / Actual size / Fit width | `Ctrl+0` / `Ctrl+1` / `Ctrl+2` |
+| Apply inline text edit | `Ctrl+Enter` |
+| Nudge selected content (outside text/format fields) | Arrow keys; `Shift` for 10 pt |
+| Duplicate selected content (outside text/format fields) | `Ctrl+D` |
 | Toggle sidebar | `F4` |
 
 ## Development
@@ -52,6 +61,22 @@ npm run build
 
 ## PDF editing model
 
-PDF text is stored as positioned drawing instructions rather than editable paragraphs. simple reconstructs an edited text or artwork region and embeds the result when saving. Text wraps inside its edited box, but it does not reflow unrelated content elsewhere on the page, and original covered text can remain extractable. Artwork-region editing is a visual region workflow; individual paths inside complex vector illustrations are not separated. Crop uses the standard non-destructive PDF CropBox. Markup is embedded visually, not added to another reader's Comments list. Digitally signed and password-protected documents are treated cautiously because ordinary edits can invalidate signatures or cannot be re-encrypted safely.
+PDF text is stored as positioned drawing instructions rather than editable paragraphs. simple reconstructs an edited text or artwork region and embeds the result when saving. Text wraps inside its edited box, but it does not reflow unrelated content elsewhere on the page, and the selected source text is removed from the saved page content. Word, Markdown, HTML, and text exports are therefore best-effort reading conversions rather than layout-preserving reconstruction; scanned pages require OCR. Artwork-region editing is a visual region workflow; individual paths inside complex vector illustrations are not separated. Crop uses the standard non-destructive PDF CropBox. Markup is embedded visually, not added to another reader's Comments list. Digitally signed and password-protected documents are treated cautiously because ordinary edits can invalidate signatures or cannot be re-encrypted safely.
 
 simple does not claim secure redaction, OCR, certificate signing, password encryption, accessibility remediation, or Acrobat's cloud-review/AI services. Those need a deeper PDF engine or carefully reviewed security implementation. See `ACROBAT_COMPARISON.md` for the researched scope and priorities.
+
+## PDF text-edit preservation
+
+Native text edits remove the selected source glyphs instead of painting a
+background rectangle. The editor preview, save, print, and exports share this
+path; images, vector backgrounds, links, and existing annotations are retained.
+Image exports also bound oversized pages before allocating their canvas.
+
+Regression checks: `node --test tests/*.test.cjs`,
+`node scripts/run-edit-productivity-regression.mjs`, and
+`electron scripts/save-export-regression.cjs` (disposable files in `.codex-tmp`).
+
+Text-only removal uses the pinned `mupdf` package, licensed **AGPL-3.0-or-later**
+by Artifex. Its license is included with the dependency and in the unified
+app's `modules/pdf/vendor/mupdf/LICENSE`. Distribution must account for this
+dependency's license; the application's MIT notice does not replace it.

@@ -19,6 +19,13 @@ contextBridge.exposeInMainWorld('simpleVideo', {
   removeRecent: (filePath) => ipcRenderer.invoke('recent:remove', filePath),
   clearRecents: () => ipcRenderer.invoke('recent:clear'),
   revealFile: (filePath) => ipcRenderer.invoke('shell:show-item', filePath),
+  exportOriginalCopy: (filePath) => ipcRenderer.invoke('export:copy-original', filePath),
+  exportFrame: (payload) => ipcRenderer.invoke('export:frame', payload),
+  copyFrame: (bytes) => ipcRenderer.invoke('clipboard:write-frame', bytes),
+  startPrint: (payload) => ipcRenderer.invoke('print:start', payload),
+  renderPrintPreview: (payload) => ipcRenderer.invoke('print:preview', payload),
+  printFrame: (payload) => ipcRenderer.invoke('print:run', payload),
+  endPrint: (sessionId) => ipcRenderer.invoke('print:end', sessionId),
   pathForFile: (file) => {
     try {
       return webUtils.getPathForFile(file) || null

@@ -5,6 +5,13 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron')
 contextBridge.exposeInMainWorld('simpleLauncher', {
   info: () => ipcRenderer.invoke('launcher:info'),
   open: () => ipcRenderer.invoke('launcher:open'),
+  combineAdd: (paths) => ipcRenderer.invoke('launcher:combine-add', paths),
+  combineSave: (entries) => ipcRenderer.invoke('launcher:combine-save', entries),
+  onCombineProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress)
+    ipcRenderer.on('launcher:combine-progress', listener)
+    return () => ipcRenderer.removeListener('launcher:combine-progress', listener)
+  },
   launchMode: (mode) => ipcRenderer.invoke('launcher:launch-mode', mode),
   launchPaths: (paths) => ipcRenderer.invoke('launcher:launch-paths', paths),
   registerFileTypes: () => ipcRenderer.invoke('launcher:register-file-types'),

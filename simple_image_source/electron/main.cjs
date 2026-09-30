@@ -1,7 +1,6 @@
-const { app, BrowserWindow, dialog, ipcMain } = require('electron')
+const { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } = require('electron')
 const fs = require('node:fs/promises')
 const path = require('node:path')
-const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const {
   EDITABLE_EXTENSIONS,
@@ -19,6 +18,10 @@ const {
   validateImageDimensions,
 } = require('./image-files.cjs')
 const { ensurePdfExtension, imageToPdfBytes } = require('./pdf-export.cjs')
+const { buildPrintHtml, computePrintLayout, electronPrintOptions } = require('./print-layout.cjs')
+const { cleanupStalePrintDirectories, createOwnedPrintDirectory, removePrintDirectory } = require('./print-temp.cjs')
+const { ensurePrinterInstalled, submitPrintJob } = require('./default-printer.cjs')
+const { preparePrintableImage } = require('./print-image.cjs')
 
 const closeApprovedWindows = new WeakSet()
 const productionRendererUrl = pathToFileURL(path.join(__dirname, '..', 'dist', 'index.html')).href
@@ -111,25 +114,19 @@ async function bytesPayload(input) {
 }
 
 async function printImage(input, owner) {
-  const png = validateImageBytes(input?.data, '.png')
-  validateImageDimensions(png, '.png')
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-image-print-'))
-  const imagePath = path.join(directory, `${safeStem(input?.name)}.png`)
+  const { bytes, extension, dimensions } = preparePrintableImage(input)
+  const layout = computePrintLayout(dimensions.width, dimensions.height, input?.settings)
+  const directory = await createOwnedPrintDirectory()
+  const imagePath = path.join(directory, `${safeStem(input?.name)}${extension}`)
   const htmlPath = path.join(directory, 'print.html')
   let printWindow = null
   const cleanup = async () => {
     if (printWindow && !printWindow.isDestroyed()) printWindow.destroy()
-    await fs.rm(directory, { recursive: true, force: true }).catch(() => {})
+    await removePrintDirectory(directory).catch(() => {})
   }
   try {
-    await fs.writeFile(imagePath, png)
-    const imageUrl = pathToFileURL(imagePath).href.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-    const html = `<!doctype html><html><head><meta charset="utf-8"><style>
-      @page { margin: 12mm; }
-      html, body { width: 100%; height: 100%; margin: 0; }
-      body { display: grid; place-items: center; }
-      img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; }
-    </style></head><body><img src="${imageUrl}" alt=""></body></html>`
+    await fs.writeFile(imagePath, bytes)
+    const html = buildPrintHtml(pathToFileURL(imagePath).href, dimensions.width, dimensions.height, layout.settings, safeStem(input?.name))
     await fs.writeFile(htmlPath, html, 'utf8')
     printWindow = new BrowserWindow({
       ...(owner ? { parent: owner } : {}),
@@ -141,36 +138,32 @@ async function printImage(input, owner) {
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
-        javascript: false,
+        // The page contains no scripts, but JavaScript must remain enabled so the
+        // main process can await img.decode() before handing the page to Chromium.
+        javascript: true,
         devTools: false,
       },
     })
+    closeApprovedWindows.add(printWindow)
     printWindow.removeMenu()
     printWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     printWindow.webContents.on('will-navigate', (event, url) => {
       if (url !== pathToFileURL(htmlPath).href) event.preventDefault()
     })
     await printWindow.loadFile(htmlPath)
-    return await new Promise((resolve, reject) => {
-      printWindow.webContents.print({ silent: false, printBackground: true }, async (success, reason) => {
-        await cleanup()
-        if (success) resolve(true)
-        else if (/cancel/i.test(String(reason))) resolve(false)
-        else reject(new Error(reason || 'Windows could not start printing.'))
-      })
-    })
-  } catch (error) {
+    const decoded = await printWindow.webContents.executeJavaScript(`(() => {
+      const image = document.querySelector('img')
+      if (!image) throw new Error('The printable image is missing.')
+      return image.decode().then(() => ({ width: image.naturalWidth, height: image.naturalHeight }))
+    })()`)
+    if (decoded?.width !== dimensions.width || decoded?.height !== dimensions.height) {
+      throw new Error('The printable image did not decode at the expected size.')
+    }
+    await ensurePrinterInstalled(printWindow.webContents)
+    return await submitPrintJob(printWindow.webContents, electronPrintOptions(layout.settings))
+  } finally {
     await cleanup()
-    throw error
   }
-}
-
-async function cleanupStalePrintDirectories() {
-  let entries = []
-  try { entries = await fs.readdir(os.tmpdir(), { withFileTypes: true }) } catch { return }
-  await Promise.all(entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith('simple-image-print-'))
-    .map((entry) => fs.rm(path.join(os.tmpdir(), entry.name), { recursive: true, force: true }).catch(() => {})))
 }
 
 function createWindow(openPath = null) {
@@ -232,6 +225,17 @@ function registerIpc() {
     requireCallingWindow(event)
     return filePayload(filePath)
   })
+  ipcMain.handle('file:list-siblings', async (event, filePath) => {
+    requireCallingWindow(event)
+    if (typeof filePath !== 'string' || !filePath || filePath.length > 32_768) return []
+    const directory = path.dirname(path.resolve(filePath))
+    let entries
+    try { entries = await fs.readdir(directory, { withFileTypes: true }) } catch { return [] }
+    return entries
+      .filter((entry) => entry.isFile() && !entry.name.startsWith('.') && isSupportedExtension(entry.name))
+      .map((entry) => path.join(directory, entry.name))
+      .sort((a, b) => path.basename(a).localeCompare(path.basename(b), undefined, { numeric: true, sensitivity: 'base' }))
+  })
   ipcMain.handle('file:open-bytes', (event, input) => {
     requireCallingWindow(event)
     return bytesPayload(input)
@@ -262,8 +266,9 @@ function registerIpc() {
     }
     if (!targetPath) {
       const label = format === 'jpeg' || format === 'jpg' ? 'JPEG' : format.toUpperCase()
+      const exporting = input?.purpose === 'export'
       const result = await showSaveDialogFor(event, {
-        title: input?.forceDialog ? 'Save image as' : 'Save image',
+        title: exporting ? `Export image as ${label}` : input?.forceDialog ? 'Save image as' : 'Save image',
         defaultPath: `${safeStem(input?.name)}${extension}`,
         filters: [{ name: `${label} image`, extensions: extension === '.jpg' ? ['jpg', 'jpeg'] : [extension.slice(1)] }],
       })
@@ -283,7 +288,7 @@ function registerIpc() {
     const png = validateImageBytes(input?.data, '.png')
     validateImageDimensions(png, '.png')
     const result = await showSaveDialogFor(event, {
-      title: 'Convert image to PDF',
+      title: 'Export image as PDF',
       defaultPath: `${safeStem(input?.name)}.pdf`,
       filters: [{ name: 'PDF document', extensions: ['pdf'] }],
     })
@@ -298,6 +303,15 @@ function registerIpc() {
     }
   })
   ipcMain.handle('image:print', (event, input) => printImage(input, requireCallingWindow(event)))
+  ipcMain.handle('clipboard:write-png', (event, input) => {
+    requireCallingWindow(event)
+    const bytes = validateImageBytes(input, '.png')
+    const dimensions = validateImageDimensions(bytes, '.png')
+    const image = nativeImage.createFromBuffer(bytes)
+    if (image.isEmpty()) throw new Error('The copied image could not be decoded.')
+    clipboard.writeImage(image)
+    return dimensions
+  })
   ipcMain.handle('app:new-window', (event) => { requireCallingWindow(event); createWindow(); return true })
   ipcMain.handle('app:get-version', (event) => { requireCallingWindow(event); return app.getVersion() })
   ipcMain.on('window:set-title', (event, title) => {

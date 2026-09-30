@@ -1,0 +1,76 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('node:fs/promises')
+const os = require('node:os')
+const path = require('node:path')
+const { fontMetrics, installedDocumentFonts } = require('../electron/document-fonts.cjs')
+const { fontCoverage } = require('../electron/font-coverage.cjs')
+
+function fixtureFont(flags = 0) {
+  const bytes = Buffer.alloc(124)
+  bytes.writeUInt32BE(0x00010000, 0)
+  bytes.writeUInt16BE(3, 4)
+  for (const [index, name, offset, length] of [[0, 'head', 60, 20], [1, 'hhea', 80, 10], [2, 'OS/2', 100, 24]]) {
+    bytes.write(name, 12 + index * 16)
+    bytes.writeUInt32BE(offset, 20 + index * 16)
+    bytes.writeUInt32BE(length, 24 + index * 16)
+  }
+  bytes.writeUInt16BE(2048, 78)
+  bytes.writeInt16BE(1900, 84)
+  bytes.writeInt16BE(-500, 86)
+  bytes.writeUInt16BE(flags, 108)
+  return bytes
+}
+
+test('installed fonts use real ascent/descent and reject malformed or restricted faces', () => {
+  assert.deepEqual(fontMetrics(fixtureFont()), { ascent: 1900 / 2048, descent: 500 / 2048 })
+  assert.equal(fontMetrics(fixtureFont(2)), null)
+  assert.equal(fontMetrics(fixtureFont(512)), null)
+  assert.equal(fontMetrics(Buffer.from('not a font')), null)
+  assert.equal(fontMetrics(fixtureFont().subarray(0, 80)), null)
+})
+
+test('font manifest serves only existing allowlisted faces, leaving missing families to fallbacks', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-doc-font-test-'))
+  try {
+    await fs.writeFile(path.join(directory, 'arial.ttf'), fixtureFont())
+    await fs.writeFile(path.join(directory, 'arialbd.ttf'), fixtureFont())
+    await fs.writeFile(path.join(directory, 'arbitrary.ttf'), fixtureFont())
+    const { fonts, files } = await installedDocumentFonts({ roots: [directory] })
+    assert.equal(fonts.length, 1)
+    assert.equal(fonts[0].family, 'Arial')
+    assert.equal(Object.keys(fonts[0].faces).length, 2)
+    assert.ok(fonts[0].faces.regular.startsWith('simple-font://installed/'))
+    assert.equal(files.size, 2)
+  } finally { await fs.rm(directory, { recursive: true, force: true }) }
+})
+
+test('glyph coverage reads mapped Unicode ranges and rejects truncated tables', async () => {
+  const bytes = Buffer.alloc(80)
+  bytes.writeUInt32BE(0x10000, 0)
+  bytes.writeUInt16BE(1, 4)
+  bytes.write('cmap', 12)
+  bytes.writeUInt32BE(28, 20)
+  bytes.writeUInt32BE(52, 24)
+  bytes.writeUInt16BE(1, 30)
+  bytes.writeUInt16BE(3, 32)
+  bytes.writeUInt16BE(10, 34)
+  bytes.writeUInt32BE(12, 36)
+  bytes.writeUInt16BE(12, 40)
+  bytes.writeUInt32BE(40, 44)
+  bytes.writeUInt32BE(2, 52)
+  bytes.writeUInt32BE(0x4e00, 56)
+  bytes.writeUInt32BE(0x4e02, 60)
+  bytes.writeUInt32BE(0, 64)
+  bytes.writeUInt32BE(0xac00, 68)
+  bytes.writeUInt32BE(0xac01, 72)
+  bytes.writeUInt32BE(15, 76)
+  assert.deepEqual(fontCoverage(bytes), [[0x4e01, 0x4e02], [0xac00, 0xac01]])
+  assert.deepEqual(fontCoverage(bytes.subarray(0, 60)), [])
+  assert.deepEqual(fontCoverage(Buffer.from('not a font')), [])
+  const bundled = fontCoverage(await fs.readFile(path.join(__dirname, '../node_modules/@forevka/wordcanvas/dist-node/fonts/NotoSansSC-Regular.ttf')))
+  const has = (char) => bundled.some(([start, end]) => char.codePointAt(0) >= start && char.codePointAt(0) <= end)
+  assert.equal(has('测'), true)
+  assert.equal(has('語'), false)
+  assert.equal(has('한'), false)
+})

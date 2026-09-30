@@ -1,0 +1,67 @@
+{
+  "source": {
+    "width": 1266,
+    "height": 1243
+  },
+  "defaultLayout": {
+    "title": "Set up your print",
+    "paper": "letter",
+    "orientation": "portrait",
+    "scaleMode": "fit",
+    "panesSideBySide": true,
+    "dialogFits": true,
+    "portraitSheet": true,
+    "imageLoaded": true
+  },
+  "backgroundIsolation": {
+    "dimensionsUnchanged": true,
+    "titleUnchanged": true,
+    "noDropOverlay": true,
+    "backgroundInert": true
+  },
+  "toolbarFocusRestored": true,
+  "shortcutFocusRestored": true,
+  "configuredLayout": {
+    "landscapeSheet": true,
+    "clippedWarning": true,
+    "blackBackground": true,
+    "grayscaleComposition": true,
+    "grayscaleLabelHonest": true,
+    "summary": "Printable area 297 mm × 210 mm\nEffective resolution 108 dpi\nScale 89%"
+  },
+  "responsiveLayout": {
+    "stacked": true,
+    "dialogFits": true,
+    "bodyScrollable": true
+  },
+  "focusTrapped": true,
+  "frozenJob": {
+    "allOptionsDisabled": true,
+    "unchanged": true,
+    "dialogStayedOpen": true,
+    "busyText": "Sending to printer…"
+  },
+  "submitFocusRestored": true,
+  "printRequest": {
+    "name": "brand-icon.png",
+    "dimensions": {
+      "width": 1266,
+      "height": 1243
+    },
+    "requestedDimensions": {
+      "width": 1266,
+      "height": 1243
+    },
+    "settings": {
+      "paper": "a4",
+      "orientation": "landscape",
+      "marginMm": 0,
+      "scaleMode": "fill",
+      "scalePercent": 100,
+      "position": "bottom-right",
+      "background": "#000000",
+      "grayscale": true,
+      "copies": 3
+    }
+  }
+}

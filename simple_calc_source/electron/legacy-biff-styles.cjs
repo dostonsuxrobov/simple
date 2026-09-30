@@ -22,6 +22,18 @@ const RECORD = Object.freeze({
   RSTRING: 0x00d6,
   MUL_RK: 0x00bd,
   MUL_BLANK: 0x00be,
+  DEFAULT_ROW_HEIGHT: 0x0225,
+  DEFAULT_COL_WIDTH: 0x0055,
+  ROW: 0x0208,
+  HEADER: 0x0014,
+  FOOTER: 0x0015,
+  SETUP: 0x00a1,
+  WS_BOOL: 0x0081,
+  PRINT_GRID: 0x002b,
+  PRINT_ROW_COL: 0x002a,
+  HCENTER: 0x0083,
+  VCENTER: 0x0084,
+  STYLE: 0x0293,
   EOF: 0x000a,
 })
 
@@ -378,6 +390,7 @@ function extractLegacyBiffStyles(buffer, numberFormats = {}) {
   const xfs = []
   let palette = []
   let fontRecordIndex = 0
+  let normalXfIndex = 0
   for (const record of allRecords) {
     if (record.offset >= globalEnd) break
     if (record.type === RECORD.FONT) {
@@ -388,6 +401,9 @@ function extractLegacyBiffStyles(buffer, numberFormats = {}) {
       xfs.push(parseXf(record.data))
     } else if (record.type === RECORD.PALETTE) {
       palette = parsePalette(record.data)
+    } else if (record.type === RECORD.STYLE && record.data.length >= 4) {
+      const flags = record.data.readUInt16LE(0)
+      if ((flags & 0x8000) && record.data[2] === 0) normalXfIndex = flags & 0x0fff
     }
   }
 
@@ -399,10 +415,61 @@ function extractLegacyBiffStyles(buffer, numberFormats = {}) {
     const end = positionIndex >= 0 && sortedPositions[positionIndex + 1] != null
       ? sortedPositions[positionIndex + 1]
       : stream.length
-    return { cells: parseSheetStyles(stream, sheet.position, end, descriptors) }
+    const properties = {}
+    const rowHeights = {}
+    const pageSetup = {}
+    const headerFooter = {}
+    for (const record of records(stream, sheet.position, end)) {
+      if (record.type === RECORD.EOF) break
+      if (record.type === RECORD.DEFAULT_ROW_HEIGHT && record.data.length >= 4 && !(record.data.readUInt16LE(0) & 2)) {
+        const twips = record.data.readInt16LE(2)
+        if (twips > 0 && twips <= 8179) properties.defaultRowHeight = twips / 20
+      } else if (record.type === RECORD.DEFAULT_COL_WIDTH && record.data.length >= 2) {
+        const characters = record.data.readUInt16LE(0)
+        if (characters > 0 && characters <= 255) properties.defaultColWidth = characters
+      } else if (record.type === RECORD.ROW && record.data.length >= 16) {
+        // ROW.miyRw records the displayed height even when Excel calculated it
+        // automatically. SheetJS only exposes heights with fUnsynced set, so
+        // common 16pt automatic rows otherwise shrink to our 15pt fallback.
+        const row = record.data.readUInt16LE(0) + 1
+        const twips = record.data.readUInt16LE(6) & 0x7fff
+        if (twips > 0 && twips <= 8179) rowHeights[String(row)] = twips / 20
+      } else if ([RECORD.HEADER, RECORD.FOOTER].includes(record.type) && record.data.length >= 3) {
+        const characters = record.data.readUInt16LE(0)
+        const wide = Boolean(record.data[2] & 1)
+        const endOfText = 3 + characters * (wide ? 2 : 1)
+        if (endOfText <= record.data.length) {
+          headerFooter[record.type === RECORD.HEADER ? 'oddHeader' : 'oddFooter'] = record.data.subarray(3, endOfText).toString(wide ? 'utf16le' : 'latin1')
+        }
+      } else if (record.type === RECORD.SETUP && record.data.length >= 34) {
+        const flags = record.data.readUInt16LE(10)
+        pageSetup.fitToWidth = record.data.readUInt16LE(6)
+        pageSetup.fitToHeight = record.data.readUInt16LE(8)
+        pageSetup.pageOrder = flags & 1 ? 'overThenDown' : 'downThenOver'
+        pageSetup.blackAndWhite = Boolean(flags & 8)
+        pageSetup.draft = Boolean(flags & 16)
+        if (!(flags & 4)) {
+          pageSetup.paperSize = record.data.readUInt16LE(0)
+          const scale = record.data.readUInt16LE(2)
+          if (scale >= 10 && scale <= 400) pageSetup.scale = scale
+          if (!(flags & 64)) pageSetup.orientation = flags & 2 ? 'portrait' : 'landscape'
+          pageSetup.horizontalDpi = record.data.readUInt16LE(12)
+          pageSetup.verticalDpi = record.data.readUInt16LE(14)
+        }
+        pageSetup.useFirstPageNumber = Boolean(flags & 128)
+        if (flags & 128) pageSetup.firstPageNumber = record.data.readInt16LE(4)
+      } else if (record.type === RECORD.WS_BOOL && record.data.length >= 2) {
+        pageSetup.fitToPage = Boolean(record.data.readUInt16LE(0) & 0x100)
+      } else if ([RECORD.PRINT_GRID, RECORD.PRINT_ROW_COL, RECORD.HCENTER, RECORD.VCENTER].includes(record.type) && record.data.length >= 2) {
+        const key = { [RECORD.PRINT_GRID]: 'showGridLines', [RECORD.PRINT_ROW_COL]: 'showRowColHeaders', [RECORD.HCENTER]: 'horizontalCentered', [RECORD.VCENTER]: 'verticalCentered' }[record.type]
+        pageSetup[key] = Boolean(record.data.readUInt16LE(0))
+      }
+    }
+    return { cells: parseSheetStyles(stream, sheet.position, end, descriptors), properties, rowHeights, pageSetup, headerFooter }
   })
 
-  return { sheets, fontCount: fonts.filter(Boolean).length, xfCount: xfs.filter(Boolean).length }
+  const normalFont = xfs[normalXfIndex] ? fontForXf(xfs[normalXfIndex], fonts, palette) : undefined
+  return { sheets, normalFont, fontCount: fonts.filter(Boolean).length, xfCount: xfs.filter(Boolean).length }
 }
 
 module.exports = {

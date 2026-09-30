@@ -4,6 +4,13 @@
     "height": 1243,
     "details": "Image details\nRead from this asset\nFormat\nPNG\nDimensions\n1,266 × 1,243 px\nResolution\n1.6 MP\nAspect ratio\n1.02\nColor\nRGBA · transparency\nFile size\n839.0 KB\nProcessed locally on this computer\nPAINTING\nBrush\n12 px"
   },
+  "inspectorControl": {
+    "f4Reopened": true,
+    "ariaExpanded": "true",
+    "storedPreference": "open",
+    "responsivePosition": "absolute",
+    "responsiveWidth": 280
+  },
   "edited": {
     "width": 1013,
     "height": 994,
@@ -13,6 +20,49 @@
     "width": 994,
     "height": 1013
   },
+  "exportMenu": {
+    "formats": [
+      "png",
+      "jpeg",
+      "webp",
+      "pdf"
+    ],
+    "text": "Export a copy\nThe open image and unsaved edits stay in place.\nPNG image\nLossless and transparency-safe\nJPEG image\nCompact for photos; transparent areas become white\nWebP image\nSmaller modern image with transparency\nPDF document\nOne page sized to the image aspect ratio\n\nSVG input is rasterized at its displayed pixel dimensions. Vector paths are not preserved, so SVG export is not offered.",
+    "visibleOptions": true,
+    "fitsWindow": true
+  },
+  "exportedImages": [
+    {
+      "format": "png",
+      "dimensions": {
+        "width": 994,
+        "height": 1013
+      },
+      "forceDialog": true,
+      "path": null,
+      "purpose": "export"
+    },
+    {
+      "format": "jpeg",
+      "dimensions": {
+        "width": 994,
+        "height": 1013
+      },
+      "forceDialog": true,
+      "path": null,
+      "purpose": "export"
+    },
+    {
+      "format": "webp",
+      "dimensions": {
+        "width": 994,
+        "height": 1013
+      },
+      "forceDialog": true,
+      "path": null,
+      "purpose": "export"
+    }
+  ],
   "convertedImage": {
     "name": "brand-icon.png",
     "dimensions": {

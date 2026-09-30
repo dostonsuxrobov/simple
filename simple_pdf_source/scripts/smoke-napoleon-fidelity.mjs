@@ -120,7 +120,7 @@ const committed = await evaluate(`(() => {
   const cover = overlay.parentElement.querySelector('.text-original-cover')
   return {
     overlayWidth: overlay.getBoundingClientRect().width,
-    coverWidth: cover.getBoundingClientRect().width,
+    hasBackgroundPatch: Boolean(cover),
     fontFamily: getComputedStyle(overlay).fontFamily,
     fontSize: getComputedStyle(overlay).fontSize,
     color: getComputedStyle(overlay).color,

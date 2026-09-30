@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "fixture": "6000 x 4000 JPEG (24 MP)",
+  "openMs": 167.69719999999995,
+  "previewMs": 36.14409999999998,
+  "sourceBytes": 899204,
+  "scanMs": 35.799999952316284,
+  "pngEncodeMs": 2060.399999856949,
+  "pngBytes": 6651424,
+  "alpha": false,
+  "unchangedSaveAndPrintExact": true,
+  "staleOpenIgnored": true,
+  "printPdfPages": 1,
+  "editedPrintAndUndo": true,
+  "exifPortraitPrint": true
+}

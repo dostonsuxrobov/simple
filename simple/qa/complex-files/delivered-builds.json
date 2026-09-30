@@ -1,0 +1,30 @@
+[
+  {
+    "file": "C:\\Users\\dosto\\Documents\\simple\\simple.exe",
+    "source": "C:\\Users\\dosto\\Documents\\simple\\simple\\release\\simple.exe",
+    "bytes": 94654036,
+    "sha256": "1571C42E0F3F0C73690A1672854516B9B81DCB82C7963FE9E6636540C70D68C7",
+    "verifiedAt": "2026-09-05T13:39:02.5299451Z"
+  },
+  {
+    "file": "C:\\Users\\dosto\\Documents\\simple\\simple_calc.exe",
+    "source": "C:\\Users\\dosto\\Documents\\simple\\simple_calc_source\\release\\simple_calc-1.0.0-portable.exe",
+    "bytes": 89399906,
+    "sha256": "8D9DFE072E2638084E312544D6128A7CA9EED53E6D621A0C0F994937E39F4A11",
+    "verifiedAt": "2026-09-05T13:39:02.8911824Z"
+  },
+  {
+    "file": "C:\\Users\\dosto\\Documents\\simple\\simple_doc.exe",
+    "source": "C:\\Users\\dosto\\Documents\\simple\\simple_doc_source\\release\\Simple-Docs-1.0.0-portable.exe",
+    "bytes": 98201822,
+    "sha256": "4B5E0EB7DA947254096966BDE24D1C0AF8B7DE77CCA608B25E0024A0E6605E7C",
+    "verifiedAt": "2026-09-05T13:39:03.5063008Z"
+  },
+  {
+    "file": "C:\\Users\\dosto\\Documents\\simple\\simple_pdf.exe",
+    "source": "C:\\Users\\dosto\\Documents\\simple\\simple_pdf_source\\release\\simple-1.4.3-portable.exe",
+    "bytes": 88322311,
+    "sha256": "FD3F3B18CB4D6833E84D83EE3A4B11D857902AA6B314A5FE5493185B618A0D79",
+    "verifiedAt": "2026-09-05T13:39:04.0317523Z"
+  }
+]

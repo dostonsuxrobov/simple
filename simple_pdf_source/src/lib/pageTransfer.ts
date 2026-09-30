@@ -26,5 +26,5 @@ export function isPdfTransferFile(file: Pick<File, 'name' | 'type'>) {
 const IMPORTABLE_TRANSFER_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg'])
 
 export function isImportableTransferFile(file: Pick<File, 'name' | 'type'>) {
-  return IMPORTABLE_TRANSFER_TYPES.has(file.type.toLowerCase()) || /\.(pdf|png|jpe?g|txt|md|docx?)$/i.test(file.name)
+  return IMPORTABLE_TRANSFER_TYPES.has(file.type.toLowerCase()) || /\.(pdf|png|jpe?g|gif|webp|bmp|avif|svg|txt|md|docx?)$/i.test(file.name) || /^image\//i.test(file.type)
 }

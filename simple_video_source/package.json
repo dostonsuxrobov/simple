@@ -10,6 +10,8 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5175 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5175 electron .\"",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.cjs",
+    "qa:export": "node scripts/qa-export.cjs",
+    "qa:context-menu": "node scripts/qa-context-menu.cjs",
     "build:web": "npm run typecheck && vite build",
     "build": "npm run test && npm run build:web && electron-builder --win portable --x64",
     "build:dir": "npm run test && npm run build:web && electron-builder --win dir --x64",

@@ -5,6 +5,7 @@ const fs = require('node:fs/promises')
 const os = require('node:os')
 const path = require('node:path')
 const ExcelJS = require('exceljs')
+const JSZip = require('jszip')
 const XLSX = require('xlsx')
 const {
   workbookPayloadFromPath,
@@ -76,6 +77,22 @@ async function main() {
     assert.deepEqual(reopenedSummary.merges, ['C1:D1'])
     assert.equal(reopened.workbook.sheets.find((sheet) => sheet.name === 'Hidden data').state, 'hidden')
 
+    // Native readers require absolute rows as well as columns in Print_Area.
+    // Also verify layout edits replace the imported built-in instead of reviving it.
+    const printModel = structuredClone(opened.workbook)
+    printModel.sheets[0].name = "Owner's summary"
+    printModel.sheets[0].pageSetup = { printArea: 'A1:D4&&A8:B9', printTitlesRow: '1:2', printTitlesColumn: 'A:B' }
+    printModel.definedNames = [{ name: '_xlnm.Print_Area', ranges: ["'Summary'!$A$1:$Z$99"], localSheetIndex: 0 }]
+    const printBytes = await serializeWorkbook(printModel, 'xlsx')
+    const printZip = await JSZip.loadAsync(printBytes)
+    const printXml = await printZip.file('xl/workbook.xml').async('string')
+    assert.match(printXml, /Owner&apos;s|Owner&apos;&apos;s|Owner''s/)
+    assert.ok(printXml.includes('$A$1:$D$4') && printXml.includes('$A$8:$B$9'))
+    assert.ok(!printXml.includes('$Z$99'), 'stale imported print area must not override the saved layout')
+    assert.ok(printXml.includes('$1:$2') && printXml.includes('$A:$B'))
+    const printReopened = await workbookPayloadFromBytes('print.xlsx', printBytes)
+    assert.equal(printReopened.workbook.sheets[0].pageSetup.printArea, 'A1:D4&&A8:B9')
+
     const csv = await serializeWorkbook(opened.workbook, 'csv')
     assert.match(csv.toString('utf8'), /Revenue/)
     assert.match(csv.toString('utf8'), /2,000\.00|2000/)
@@ -95,7 +112,7 @@ async function main() {
     XLSX.utils.book_append_sheet(legacyWorkbook, legacySheet, 'Legacy')
     const xlsBytes = XLSX.write(legacyWorkbook, { type: 'buffer', bookType: 'biff8' })
     const xlsOpened = await workbookPayloadFromBytes('legacy.xls', xlsBytes)
-    assert.equal(xlsOpened.requiresSaveAs, true)
+    assert.equal(xlsOpened.requiresSaveAs, false)
     // SheetJS' legacy BIFF writer does not emit formula records; real XLS
     // formula imports are covered by the decoder, while this generated fixture
     // still exercises values, text types, merges, and XLS-to-XLSX conversion.
@@ -156,6 +173,83 @@ async function main() {
     const idsReopened = await workbookPayloadFromBytes('ids-roundtrip.csv', idsExported)
     assert.equal(idsReopened.workbook.sheets[0].cells.A2.value, '00123')
     assert.equal(idsReopened.workbook.sheets[0].cells.B2.value, isoSerial)
+
+    // Excel's reserved builtin number formats (Currency / Comma / Accounting), the locale
+    // short-date builtins, rich-text runs, phantom fills and colour-only borders all reach
+    // the model the way the renderer expects them.
+    const stylesPath = path.join(directory, 'styles.xlsx')
+    const stylesBook = new ExcelJS.Workbook()
+    const styled = stylesBook.addWorksheet('Styled')
+    styled.getCell('A1').value = 1234.5
+    styled.getCell('A1').numFmt = '_(* #,##0.00_);_(* (#,##0.00);_(* "-"??_);_(@_)'
+    styled.getCell('A2').value = new Date(Date.UTC(2023, 2, 15))
+    styled.getCell('A3').value = { richText: [{ text: 'plain ' }, { text: 'bold', font: { bold: true } }] }
+    styled.getCell('A4').value = 'bordered'
+    styled.getCell('A4').border = { right: { style: 'none', color: { argb: 'FF000000' } } }
+    styled.getCell('A5').value = 'unfilled'
+    styled.getCell('A5').fill = { type: 'pattern', pattern: 'none' }
+    await stylesBook.xlsx.writeFile(stylesPath)
+    const stylesOpened = await workbookPayloadFromPath(stylesPath)
+    const styledSheet = stylesOpened.workbook.sheets[0]
+    assert.equal(styledSheet.cells.A2.numFmt, 'm/d/yyyy', 'builtin short date resolves to the locale format')
+    assert.equal(typeof styledSheet.cells.A3.value, 'string', 'rich text keeps a scalar value')
+    assert.equal(styledSheet.cells.A3.value, 'plain bold')
+    assert.equal(styledSheet.cells.A3.richText.length, 2, 'rich-text runs travel beside the plain text')
+    // Import keeps style="none" verbatim for round-trip fidelity; the renderer is what
+    // refuses to draw it (see drawableBorderSide in src/App.tsx).
+    assert.equal(styledSheet.cells.A4.style.border.right.style, 'none')
+    assert.equal(styledSheet.cells.A5.style && styledSheet.cells.A5.style.fill, undefined, 'a paint-nothing fill is dropped')
+    const styledRoundTrip = await workbookPayloadFromBytes(
+      'styles-roundtrip.xlsx',
+      await serializeWorkbook(stylesOpened.workbook, 'xlsx'),
+    )
+    assert.equal(styledRoundTrip.workbook.sheets[0].cells.A3.richText.length, 2, 'untouched rich text survives a save')
+
+    // ExcelJS omits the reserved ids Excel uses for its Currency/Comma/Accounting styles,
+    // and those ids never appear in <numFmts>, so they have to be seeded from a builtin table.
+    const reservedPath = path.join(directory, 'reserved-formats.xlsx')
+    const reservedZip = await JSZip.loadAsync(await fs.readFile(stylesPath))
+    const reservedStyles = await reservedZip.file('xl/styles.xml').async('string')
+    const cellXfsMatch = /<cellXfs count="(\d+)">([\s\S]*?)<\/cellXfs>/.exec(reservedStyles)
+    assert(cellXfsMatch, 'the fixture has a cellXfs table')
+    const accountingXfIndex = Number(cellXfsMatch[1])
+    reservedZip.file('xl/styles.xml', reservedStyles.replace(
+      cellXfsMatch[0],
+      `<cellXfs count="${accountingXfIndex + 1}">${cellXfsMatch[2]}` +
+        '<xf numFmtId="44" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>',
+    ))
+    const reservedSheet = await reservedZip.file('xl/worksheets/sheet1.xml').async('string')
+    reservedZip.file('xl/worksheets/sheet1.xml', reservedSheet.replace(
+      '</sheetData>',
+      `<row r="20"><c r="A20" s="${accountingXfIndex}"><v>1234.5</v></c></row></sheetData>`,
+    ))
+    await fs.writeFile(reservedPath, await reservedZip.generateAsync({ type: 'nodebuffer' }))
+    const reservedOpened = await workbookPayloadFromPath(reservedPath)
+    assert.match(
+      String(reservedOpened.workbook.sheets[0].cells.A20.numFmt),
+      /^_\("\$"\* #,##0\.00_\)/,
+      'builtin accounting format id 44 resolves',
+    )
+
+    // A formula with no cached result must survive an ODS export.
+    const odsSource = {
+      version: 1,
+      name: 'ods-formulas.xlsx',
+      activeSheetId: 's1',
+      sheets: [{
+        id: 's1',
+        name: 'Sheet1',
+        rowCount: 4,
+        colCount: 3,
+        cells: { A1: { value: 1 }, B1: { value: 2 }, C1: { formula: 'A1+B1' } },
+        merges: [],
+      }],
+      definedNames: [],
+      metadata: {},
+    }
+    const odsBytes = await serializeWorkbook(odsSource, 'ods')
+    const odsReopened = await workbookPayloadFromBytes('ods-formulas.ods', odsBytes)
+    assert.equal(odsReopened.workbook.sheets[0].cells.C1.formula, 'A1+B1', 'an uncached formula survives an ODS export')
 
     const encrypted = Buffer.concat([
       Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]),

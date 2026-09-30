@@ -107,7 +107,11 @@ function placedImageDataUrl(image: PdfImageData, matrix: Matrix, rect: PdfRect):
   const source = decodedImageCanvas(image)
   if (!source || rect.width <= 0 || rect.height <= 0) return undefined
   const sourceScale = Math.min(source.width / rect.width, source.height / rect.height)
-  const pixelsPerPoint = Math.max(1, Math.min(4, Number.isFinite(sourceScale) ? sourceScale : 1))
+  const pixelsPerPoint = Math.min(
+    Math.max(1, Math.min(4, Number.isFinite(sourceScale) ? sourceScale : 1)),
+    Math.sqrt(16_000_000 / (rect.width * rect.height)),
+    8192 / Math.max(rect.width, rect.height),
+  )
   const canvas = document.createElement('canvas')
   canvas.width = Math.max(1, Math.ceil(rect.width * pixelsPerPoint))
   canvas.height = Math.max(1, Math.ceil(rect.height * pixelsPerPoint))
@@ -134,8 +138,9 @@ const pageObjectsCache = new WeakMap<PDFPageProxy, Promise<DetectedPageObject[]>
 /**
  * Finds raster-image paint operations exposed by PDF.js. These bounds are a
  * rendering aid, not a mutation API; the original PDF object remains untouched.
- * Detection walks the full operator list and decodes every image, so the result
- * is shared across mounts and tool switches for the lifetime of the page proxy.
+ * Bounds are shared across mounts and tool switches. PNG materialization is
+ * deferred until a user selects an image, so entering Edit does not encode every
+ * photograph on the page or retain all those large strings in memory.
  */
 export function detectPageObjects(page: PDFPageProxy, pageIndex: number): Promise<DetectedPageObject[]> {
   let request = pageObjectsCache.get(page)
@@ -250,9 +255,17 @@ async function extractPageObjects(page: PDFPageProxy, pageIndex: number): Promis
 
   return Promise.all(unique.map(async ({ matrix, imageObjectId, imageData, ...candidate }) => {
     const decoded = imageData || (imageObjectId ? await imageObject(page, imageObjectId) : null)
+    let materialized = false
+    let dataUrl: string | undefined
     return {
       ...candidate,
-      dataUrl: decoded ? placedImageDataUrl(decoded, matrix, candidate.rect) : undefined,
+      get dataUrl() {
+        if (!materialized) {
+          dataUrl = decoded ? placedImageDataUrl(decoded, matrix, candidate.rect) : undefined
+          materialized = true
+        }
+        return dataUrl
+      },
     }
   }))
 }

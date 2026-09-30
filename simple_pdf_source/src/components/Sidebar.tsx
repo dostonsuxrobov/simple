@@ -18,8 +18,9 @@ import {
 } from 'lucide-react'
 import type { ActiveSearchMatch, Bookmark, SearchResult } from '../types'
 import { getPageTextContent } from '../lib/pdf'
-import { isImportableTransferFile, pageReorderDestination } from '../lib/pageTransfer'
+import { isImportableTransferFile, pageIndicesForTransfer } from '../lib/pageTransfer'
 import { normalizeSearchValue } from '../lib/search'
+import { createDocumentSearch } from '../lib/documentSearch'
 import { cx, errorMessage } from '../lib/utils'
 import { EmptyState, IconButton } from './ui'
 
@@ -28,6 +29,15 @@ type SidebarTab = 'pages' | 'bookmarks' | 'search'
 const THUMBNAIL_ROW_HEIGHT = 222
 const THUMBNAIL_OVERSCAN = 2
 const INTERNAL_PAGE_DRAG_TYPE = 'application/x-simple-pdf-page'
+
+const searchDocument = createDocumentSearch<PDFDocumentProxy>(async (pdf, pageIndex, isCancelled) => {
+  if (isCancelled()) return null
+  const page = await pdf.getPage(pageIndex + 1)
+  if (isCancelled()) return null
+  const content = await getPageTextContent(page)
+  if (isCancelled()) return null
+  return content.items.map((item) => ('str' in item ? item.str : '')).join(' ')
+})
 
 interface SearchOccurrence {
   resultIndex: number
@@ -221,7 +231,7 @@ interface SidebarProps {
   onClose: () => void
   onPage: (index: number) => void
   onSelectPage: (index: number, event: MouseEvent) => void
-  onReorder: (from: number, to: number) => void
+  onReorder: (indices: number[], insertIndex: number) => void
   onInsertBlank: () => void
   onAddPages: () => void
   onDuplicatePages: () => void
@@ -243,6 +253,8 @@ export function Sidebar({
 }: SidebarProps) {
   const [tab, setTab] = useState<SidebarTab>('pages')
   const [draggedPage, setDraggedPage] = useState<number | null>(null)
+  const draggedIndicesRef = useRef<number[]>([])
+  const autoScrollRef = useRef({ velocity: 0, lastOver: 0, frame: 0 })
   const [query, setQuery] = useState('')
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
@@ -258,8 +270,55 @@ export function Sidebar({
     start: 0,
     end: Math.min(pdf.numPages, 8),
   }))
+  // The row being dragged must stay mounted while the list auto-scrolls away from it.
+  const visibleThumbnailRows = useMemo(() => {
+    const rows = Array.from({ length: Math.max(0, thumbnailWindow.end - thumbnailWindow.start) }, (_, offset) => thumbnailWindow.start + offset)
+    if (draggedPage !== null && draggedPage < pdf.numPages && !rows.includes(draggedPage)) rows.push(draggedPage)
+    return rows
+  }, [thumbnailWindow, draggedPage, pdf.numPages])
   const searchOccurrences = useMemo(() => flattenSearchResults(results), [results])
   const activeResultIndex = searchOccurrences[activeMatchIndex]?.resultIndex ?? -1
+
+  const stopAutoScroll = useCallback(() => {
+    const state = autoScrollRef.current
+    state.velocity = 0
+    if (state.frame) { cancelAnimationFrame(state.frame); state.frame = 0 }
+  }, [])
+
+  const autoScrollWhileDragging = useCallback((event: ReactDragEvent<HTMLElement>) => {
+    const element = currentRef.current
+    if (!element) return
+    const state = autoScrollRef.current
+    const bounds = element.getBoundingClientRect()
+    const zone = Math.min(90, bounds.height / 3)
+    const fromTop = event.clientY - bounds.top
+    const fromBottom = bounds.bottom - event.clientY
+    // Speed ramps up the closer the pointer gets to the edge.
+    state.velocity = fromTop < zone ? -Math.ceil((1 - Math.max(0, fromTop) / zone) * 28)
+      : fromBottom < zone ? Math.ceil((1 - Math.max(0, fromBottom) / zone) * 28) : 0
+    state.lastOver = performance.now()
+    if (state.velocity && !state.frame) {
+      const tick = () => {
+        state.frame = 0
+        if (!state.velocity || performance.now() - state.lastOver > 250) { state.velocity = 0; return }
+        element.scrollTop += state.velocity
+        state.frame = requestAnimationFrame(tick)
+      }
+      state.frame = requestAnimationFrame(tick)
+    }
+  }, [])
+
+  useEffect(() => stopAutoScroll, [stopAutoScroll])
+
+  const dropOnPages = useCallback((event: ReactDragEvent<HTMLElement>, insertIndex: number) => {
+    stopAutoScroll()
+    const internal = Array.from(event.dataTransfer.types).includes(INTERNAL_PAGE_DRAG_TYPE)
+    const dragged = draggedIndicesRef.current
+    draggedIndicesRef.current = []
+    setDraggedPage(null)
+    if (internal && dragged.length) onReorder(dragged, insertIndex)
+    else if (event.dataTransfer.files.length) onImportPagesAt?.(Array.from(event.dataTransfer.files).filter(isImportableTransferFile), insertIndex)
+  }, [onImportPagesAt, onReorder, stopAutoScroll])
 
   const updateThumbnailWindow = useCallback((element: HTMLDivElement) => {
     const visibleStart = Math.floor(element.scrollTop / THUMBNAIL_ROW_HEIGHT)
@@ -300,6 +359,7 @@ export function Sidebar({
     onActiveSearchMatch(null)
     setSearchError('')
     setSearching(false)
+    return () => { searchRunRef.current += 1 }
   }, [pdf, onActiveSearchMatch])
 
   useEffect(() => {
@@ -361,42 +421,22 @@ export function Sidebar({
   }
 
   async function runSearch(direction: 1 | -1 = 1) {
+    const runId = ++searchRunRef.current
     const needle = normalizeSearchValue(query)
     if (!needle) {
       setResults([])
       setLastSearchedQuery('')
       setActiveMatchIndex(-1)
       onActiveSearchMatch(null)
+      setSearching(false)
+      setSearchError('')
       return
     }
-    const runId = ++searchRunRef.current
     setSearching(true)
     setSearchError('')
     try {
-      const matches: SearchResult[] = []
-      for (let index = 0; index < pdf.numPages; index += 1) {
-        const page = await pdf.getPage(index + 1)
-        const content = await getPageTextContent(page)
-        const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ').replace(/\s+/g, ' ').trim()
-        const lower = normalizeSearchValue(text)
-        let count = 0
-        let offset = lower.indexOf(needle)
-        while (offset >= 0) {
-          count += 1
-          offset = lower.indexOf(needle, offset + needle.length)
-        }
-        if (count) {
-          const first = lower.indexOf(needle)
-          const start = Math.max(0, first - 42)
-          const end = Math.min(text.length, first + needle.length + 58)
-          matches.push({
-            pageIndex: index,
-            excerpt: `${start ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}`,
-            count,
-          })
-        }
-      }
-      if (runId !== searchRunRef.current) return
+      const matches = await searchDocument(pdf, needle, { isCancelled: () => runId !== searchRunRef.current })
+      if (!matches || runId !== searchRunRef.current) return
       setResults(matches)
       setLastSearchedQuery(needle)
       if (matches.length) {
@@ -427,6 +467,8 @@ export function Sidebar({
   }
 
   function dismissSearch() {
+    searchRunRef.current += 1
+    setSearching(false)
     onActiveSearchMatch(null)
     setTab(lastNonSearchTab.current)
     window.requestAnimationFrame(() => {
@@ -467,9 +509,23 @@ export function Sidebar({
             <span>{pdf.numPages} {pdf.numPages === 1 ? 'page' : 'pages'}</span>
             {selectedPages.size > 1 && <strong>{selectedPages.size} selected</strong>}
           </div>
-          <div className="thumbnails" ref={currentRef} role="listbox" aria-label="PDF pages" aria-multiselectable="true" onScroll={(event) => updateThumbnailWindow(event.currentTarget)}>
+          <div
+            className="thumbnails"
+            ref={currentRef}
+            role="listbox"
+            aria-label="PDF pages"
+            aria-multiselectable="true"
+            onScroll={(event) => updateThumbnailWindow(event.currentTarget)}
+            onDragOver={(event) => {
+              event.preventDefault()
+              event.dataTransfer.dropEffect = Array.from(event.dataTransfer.types).includes('Files') ? 'copy' : 'move'
+              autoScrollWhileDragging(event)
+            }}
+            onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) stopAutoScroll() }}
+            onDrop={(event) => { event.preventDefault(); dropOnPages(event, pdf.numPages) }}
+          >
             <div className="thumbnail-virtual-spacer" style={{ height: pdf.numPages * THUMBNAIL_ROW_HEIGHT }}>
-              {Array.from({ length: Math.max(0, thumbnailWindow.end - thumbnailWindow.start) }, (_, offset) => thumbnailWindow.start + offset).map((index) => (
+              {visibleThumbnailRows.map((index) => (
                 <div key={index} className="thumbnail-virtual-row" style={{ transform: `translateY(${index * THUMBNAIL_ROW_HEIGHT}px)` }}>
                   <PageThumbnail
                     pdf={pdf}
@@ -485,24 +541,19 @@ export function Sidebar({
                     onRotateRight={onRotateRight}
                     onDelete={onDeletePages}
                     onDragStart={(event) => {
-                      setDraggedPage(index)
+                      const indices = pageIndicesForTransfer(selectedPages, index)
+                      draggedIndicesRef.current = indices
                       event.dataTransfer.effectAllowed = 'move'
-                      event.dataTransfer.setData(INTERNAL_PAGE_DRAG_TYPE, String(index))
+                      event.dataTransfer.setData(INTERNAL_PAGE_DRAG_TYPE, indices.join(','))
+                      // Re-rendering inside dragstart can make Chromium cancel the drag.
+                      window.setTimeout(() => setDraggedPage(index), 0)
                     }}
                     onExportDragStart={(event) => {
                       event.dataTransfer.effectAllowed = 'copy'
                       onPageDragStart?.(index, event)
                     }}
-                    onDragEnd={() => setDraggedPage(null)}
-                    onDrop={(event, insertIndex) => {
-                      const internalPage = event.dataTransfer.getData(INTERNAL_PAGE_DRAG_TYPE)
-                      const importableFiles = Array.from(event.dataTransfer.files).filter(isImportableTransferFile)
-                      if (internalPage && draggedPage !== null) {
-                        const destination = pageReorderDestination(draggedPage, insertIndex)
-                        if (destination !== draggedPage) onReorder(draggedPage, destination)
-                      } else if (event.dataTransfer.files.length) onImportPagesAt?.(importableFiles, insertIndex)
-                      setDraggedPage(null)
-                    }}
+                    onDragEnd={() => { stopAutoScroll(); draggedIndicesRef.current = []; setDraggedPage(null) }}
+                    onDrop={dropOnPages}
                   />
                 </div>
               ))}
@@ -583,7 +634,7 @@ export function Sidebar({
               placeholder="Find in document"
               aria-label="Find in document"
             />
-            {query && <button type="button" aria-label="Clear search" onClick={() => { searchRunRef.current += 1; setQuery(''); setResults([]); setLastSearchedQuery(''); setActiveMatchIndex(-1); onActiveSearchMatch(null); setSearching(false); searchInputRef.current?.focus() }}><X size={13} /></button>}
+            {query && <button type="button" aria-label="Clear search" onClick={() => { searchRunRef.current += 1; setQuery(''); setResults([]); setLastSearchedQuery(''); setActiveMatchIndex(-1); onActiveSearchMatch(null); setSearchError(''); setSearching(false); searchInputRef.current?.focus() }}><X size={13} /></button>}
           </form>
           <div className="search-status">
             {searching

@@ -27,7 +27,7 @@ The main process checks both the extension and the file signature before data re
 - Memory-bounded undo and redo.
 - Atomic Save and Save As to PNG, JPEG, or WebP.
 - One-click conversion of the current edited image to a one-page PDF.
-- Native Windows printing from the current edited canvas.
+- Two-pane print setup for the current edited canvas: live Letter/A4/Legal paper preview, portrait or landscape orientation, preset/custom margins, fit/fill/actual/custom scaling, five placement anchors, transparency background color, whole-composition grayscale, and 1–99 copies. The preview and hidden Windows print renderer share the same physical layout calculations, and Print sends directly to the default printer without opening the native print dialog. Background editing, shortcuts, and drops are isolated while the dialog is open; submitted controls freeze until Windows returns; focus returns to the invoking control; and owned temporary print folders are never swept from another live process.
 - Save / Don't save / Cancel protection before close or replacement.
 - Sandboxed renderer, isolated preload bridge, blocked navigation, and no Node.js access in the page.
 
@@ -43,10 +43,14 @@ npm run dev
 ```powershell
 npm test
 npm run build:web
+npm run smoke:print
+npm run smoke:print-render
+npm run build:dir
+npm run smoke:packaged-print
 npm run build
 ```
 
-`npm test` runs TypeScript checking plus focused file-contract and atomic-save tests. The portable build is emitted to `release/` and uses the same shared `simple` icon as the other components.
+`npm test` runs TypeScript checking plus focused file-contract, atomic-save, PDF-export, print-layout, and silent-default-printer tests. `npm run smoke:print` drives the two-pane Electron interface, responsive layout, modal keyboard isolation, and the final IPC print payload without sending a real job. `npm run smoke:print-render` runs the same generated page through Chromium's PDF renderer and verifies a single, correctly oriented physical sheet. The portable build is emitted to `release/` and uses the same shared `simple` icon as the other components.
 
 ## Integration contract
 

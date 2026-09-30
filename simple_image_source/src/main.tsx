@@ -4,6 +4,9 @@ import {
   Brush,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
   Crop,
   Eraser,
   FileDown,
@@ -23,10 +26,14 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
+import { INSPECTOR_STORAGE_KEY, inspectorOpenFromStored, storedInspectorOpen } from './inspector-preference.js'
+import { PrintDialog } from './PrintDialog'
+import type { ImagePrintSettings } from '../electron/print-layout.mjs'
 import './styles.css'
 
 type Tool = 'view' | 'crop' | 'brush' | 'eraser'
 type SaveFormat = 'png' | 'jpeg' | 'webp'
+type ExportFormat = SaveFormat | 'pdf'
 
 interface OpenImage {
   name: string
@@ -41,11 +48,19 @@ interface OpenImage {
 interface Dimensions { width: number; height: number }
 interface Point { x: number; y: number }
 interface CropRect { x: number; y: number; width: number; height: number }
-interface Snapshot { width: number; height: number; pixels: ImageData; revision: number }
+interface Snapshot { width: number; height: number; pixels: ImageData; revision: number; hasAlpha: boolean }
 interface CropDrag { handle: string; start: Point; initial: CropRect }
 interface ConfirmState { title: string; detail: string; action: () => void | Promise<void> }
+interface PrintSnapshot { data: Uint8Array; url: string; name: string; width: number; height: number }
+interface ImageContextMenu { x: number; y: number }
 
 const SUPPORTED = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'avif']
+const EXPORT_OPTIONS: ReadonlyArray<{ format: ExportFormat; label: string; detail: string }> = [
+  { format: 'png', label: 'PNG image', detail: 'Lossless and transparency-safe' },
+  { format: 'jpeg', label: 'JPEG image', detail: 'Compact for photos; transparent areas become white' },
+  { format: 'webp', label: 'WebP image', detail: 'Smaller modern image with transparency' },
+  { format: 'pdf', label: 'PDF document', detail: 'One page sized to the image aspect ratio' },
+]
 const MAX_ZOOM = 8
 const MIN_ZOOM = 0.05
 const MAX_CANVAS_DIMENSION = 20_000
@@ -94,12 +109,14 @@ function canvasToBlob(canvas: HTMLCanvasElement, format: SaveFormat): Promise<Bl
     context.fillRect(0, 0, exportCanvas.width, exportCanvas.height)
     context.drawImage(canvas, 0, 0)
   }
-  return new Promise((resolve, reject) => {
+  return new Promise<Blob>((resolve, reject) => {
     exportCanvas.toBlob(
       (blob) => blob ? resolve(blob) : reject(new Error('The image could not be encoded.')),
       outputMime(format),
       format === 'png' ? undefined : 0.92,
     )
+  }).finally(() => {
+    if (exportCanvas !== canvas) { exportCanvas.width = 1; exportCanvas.height = 1 }
   })
 }
 
@@ -119,6 +136,7 @@ function canvasHasTransparency(canvas: HTMLCanvasElement) {
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const contextMenuRef = useRef<HTMLDivElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
   const undoRef = useRef<Snapshot[]>([])
   const redoRef = useRef<Snapshot[]>([])
@@ -129,16 +147,26 @@ function App() {
   const imageRef = useRef<OpenImage | null>(null)
   const dirtyRef = useRef(false)
   const documentIdRef = useRef(0)
+  const loadRequestRef = useRef(0)
+  const originalImageRef = useRef<{ blob: Blob; format: SaveFormat; printable: boolean } | null>(null)
   const nextRevisionRef = useRef(0)
   const contentRevisionRef = useRef(0)
   const savedRevisionRef = useRef(0)
+  const saveGroupRef = useRef<HTMLDivElement>(null)
+  const exportGroupRef = useRef<HTMLDivElement>(null)
+  const printButtonRef = useRef<HTMLButtonElement>(null)
+  const printFocusReturnRef = useRef<HTMLElement | null>(null)
+  const printPendingFocusRef = useRef<HTMLElement | null>(null)
+  const printDialogOpenRef = useRef(false)
 
   const [image, setImage] = useState<OpenImage | null>(null)
+  const [album, setAlbum] = useState<{ paths: string[]; index: number }>({ paths: [], index: -1 })
   const [dimensions, setDimensions] = useState<Dimensions>({ width: 0, height: 0 })
   const [dirty, setDirtyState] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [convertingPdf, setConvertingPdf] = useState(false)
+  const [exporting, setExporting] = useState<ExportFormat | null>(null)
   const [printing, setPrinting] = useState(false)
+  const [printSnapshot, setPrintSnapshot] = useState<PrintSnapshot | null>(null)
   const [tool, setTool] = useState<Tool>('view')
   const [brushColor, setBrushColor] = useState('#111111')
   const [brushSize, setBrushSize] = useState(12)
@@ -151,9 +179,15 @@ function App() {
   const [toast, setToast] = useState<{ message: string; tone: 'normal' | 'error' } | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)
   const [saveMenu, setSaveMenu] = useState(false)
+  const [exportMenu, setExportMenu] = useState(false)
+  const [contextMenu, setContextMenu] = useState<ImageContextMenu | null>(null)
+  const [inspectorOpen, setInspectorOpen] = useState(() => {
+    try { return inspectorOpenFromStored(window.localStorage.getItem(INSPECTOR_STORAGE_KEY)) } catch { return true }
+  })
 
   imageRef.current = image
   dirtyRef.current = dirty
+  printDialogOpenRef.current = Boolean(printSnapshot)
 
   const reflectDirty = useCallback(() => {
     const value = contentRevisionRef.current !== savedRevisionRef.current
@@ -201,6 +235,7 @@ function App() {
       height: canvas.height,
       pixels: context2d().getImageData(0, 0, canvas.width, canvas.height),
       revision: contentRevisionRef.current,
+      hasAlpha: imageRef.current?.hasAlpha ?? false,
     }
   }, [context2d])
 
@@ -226,9 +261,11 @@ function App() {
     context.putImageData(entry.pixels, 0, 0)
     contentRevisionRef.current = entry.revision
     setDimensions({ width: entry.width, height: entry.height })
+    setImage((current) => current ? { ...current, hasAlpha: entry.hasAlpha } : current)
     setCropRect(null)
     reflectDirty()
-  }, [context2d, reflectDirty])
+    if (fitMode) requestAnimationFrame(() => fitImage(entry.width, entry.height))
+  }, [context2d, fitImage, fitMode, reflectDirty])
 
   const undo = useCallback(() => {
     const previous = undoRef.current.pop()
@@ -253,7 +290,8 @@ function App() {
     setImage((current) => current ? { ...current, hasAlpha } : current)
   }, [])
 
-  const loadPayloadNow = useCallback(async (payload: ImagePayload) => {
+  const loadPayloadNow = useCallback(async (payload: ImagePayload, request: number) => {
+    if (request !== loadRequestRef.current) return
     const blob = new Blob([payload.data as BlobPart], { type: payload.mime })
     const url = URL.createObjectURL(blob)
     try {
@@ -261,6 +299,7 @@ function App() {
       decoded.decoding = 'async'
       decoded.src = url
       await decoded.decode()
+      if (request !== loadRequestRef.current) return
       if (!decoded.naturalWidth || !decoded.naturalHeight) throw new Error('The image has no drawable pixels.')
       if (
         decoded.naturalWidth > MAX_CANVAS_DIMENSION
@@ -276,8 +315,15 @@ function App() {
       const context = context2d()
       context.clearRect(0, 0, canvas.width, canvas.height)
       context.drawImage(decoded, 0, 0)
-      const hasAlpha = canvasHasTransparency(canvas)
+      // JPEG cannot contain transparency. Avoid a full pixel readback and scan
+      // just to rediscover this on every large photograph.
+      const hasAlpha = /^(jpe?g)$/i.test(payload.format) ? false : canvasHasTransparency(canvas)
       const saveFormat = defaultSaveFormat(payload.format)
+      originalImageRef.current = {
+        blob,
+        format: saveFormat,
+        printable: /^(png|jpe?g)$/i.test(payload.format),
+      }
       documentIdRef.current += 1
       nextRevisionRef.current = 0
       contentRevisionRef.current = 0
@@ -292,6 +338,16 @@ function App() {
         hasAlpha,
       }
       setImage(nextImage)
+      setAlbum({ paths: payload.path ? [payload.path] : [], index: payload.path ? 0 : -1 })
+      if (payload.path) {
+        const currentPath = payload.path
+        const loadedDocument = documentIdRef.current
+        void window.simpleImage.listSiblings(currentPath).then((paths) => {
+          if (loadedDocument !== documentIdRef.current || !paths.length) return
+          const index = paths.findIndex((entry) => entry.toLowerCase() === currentPath.toLowerCase())
+          setAlbum(index >= 0 ? { paths, index } : { paths: [currentPath, ...paths], index: 0 })
+        }).catch(() => {})
+      }
       setDimensions({ width: canvas.width, height: canvas.height })
       dirtyRef.current = false
       setDirtyState(false)
@@ -310,6 +366,7 @@ function App() {
   }, [context2d, fitImage, notify])
 
   const requestProceed = useCallback((title: string, detail: string, action: () => void | Promise<void>) => {
+    if (printDialogOpenRef.current) return
     if (!dirtyRef.current) {
       void action()
       return
@@ -317,27 +374,40 @@ function App() {
     setConfirmState({ title, detail, action })
   }, [])
 
-  const loadPayload = useCallback((payload: ImagePayload) => {
+  const loadPayload = useCallback((payload: ImagePayload, request: number) => {
+    if (request !== loadRequestRef.current) return
     requestProceed('Save changes before opening another image?', 'Your current edits have not been saved.', async () => {
-      try { await loadPayloadNow(payload) } catch (error) { notify(error instanceof Error ? error.message : 'The image could not be opened.', 'error') }
+      try { await loadPayloadNow(payload, request) } catch (error) { if (request === loadRequestRef.current) notify(error instanceof Error ? error.message : 'The image could not be opened.', 'error') }
     })
   }, [loadPayloadNow, notify, requestProceed])
 
   const openPath = useCallback(async (filePath: string) => {
-    try { loadPayload(await window.simpleImage.openPath(filePath)) }
-    catch (error) { notify(error instanceof Error ? error.message : 'The image could not be opened.', 'error') }
+    if (printDialogOpenRef.current) return
+    const request = ++loadRequestRef.current
+    try { loadPayload(await window.simpleImage.openPath(filePath), request) }
+    catch (error) { if (request === loadRequestRef.current) notify(error instanceof Error ? error.message : 'The image could not be opened.', 'error') }
   }, [loadPayload, notify])
 
+  const stepAlbum = useCallback((delta: number) => {
+    if (album.paths.length < 2 || album.index < 0) return
+    const next = (album.index + delta + album.paths.length) % album.paths.length
+    void openPath(album.paths[next])
+  }, [album, openPath])
+
   const openDialog = useCallback(async () => {
+    if (printDialogOpenRef.current) return
+    const request = ++loadRequestRef.current
     try {
       const payload = await window.simpleImage.openFile()
-      if (payload) loadPayload(payload)
+      if (payload) loadPayload(payload, request)
     } catch (error) {
       notify(error instanceof Error ? error.message : 'The image could not be opened.', 'error')
     }
   }, [loadPayload, notify])
 
   const openDroppedFile = useCallback(async (file: File) => {
+    if (printDialogOpenRef.current) return
+    const request = ++loadRequestRef.current
     try {
       const extension = file.name.split('.').pop()?.toLowerCase() || ''
       if (!SUPPORTED.includes(extension)) throw new Error(`.${extension || '?'} images are not supported.`)
@@ -345,7 +415,7 @@ function App() {
       const payload = filePath
         ? await window.simpleImage.openPath(filePath)
         : await window.simpleImage.openBytes(file.name, await file.arrayBuffer())
-      loadPayload(payload)
+      loadPayload(payload, request)
     } catch (error) {
       notify(error instanceof Error ? error.message : 'The dropped image could not be opened.', 'error')
     }
@@ -354,14 +424,19 @@ function App() {
   const saveImage = useCallback(async (forceDialog = false): Promise<boolean> => {
     const canvas = canvasRef.current
     const current = imageRef.current
-    if (!canvas || !current || saving || convertingPdf || printing) return false
+    if (!canvas || !current || saving || exporting || printing) return false
     const documentId = documentIdRef.current
     const revision = contentRevisionRef.current
     const saveFormat = current.saveFormat
     setSaving(true)
     setSaveMenu(false)
     try {
-      const blob = await canvasToBlob(canvas, saveFormat)
+      const original = originalImageRef.current
+      // An unchanged Save/Save As must not recompress a JPEG or discard its
+      // metadata. Undo back to revision zero also restores the exact source.
+      const blob = revision === 0 && original?.format === saveFormat
+        && original.blob.type === outputMime(saveFormat)
+        ? original.blob : await canvasToBlob(canvas, saveFormat)
       const result = await window.simpleImage.saveImage({
         data: new Uint8Array(await blob.arrayBuffer()),
         path: current.path,
@@ -397,43 +472,147 @@ function App() {
     } finally {
       setSaving(false)
     }
-  }, [convertingPdf, notify, printing, reflectDirty, saving])
+  }, [exporting, notify, printing, reflectDirty, saving])
 
-  const printImage = useCallback(async () => {
+  const openPrintDialog = useCallback(async (invoker?: HTMLElement | null) => {
     const canvas = canvasRef.current
-    if (!canvas || !image || printing || convertingPdf || saving) return
+    if (!canvas || !image || printing || exporting || saving) return
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    printFocusReturnRef.current = invoker || activeElement || printButtonRef.current
+    setPrinting(true)
+    setSaveMenu(false)
+    setExportMenu(false)
+    const documentId = documentIdRef.current
+    const revision = contentRevisionRef.current
+    const width = canvas.width
+    const height = canvas.height
+    try {
+      const original = originalImageRef.current
+      const blob = revision === 0 && original?.printable ? original.blob : await canvasToBlob(canvas, 'png')
+      const data = new Uint8Array(await blob.arrayBuffer())
+      if (documentIdRef.current !== documentId || contentRevisionRef.current !== revision) {
+        notify('The image changed while preparing print. Open Print again to use the latest image.')
+        return
+      }
+      setPrintSnapshot({
+        data,
+        url: URL.createObjectURL(blob),
+        name: image.name,
+        width,
+        height,
+      })
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'The print preview could not be prepared.', 'error')
+    } finally {
+      setPrinting(false)
+    }
+  }, [exporting, image, notify, printing, saving])
+
+  const finishPrintDialog = useCallback(() => {
+    setPrintSnapshot(null)
+    printPendingFocusRef.current = printFocusReturnRef.current
+    printFocusReturnRef.current = null
+  }, [])
+
+  const closePrintDialog = useCallback(() => {
+    if (!printing) finishPrintDialog()
+  }, [finishPrintDialog, printing])
+
+  const runPrint = useCallback(async (settings: ImagePrintSettings) => {
+    if (!printSnapshot || printing) return
     setPrinting(true)
     try {
-      const blob = await canvasToBlob(canvas, 'png')
-      const printed = await window.simpleImage.printImage({ data: new Uint8Array(await blob.arrayBuffer()), name: image.name })
-      if (!printed) notify('Printing was canceled.')
+      const printed = await window.simpleImage.printImage({
+        data: printSnapshot.data,
+        name: printSnapshot.name,
+        width: printSnapshot.width,
+        height: printSnapshot.height,
+        settings,
+      })
+      if (printed) {
+        finishPrintDialog()
+        notify('The image was sent directly to your default printer.')
+      } else {
+        notify('The image could not be sent to the printer.', 'error')
+      }
     } catch (error) {
       notify(error instanceof Error ? error.message : 'The image could not be printed.', 'error')
     } finally {
       setPrinting(false)
     }
-  }, [convertingPdf, image, notify, printing, saving])
+  }, [finishPrintDialog, notify, printSnapshot, printing])
 
-  const convertToPdf = useCallback(async () => {
+  const exportImage = useCallback(async (format: ExportFormat) => {
     const canvas = canvasRef.current
     const current = imageRef.current
-    if (!canvas || !current || convertingPdf || saving || printing) return
-    setConvertingPdf(true)
+    if (!canvas || !current || exporting || saving || printing) return
+    setExporting(format)
     setSaveMenu(false)
+    setExportMenu(false)
     try {
-      const blob = await canvasToBlob(canvas, 'png')
-      const result = await window.simpleImage.convertToPdf({
+      if (format === 'pdf') {
+        const blob = await canvasToBlob(canvas, 'png')
+        const result = await window.simpleImage.convertToPdf({
+          data: new Uint8Array(await blob.arrayBuffer()),
+          name: current.name,
+        })
+        if (result) notify(`Exported ${result.name}`)
+        else notify('PDF export was canceled.')
+        return
+      }
+      const blob = await canvasToBlob(canvas, format)
+      const result = await window.simpleImage.saveImage({
         data: new Uint8Array(await blob.arrayBuffer()),
+        path: null,
         name: current.name,
+        format,
+        forceDialog: true,
+        purpose: 'export',
       })
-      if (result) notify(`Created ${result.name}`)
-      else notify('PDF conversion was canceled.')
+      if (result) notify(`Exported ${result.name}`)
+      else notify(`${format === 'jpeg' ? 'JPEG' : format.toUpperCase()} export was canceled.`)
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'The image could not be converted to PDF.', 'error')
+      notify(error instanceof Error ? error.message : 'The image could not be exported.', 'error')
     } finally {
-      setConvertingPdf(false)
+      setExporting(null)
     }
-  }, [convertingPdf, notify, printing, saving])
+  }, [exporting, notify, printing, saving])
+
+  const copyImageToClipboard = useCallback(async () => {
+    const canvas = canvasRef.current
+    if (!canvas || !image || saving || exporting || printing) return false
+    let copyCanvas: HTMLCanvasElement | null = null
+    try {
+      let source = canvas
+      let copiedSelection = false
+      if (tool === 'crop' && cropRect) {
+        const x = clamp(Math.round(cropRect.x), 0, Math.max(0, canvas.width - 1))
+        const y = clamp(Math.round(cropRect.y), 0, Math.max(0, canvas.height - 1))
+        const width = Math.min(Math.max(1, Math.round(cropRect.width)), canvas.width - x)
+        const height = Math.min(Math.max(1, Math.round(cropRect.height)), canvas.height - y)
+        copyCanvas = document.createElement('canvas')
+        copyCanvas.width = width
+        copyCanvas.height = height
+        const context = copyCanvas.getContext('2d')
+        if (!context) throw new Error('The selected image area could not be prepared.')
+        context.drawImage(canvas, x, y, width, height, 0, 0, width, height)
+        source = copyCanvas
+        copiedSelection = true
+      }
+      const blob = await canvasToBlob(source, 'png')
+      await window.simpleImage.copyPng(new Uint8Array(await blob.arrayBuffer()))
+      notify(copiedSelection ? 'Selected area copied to the clipboard.' : 'Image copied to the clipboard.')
+      return true
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'The image could not be copied.', 'error')
+      return false
+    } finally {
+      if (copyCanvas) {
+        copyCanvas.width = 1
+        copyCanvas.height = 1
+      }
+    }
+  }, [cropRect, exporting, image, notify, printing, saving, tool])
 
   const rotate = useCallback((clockwise: boolean) => {
     const canvas = canvasRef.current
@@ -450,12 +629,13 @@ function App() {
     context.rotate((clockwise ? 1 : -1) * Math.PI / 2)
     context.drawImage(copy, -copy.width / 2, -copy.height / 2)
     context.setTransform(1, 0, 0, 1, 0, 0)
+    copy.width = 1
+    copy.height = 1
     setDimensions({ width: canvas.width, height: canvas.height })
     setCropRect(null)
     markEdited()
-    updateAlphaMetadata()
     if (fitMode) requestAnimationFrame(() => fitImage(canvas.width, canvas.height))
-  }, [context2d, fitImage, fitMode, image, markEdited, pushUndo, updateAlphaMetadata])
+  }, [context2d, fitImage, fitMode, image, markEdited, pushUndo])
 
   const beginCrop = useCallback(() => {
     if (!image) return
@@ -487,6 +667,8 @@ function App() {
     canvas.width = crop.width
     canvas.height = crop.height
     context2d().drawImage(copy, 0, 0)
+    copy.width = 1
+    copy.height = 1
     setDimensions({ width: crop.width, height: crop.height })
     setCropRect(null)
     setTool('view')
@@ -527,6 +709,7 @@ function App() {
   }, [brushColor, brushSize, context2d, tool])
 
   const onCanvasPointerDown = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.button !== 0 || !event.isPrimary) return
     if (tool !== 'brush' && tool !== 'eraser') return
     event.currentTarget.setPointerCapture(event.pointerId)
     pushUndo()
@@ -563,6 +746,7 @@ function App() {
   }, [])
 
   const startCropDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || !event.isPrimary) return
     if (!cropRect) return
     event.currentTarget.setPointerCapture(event.pointerId)
     const element = event.target as HTMLElement
@@ -613,6 +797,10 @@ function App() {
   const handleDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault()
     setDraggingFile(false)
+    if (printDialogOpenRef.current) {
+      event.stopPropagation()
+      return
+    }
     const file = event.dataTransfer.files[0]
     if (file) void openDroppedFile(file)
   }, [openDroppedFile])
@@ -632,11 +820,68 @@ function App() {
     }
   }, [confirmState, saveImage])
 
+  const toggleInspector = useCallback(() => setInspectorOpen((value) => !value), [])
+
   useEffect(() => window.simpleImage.onMaximized(setIsMaximized), [])
   useEffect(() => window.simpleImage.onOpenExternal(openPath), [openPath])
   useEffect(() => window.simpleImage.onCloseRequested(() => {
     requestProceed('Save changes before closing?', 'Your edits will be lost if you close without saving.', () => window.simpleImage.confirmClose())
   }), [requestProceed])
+
+  useEffect(() => {
+    try { window.localStorage.setItem(INSPECTOR_STORAGE_KEY, storedInspectorOpen(inspectorOpen)) } catch { /* Preference persistence is optional. */ }
+  }, [inspectorOpen])
+
+  useEffect(() => () => {
+    if (printSnapshot) URL.revokeObjectURL(printSnapshot.url)
+  }, [printSnapshot])
+
+  useEffect(() => {
+    const backgroundSurfaces = document.querySelectorAll<HTMLElement>('[data-print-background]')
+    backgroundSurfaces.forEach((surface) => { surface.inert = Boolean(printSnapshot) })
+    return () => backgroundSurfaces.forEach((surface) => { surface.inert = false })
+  }, [printSnapshot])
+
+  useEffect(() => {
+    if (printSnapshot || printing || !printPendingFocusRef.current) return
+    const preferred = printPendingFocusRef.current
+    printPendingFocusRef.current = null
+    window.requestAnimationFrame(() => {
+      const fallback = printButtonRef.current
+      const target = preferred.isConnected && !preferred.hasAttribute('disabled') ? preferred : fallback
+      if (target?.isConnected && !target.hasAttribute('disabled')) target.focus()
+    })
+  }, [printSnapshot, printing])
+
+  useEffect(() => {
+    const closeMenus = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (!saveGroupRef.current?.contains(target)) setSaveMenu(false)
+      if (!exportGroupRef.current?.contains(target)) setExportMenu(false)
+    }
+    document.addEventListener('pointerdown', closeMenus)
+    return () => document.removeEventListener('pointerdown', closeMenus)
+  }, [])
+
+  useEffect(() => {
+    if (!contextMenu) return
+    const closeOutside = (event: PointerEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest('.image-context-menu')) setContextMenu(null)
+    }
+    const close = () => setContextMenu(null)
+    const viewport = viewportRef.current
+    document.addEventListener('pointerdown', closeOutside)
+    window.addEventListener('blur', close)
+    window.addEventListener('resize', close)
+    viewport?.addEventListener('scroll', close, { passive: true })
+    window.requestAnimationFrame(() => contextMenuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus())
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside)
+      window.removeEventListener('blur', close)
+      window.removeEventListener('resize', close)
+      viewport?.removeEventListener('scroll', close)
+    }
+  }, [contextMenu])
 
   useEffect(() => {
     if (!fitMode || !image) return
@@ -647,32 +892,94 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (printSnapshot) {
+        event.preventDefault()
+        if (event.key === 'Escape' && !printing) closePrintDialog()
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'p' && !printing) {
+          const printButton = document.querySelector<HTMLButtonElement>('.image-print-dialog .print-submit')
+          printButton?.click()
+        }
+        return
+      }
       if (confirmState) {
         if (event.key === 'Escape' && !saving) setConfirmState(null)
         if (event.key === 'Tab' || event.key === 'Enter' || event.key === ' ') return
         event.preventDefault()
         return
       }
-      if (saving) {
+      if (saving || exporting) {
         if (event.key === 'Tab') return
         event.preventDefault()
         return
       }
+      if (contextMenu) {
+        const menu = contextMenuRef.current
+        const buttons = [...menu?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []]
+        const current = Math.max(0, buttons.indexOf(document.activeElement as HTMLButtonElement))
+        const key = event.key.toLowerCase()
+        if ((event.ctrlKey || event.metaKey) && key === 'c') {
+          event.preventDefault()
+          setContextMenu(null)
+          void copyImageToClipboard()
+        } else if ((event.ctrlKey || event.metaKey) && key === 'z' && !event.shiftKey) {
+          event.preventDefault()
+          setContextMenu(null)
+          undo()
+        } else if ((event.ctrlKey || event.metaKey) && (key === 'y' || (key === 'z' && event.shiftKey))) {
+          event.preventDefault()
+          setContextMenu(null)
+          redo()
+        } else if (key === 'escape') {
+          event.preventDefault()
+          setContextMenu(null)
+        } else if (key === 'arrowdown' || key === 'arrowup' || key === 'home' || key === 'end' || key === 'tab') {
+          event.preventDefault()
+          const next = key === 'home'
+            ? 0
+            : key === 'end'
+              ? buttons.length - 1
+              : (current + (key === 'arrowup' || (key === 'tab' && event.shiftKey) ? -1 : 1) + buttons.length) % buttons.length
+          buttons[next]?.focus()
+        } else if (!(event.target instanceof Element) || !event.target.closest('.image-context-menu') || (event.ctrlKey || event.metaKey)) {
+          event.preventDefault()
+        }
+        return
+      }
       const control = event.ctrlKey || event.metaKey
+      const target = event.target instanceof HTMLElement ? event.target : null
+      const textInput = Boolean(target?.closest('input, textarea, [contenteditable="true"]'))
+      const nativeTextSelected = Boolean(window.getSelection()?.toString().trim())
+      if (control && event.key.toLowerCase() === 'c' && image && !textInput && !nativeTextSelected) { event.preventDefault(); void copyImageToClipboard() }
+      if (!control && !event.altKey && !event.shiftKey && tool === 'view' && !textInput && image && album.paths.length > 1
+        && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+        const viewport = viewportRef.current
+        const scrollable = viewport ? viewport.scrollWidth > viewport.clientWidth + 1 : false
+        if (!scrollable) { event.preventDefault(); stepAlbum(event.key === 'ArrowRight' ? 1 : -1) }
+      }
       if (control && event.key.toLowerCase() === 'o') { event.preventDefault(); void openDialog() }
       if (control && event.key.toLowerCase() === 's') { event.preventDefault(); void saveImage(event.shiftKey) }
-      if (control && event.key.toLowerCase() === 'p') { event.preventDefault(); void printImage() }
+      if (control && event.shiftKey && event.key.toLowerCase() === 'e' && image) {
+        event.preventDefault()
+        setSaveMenu(false)
+        setExportMenu((value) => !value)
+      }
+      if (control && event.key.toLowerCase() === 'p') { event.preventDefault(); void openPrintDialog() }
       if (control && !event.shiftKey && event.key.toLowerCase() === 'z') { event.preventDefault(); undo() }
       if (control && (event.key.toLowerCase() === 'y' || (event.shiftKey && event.key.toLowerCase() === 'z'))) { event.preventDefault(); redo() }
       if (control && (event.key === '+' || event.key === '=')) { event.preventDefault(); changeZoom(zoom * 1.2) }
       if (control && event.key === '-') { event.preventDefault(); changeZoom(zoom / 1.2) }
       if (control && event.key === '0') { event.preventDefault(); fitImage() }
-      if (event.key === 'Escape' && tool === 'crop') { setCropRect(null); setTool('view') }
+      if (event.key === 'F4' && image && !event.repeat) { event.preventDefault(); toggleInspector() }
+      if (event.key === 'Escape') {
+        setSaveMenu(false)
+        setExportMenu(false)
+        if (tool === 'crop') { setCropRect(null); setTool('view') }
+      }
       if (event.key === 'Enter' && tool === 'crop' && cropRect) applyCrop()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [applyCrop, changeZoom, confirmState, cropRect, fitImage, openDialog, printImage, redo, saveImage, saving, tool, undo, zoom])
+  }, [album, stepAlbum, applyCrop, changeZoom, closePrintDialog, confirmState, contextMenu, copyImageToClipboard, cropRect, exporting, fitImage, image, openDialog, openPrintDialog, printSnapshot, printing, redo, saveImage, saving, toggleInspector, tool, undo, zoom])
 
   const cropStyle = useMemo(() => cropRect && dimensions.width && dimensions.height ? {
     left: `${cropRect.x / dimensions.width * 100}%`,
@@ -686,14 +993,33 @@ function App() {
   const canRedo = redoRef.current.length > 0
   void historyVersion
 
+  const blockBackgroundAction = (event: React.SyntheticEvent) => {
+    if (!printSnapshot) return
+    const target = event.target
+    if (target instanceof Element && target.closest('.image-print-overlay')) return
+    event.preventDefault()
+    event.stopPropagation()
+  }
+
   return (
     <main
       className="app-shell"
-      onDragEnter={(event) => { event.preventDefault(); setDraggingFile(true) }}
-      onDragOver={(event) => event.preventDefault()}
+      onClickCapture={blockBackgroundAction}
+      onPointerDownCapture={blockBackgroundAction}
+      onInputCapture={blockBackgroundAction}
+      onChangeCapture={blockBackgroundAction}
+      onSubmitCapture={blockBackgroundAction}
+      onDragEnter={(event) => {
+        event.preventDefault()
+        if (printSnapshot) {
+          event.dataTransfer.dropEffect = 'none'
+          setDraggingFile(false)
+        } else setDraggingFile(true)
+      }}
+      onDragOver={(event) => { event.preventDefault(); if (printSnapshot) event.dataTransfer.dropEffect = 'none' }}
       onDrop={handleDrop}
     >
-      <header className="titlebar">
+      <header className="titlebar" data-print-background aria-hidden={printSnapshot ? true : undefined}>
         <div className="title-identity drag-region">
           <img className="brand-mark" src="./brand-icon.png" alt="" />
           <span className="app-name">simple</span>
@@ -703,24 +1029,54 @@ function App() {
         </div>
         <div className="title-actions">
           <button title="Open image (Ctrl+O)" onClick={() => void openDialog()}><FolderOpen /><span>Open</span></button>
-          <div className="save-group">
-            <button className="primary-button" disabled={!image || saving || convertingPdf || printing} title="Save (Ctrl+S)" onClick={() => void saveImage(false)}><Save /><span>{saving ? 'Saving…' : 'Save'}</span></button>
-            <button className="primary-button split-button" disabled={!image || saving || convertingPdf || printing} title="Save options" onClick={() => setSaveMenu((value) => !value)}><ChevronDown /></button>
+          <div ref={saveGroupRef} className="save-group">
+            <button className="primary-button" disabled={!image || saving || Boolean(exporting) || printing} title="Save (Ctrl+S)" onClick={() => void saveImage(false)}><Save /><span>{saving ? 'Saving…' : 'Save'}</span></button>
+            <button
+              className="primary-button split-button"
+              disabled={!image || saving || Boolean(exporting) || printing}
+              title="Save options"
+              aria-haspopup="menu"
+              aria-expanded={saveMenu}
+              onClick={() => { setExportMenu(false); setSaveMenu((value) => !value) }}
+            ><ChevronDown /></button>
             {saveMenu && (
-              <div className="save-menu">
-                <button onClick={() => void saveImage(true)}><Save /><span><strong>Save as…</strong><small>Choose another file</small></span></button>
-                <div className="menu-rule" />
-                {(['png', 'jpeg', 'webp'] as SaveFormat[]).map((format) => (
-                  <button key={format} onClick={() => { setImage((value) => value ? { ...value, saveFormat: format } : value); setSaveMenu(false) }}>
-                    {image?.saveFormat === format ? <Check /> : <span className="check-placeholder" />}
-                    <span><strong>{format === 'jpeg' ? 'JPEG' : format.toUpperCase()}</strong><small>{format === 'png' ? 'Lossless, supports transparency' : format === 'jpeg' ? 'Smaller photos, no transparency' : 'Efficient with transparency'}</small></span>
-                  </button>
-                ))}
+              <div className="save-menu" role="menu" aria-label="Save options">
+                <button role="menuitem" onClick={() => void saveImage(true)}><Save /><span><strong>Save as…</strong><small>Move or rename the working image</small></span></button>
               </div>
             )}
           </div>
-          <button disabled={!image || convertingPdf || printing || saving} title="Convert image to PDF" onClick={() => void convertToPdf()}><FileDown /><span>{convertingPdf ? 'Converting…' : 'Convert to PDF'}</span></button>
-          <button disabled={!image || printing || convertingPdf || saving} title="Print (Ctrl+P)" onClick={() => void printImage()}><Printer /><span>{printing ? 'Printing…' : 'Print'}</span></button>
+          <div ref={exportGroupRef} className="export-group">
+            <button
+              className="export-button"
+              disabled={!image || Boolean(exporting) || printing || saving}
+              title="Export As (Ctrl+Shift+E)"
+              aria-haspopup="menu"
+              aria-expanded={exportMenu}
+              onClick={() => { setSaveMenu(false); setExportMenu((value) => !value) }}
+            >
+              <FileDown />
+              <span>{exporting ? `Exporting ${exporting === 'jpeg' ? 'JPEG' : exporting.toUpperCase()}…` : 'Export As'}</span>
+              <ChevronDown className="button-chevron" />
+            </button>
+            {exportMenu && image && (
+              <div className="export-menu" role="menu" aria-label="Export image as">
+                <div className="menu-heading"><strong>Export a copy</strong><small>The open image and unsaved edits stay in place.</small></div>
+                {EXPORT_OPTIONS.map((option) => (
+                  <button
+                    key={option.format}
+                    role="menuitem"
+                    data-export-format={option.format}
+                    onClick={() => void exportImage(option.format)}
+                  >
+                    <FileDown />
+                    <span><strong>{option.label}</strong><small>{option.detail}</small></span>
+                  </button>
+                ))}
+                <p className="export-note">SVG input is rasterized at its displayed pixel dimensions. Vector paths are not preserved, so SVG export is not offered.</p>
+              </div>
+            )}
+          </div>
+          <button ref={printButtonRef} disabled={!image || printing || Boolean(exporting) || saving} title="Print (Ctrl+P)" onClick={() => void openPrintDialog(printButtonRef.current)}><Printer /><span>{printing ? 'Preparing…' : 'Print'}</span></button>
         </div>
         <div className="window-actions">
           <button aria-label="Minimize" onClick={() => window.simpleImage.minimize()}><Minus /></button>
@@ -729,7 +1085,7 @@ function App() {
         </div>
       </header>
 
-      <section className="toolbar" aria-label="Image tools">
+      <section className="toolbar" data-print-background aria-label="Image tools" aria-hidden={printSnapshot ? true : undefined}>
         <div className="tool-group">
           <button className={tool === 'view' ? 'active' : ''} disabled={!image} onClick={() => chooseTool('view')} title="View"><MousePointer2 /><span>View</span></button>
           <button className={tool === 'crop' ? 'active' : ''} disabled={!image} onClick={beginCrop} title="Crop"><Crop /><span>Crop</span></button>
@@ -747,6 +1103,14 @@ function App() {
         <div className="tool-group">
           <button disabled={!canUndo} onClick={undo} title="Undo (Ctrl+Z)"><Undo2 /></button>
           <button disabled={!canRedo} onClick={redo} title="Redo (Ctrl+Y)"><Redo2 /></button>
+          <button
+            className={image && inspectorOpen ? 'active' : ''}
+            disabled={!image}
+            aria-controls="image-inspector"
+            aria-expanded={Boolean(image && inspectorOpen)}
+            onClick={toggleInspector}
+            title={`${inspectorOpen ? 'Hide' : 'Show'} image details (F4)`}
+          ><FileImage /><span>Details</span></button>
         </div>
         {tool === 'crop' && cropRect && (
           <div className="crop-actions">
@@ -757,7 +1121,7 @@ function App() {
         )}
       </section>
 
-      <section className="content">
+      <section className="content" data-print-background aria-hidden={printSnapshot ? true : undefined}>
         <div
           ref={viewportRef}
           className={`viewport ${image ? '' : 'is-empty'}`}
@@ -767,11 +1131,18 @@ function App() {
             changeZoom(zoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12))
           }}
         >
+          {image && album.paths.length > 1 && (
+            <>
+              <button className="album-nav album-prev" title="Previous image (←)" aria-label="Previous image" onClick={() => stepAlbum(-1)}><ChevronLeft /></button>
+              <button className="album-nav album-next" title="Next image (→)" aria-label="Next image" onClick={() => stepAlbum(1)}><ChevronRight /></button>
+              <div className="album-counter">{album.index + 1} / {album.paths.length}</div>
+            </>
+          )}
           {!image && (
             <div className="welcome">
               <img src="./brand-icon.png" alt="" />
               <h1>See every detail.</h1>
-              <p>Open, inspect, crop, rotate, paint, convert to PDF, print, and save images without uploading them anywhere.</p>
+              <p>Open, inspect, crop, rotate, paint, print, or export a copy as PNG, JPEG, WebP, or PDF without uploading anything.</p>
               <div className="welcome-actions">
                 <button className="welcome-primary" onClick={() => void openDialog()}><ImagePlus /> Open an image</button>
                 <button onClick={() => void window.simpleImage.newWindow()}><FileImage /> New window</button>
@@ -784,6 +1155,16 @@ function App() {
             className="canvas-stage"
             hidden={!image}
             style={{ minWidth: dimensions.width * zoom + 80, minHeight: dimensions.height * zoom + 80 }}
+            onContextMenu={(event) => {
+              event.preventDefault()
+              if (!image || saving || exporting || printing || printSnapshot) return
+              setSaveMenu(false)
+              setExportMenu(false)
+              setContextMenu({
+                x: Math.max(8, Math.min(event.clientX, window.innerWidth - 224)),
+                y: Math.max(8, Math.min(event.clientY, window.innerHeight - 190)),
+              })
+            }}
           >
             <div className="canvas-stack" style={{ width: dimensions.width * zoom, height: dimensions.height * zoom }}>
               <canvas
@@ -810,8 +1191,12 @@ function App() {
         </div>
 
         {image && (
-          <aside className="inspector">
-            <div className="inspector-heading"><FileImage /><div><strong>Image details</strong><span>Read from this asset</span></div></div>
+          <aside id="image-inspector" className="inspector" aria-label="Image details" hidden={!inspectorOpen}>
+            <div className="inspector-heading">
+              <FileImage />
+              <div><strong>Image details</strong><span>Read from this asset</span></div>
+              <button className="inspector-close" type="button" aria-label="Close image details" title="Close image details (F4)" onClick={() => setInspectorOpen(false)}><X /></button>
+            </div>
             <dl>
               <div><dt>Format</dt><dd>{image.sourceFormat.toUpperCase()}</dd></div>
               <div><dt>Dimensions</dt><dd>{dimensions.width.toLocaleString()} × {dimensions.height.toLocaleString()} px</dd></div>
@@ -830,7 +1215,7 @@ function App() {
         )}
       </section>
 
-      <footer className="statusbar">
+      <footer className="statusbar" data-print-background aria-hidden={printSnapshot ? true : undefined}>
         <div>{image ? <><strong>{image.sourceFormat.toUpperCase()}</strong><span>{dimensions.width.toLocaleString()} × {dimensions.height.toLocaleString()} px</span><span>{formatBytes(image.size)}</span></> : <span>Local image workspace</span>}</div>
         <div className="zoom-controls">
           <button disabled={!image} onClick={() => changeZoom(zoom / 1.2)} aria-label="Zoom out"><ZoomOut /></button>
@@ -846,7 +1231,27 @@ function App() {
           <div><ImagePlus /><strong>Drop to open</strong><span>Your current image stays safe until you confirm.</span></div>
         </div>
       )}
+      {contextMenu && image && (
+        <div ref={contextMenuRef} className="image-context-menu" role="menu" aria-label="Image selection menu" style={{ left: contextMenu.x, top: contextMenu.y }} onContextMenu={(event) => event.preventDefault()}>
+          <button role="menuitem" onClick={() => { setContextMenu(null); void copyImageToClipboard() }}><Copy /><span>{tool === 'crop' && cropRect ? 'Copy selected area' : 'Copy image'}</span><kbd>Ctrl C</kbd></button>
+          <div role="separator" />
+          <button role="menuitem" disabled={!canUndo} onClick={() => { setContextMenu(null); undo() }}><Undo2 /><span>Undo</span><kbd>Ctrl Z</kbd></button>
+          <button role="menuitem" disabled={!canRedo} onClick={() => { setContextMenu(null); redo() }}><Redo2 /><span>Redo</span><kbd>Ctrl Y</kbd></button>
+          {tool === 'crop' && cropRect && <><div role="separator" /><button role="menuitem" onClick={() => { setContextMenu(null); applyCrop() }}><Crop /><span>Apply crop</span><kbd>Enter</kbd></button></>}
+        </div>
+      )}
       {toast && <div className="toast" data-tone={toast.tone}>{toast.message}</div>}
+      {printSnapshot && (
+        <PrintDialog
+          imageUrl={printSnapshot.url}
+          imageName={printSnapshot.name}
+          imageWidth={printSnapshot.width}
+          imageHeight={printSnapshot.height}
+          busy={printing}
+          onPrint={(settings) => void runPrint(settings)}
+          onClose={closePrintDialog}
+        />
+      )}
       {confirmState && (
         <div className="modal-backdrop">
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">

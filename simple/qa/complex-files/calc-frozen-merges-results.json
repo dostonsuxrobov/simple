@@ -1,0 +1,80 @@
+{
+  "checks": [
+    "full original Summary title/note visible exactly once; initial focus and clicks on both sides select the entire merge; both sides edit the same master",
+    "merged dropdown, checkbox and hyperlink expose only one tab stop; continuation dropdown uses the accessible native master picker",
+    "75% and 125% zoom retain readable title and paragraph; scrolled four-pane merge selects and opens a visible sticky editor; Escape restores content; toolbar reports Georgia21 and Cambria13.5 accurately",
+    "column-only, row-only, and four-pane merged cells; independent and combined scrolling; far-scroll virtualization and return; no duplicate visible text or IDs",
+    "original saved cells, merge ranges, freeze metadata and workbook bytes unchanged"
+  ],
+  "visibility": {
+    "A1": {
+      "characters": 20,
+      "panes": [
+        "frozen-row",
+        "frozen-corner"
+      ],
+      "readableOnce": true
+    },
+    "A13": {
+      "characters": 223,
+      "panes": [
+        "body",
+        "frozen-column"
+      ],
+      "readableOnce": true
+    },
+    "A2": {
+      "characters": 75,
+      "panes": [
+        "body",
+        "frozen-row",
+        "frozen-column",
+        "frozen-corner"
+      ],
+      "readableOnce": true
+    },
+    "F2": {
+      "characters": 79,
+      "panes": [
+        "body",
+        "frozen-row"
+      ],
+      "readableOnce": true
+    },
+    "A12": {
+      "characters": 85,
+      "panes": [
+        "body",
+        "frozen-column"
+      ],
+      "readableOnce": true
+    }
+  },
+  "scroll": [
+    {
+      "left": 64,
+      "top": 0,
+      "passed": true
+    },
+    {
+      "left": 0,
+      "top": 24,
+      "passed": true
+    },
+    {
+      "left": 64,
+      "top": 24,
+      "passed": true
+    },
+    {
+      "left": 1200,
+      "top": 800,
+      "passed": true
+    },
+    {
+      "left": 0,
+      "top": 0,
+      "passed": true
+    }
+  ]
+}
