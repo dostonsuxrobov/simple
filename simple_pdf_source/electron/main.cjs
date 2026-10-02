@@ -8,43 +8,67 @@ const { replacePdfOutlines } = require('./pdf-outlines.cjs')
 const { removePageImageDraws } = require('./pdf-content-edits.cjs')
 const { removeNativeText } = require('./text-removal.cjs')
 const {
+  addGlyphlessFont, addOcrTextLayer, glyphlessFontKey, removeInvisibleText, validateOcrLayerOperation, writeInvisibleRun,
+} = require('./ocr-text-layer.cjs')
+const { registerSharedIo, bridgeArguments } = require('./simple-io/io-ipc.cjs')
+const { sweep } = require('./simple-io/io-core.cjs')
+const { safeWriteFile } = require('./simple-io/safe-write.cjs')
+const guard = require('./simple-io/document-guard.cjs')
+const stores = require('./simple-io/stores.cjs')
+const officeEngine = require('./simple-io/office-engine.cjs')
+
+const IO_MODULE = 'pdf'
+/** Every file type the PDF workspace opens; mirrors IMPORT_FORMATS in office-import.cjs (checked by tests/supported-extensions.test.cjs and simple/scripts/verify.cjs). */
+const SUPPORTED_EXTENSIONS = new Set([
+  '.pdf', '.docx', '.docm', '.dotx', '.dotm', '.doc', '.odt', '.rtf',
+  '.xlsx', '.xlsm', '.xltx', '.xltm', '.xlsb', '.xls', '.ods', '.csv', '.tsv',
+  '.md', '.markdown', '.mdown', '.mkd', '.html', '.htm', '.xhtml', '.txt', '.text', '.log',
+  '.png', '.jpg', '.jpeg', '.jpe', '.jfif', '.gif', '.webp', '.bmp', '.dib', '.tif', '.tiff', '.svg', '.avif', '.ico',
+  '.pptx', '.ppt', '.odp',
+])
+const {
   IMAGE_EXPORT_FORMATS,
   TEXT_EXPORT_FORMATS,
-  buildTextExport,
+  buildTextExportFiles,
   imageExportFileName,
   safeExportBaseName,
 } = require('./pdf-export.cjs')
 const { loadPdfViewerForPrint, nativePrintOptions, preparePrintPdf, printWebContentsSilently, resolvePrinter } = require('./pdf-print.cjs')
-const { imageToPdfBytes } = require('./image-to-pdf.cjs')
+const { jpegOrientation, orientationPlacement } = require('./image-to-pdf.cjs')
+const {
+  convertToPdf,
+  importDialogFilters,
+  isImportableName,
+  officeEngineAvailable,
+  pickedImageData,
+  sniffType,
+  unsupportedFormatError,
+} = require('./office-import.cjs')
 const { embedPdfFont } = require('./font-embedding.cjs')
+const { compactUnreachable, copyPagesRemapped, detachRemovedPages, pageLeaves } = require('./pdf-compact.cjs')
+const { detectSignatures, documentSignatureStatus, fileSignatureStatus } = require('./pdf-signatures.cjs')
+const { encryptedDocumentError, hasEncryptionDictionary, isEncryptedPdfError, readableCopy } = require('./pdf-unlock.cjs')
+const { codedError, problem, unsavedChangesError } = require('./pdf-problems.cjs')
+const { FontLibrary, loadFaceFile } = require('./font-fallback.cjs')
+const { applyFormValues, verifyFormValues } = require('./form-fill.cjs')
+const { createTextBackgroundCache } = require('./text-background-cache.cjs')
 
-const SUPPORTED_EXTENSIONS = new Set([
-  '.pdf', '.png', '.jpg', '.jpeg', '.txt', '.md', '.docx', '.doc',
-])
-const PDF_SIGNATURE_FIELD = Buffer.from('/Type /Sig')
+// Text that cannot fit its box is reduced down to this size before it is
+// allowed to run past the box (it is never dropped).
+const MIN_FITTED_TEXT_SIZE = 6
+// Share of a one-line text box above the baseline (pdf.js's default ascent).
+const NATIVE_RUN_ASCENT = 0.8
 
-const closeApprovedWindows = new WeakSet()
 let isQuitting = false
-let mammothModule
-let WordExtractorModule
 let fontkitModule
 let pdfLibModule
 let dragExportDirectory = null
 const imageExportSessions = new Map()
 
 // Conversion/editing dependencies are intentionally loaded only when a user
-// invokes those features. In particular, mammoth and fontkit are expensive to
-// initialise and are not needed at all for the common PDF viewing path.
-function getMammoth() {
-  mammothModule ||= require('mammoth')
-  return mammothModule
-}
-
-function getWordExtractor() {
-  WordExtractorModule ||= require('word-extractor')
-  return WordExtractorModule
-}
-
+// invokes those features. Fontkit is expensive to initialise and is not
+// needed at all for the common PDF viewing path; office-import.cjs loads its
+// converters (mammoth, SheetJS, markdown-it) the same way.
 function getFontkit() {
   fontkitModule ||= require('@pdf-lib/fontkit')
   return fontkitModule
@@ -85,14 +109,20 @@ async function getPdfFont(pdfDoc, requestedFamily = 'Segoe UI', cache = new Map(
   const family = String(requestedFamily || 'Segoe UI').toLowerCase()
   const bold = Number(style.fontWeight) >= 600 || /bold|black|semibold|demi/.test(family)
   const italic = style.fontStyle === 'italic' || /italic|oblique/.test(family)
+  const definition = windowsFontDefinition(family, bold, italic, StandardFonts)
   const embeddedKey = style.fontKey ? `embedded:${style.fontKey}:${style.fontData?.byteLength || 0}` : ''
   if (embeddedKey && style.fontData?.byteLength) {
     try {
       const fontBytes = toBytes(style.fontData)
       const decodedFont = getFontkit().create(fontBytes)
-      const missingRequiredGlyph = Array.from(String(style.text || ''))
-        .some((character) => !/\s/.test(character) && !decodedFont.hasGlyphForCodePoint(character.codePointAt(0)))
-      if (missingRequiredGlyph) throw new Error('Decoded PDF subset does not contain every replacement glyph.')
+      const missing = Array.from(String(style.text || ''))
+        .filter((character) => !/\s/.test(character) && !decodedFont.hasGlyphForCodePoint(character.codePointAt(0)))
+      // Keep the document's own face when the matched Windows family cannot
+      // draw the missing characters either (e.g. CJK or emoji typed into Latin
+      // text); they come from fallback fonts per character instead.
+      if (missing.length && await windowsFamilyCovers(definition, windowsDir, missing)) {
+        throw new Error('Decoded PDF subset does not contain every replacement glyph.')
+      }
       if (cache.has(embeddedKey)) return cache.get(embeddedKey)
       pdfDoc.registerFontkit(getFontkit())
       const embedded = await embedPdfFont(pdfDoc, fontBytes, style.text || '')
@@ -106,6 +136,35 @@ async function getPdfFont(pdfDoc, requestedFamily = 'Segoe UI', cache = new Map(
     }
   }
 
+  if (cache.has(definition.key)) return cache.get(definition.key)
+  const candidates = definition.files.map((fileName) => path.join(windowsDir, 'Fonts', fileName))
+
+  for (const candidate of candidates) {
+    try {
+      const fontBytes = await fs.readFile(candidate)
+      pdfDoc.registerFontkit(getFontkit())
+      const font = await embedPdfFont(pdfDoc, fontBytes, style.text || '')
+      cache.set(definition.key, font)
+      return font
+    } catch {
+      // Continue to the built-in fallback.
+    }
+  }
+
+  const font = await pdfDoc.embedFont(definition.fallback)
+  cache.set(definition.key, font)
+  return font
+}
+
+async function windowsFamilyCovers(definition, windowsDir, characters) {
+  for (const fileName of definition.files) {
+    const face = await loadFaceFile(path.join(windowsDir, 'Fonts', fileName))
+    if (face) return characters.some((character) => face.font.hasGlyphForCodePoint(character.codePointAt(0)))
+  }
+  return true
+}
+
+function windowsFontDefinition(family, bold, italic, StandardFonts) {
   const variant = (regular, boldFile, italicFile, boldItalicFile) => (
     bold && italic ? boldItalicFile : bold ? boldFile : italic ? italicFile : regular
   )
@@ -143,201 +202,87 @@ async function getPdfFont(pdfDoc, requestedFamily = 'Segoe UI', cache = new Map(
   }
 
   definition.key = `${definition.key}:${bold ? 'bold' : 'regular'}:${italic ? 'italic' : 'normal'}`
-
-  if (cache.has(definition.key)) return cache.get(definition.key)
-  const candidates = definition.files.map((fileName) => path.join(windowsDir, 'Fonts', fileName))
-
-  for (const candidate of candidates) {
-    try {
-      const fontBytes = await fs.readFile(candidate)
-      pdfDoc.registerFontkit(getFontkit())
-      const font = await embedPdfFont(pdfDoc, fontBytes, style.text || '')
-      cache.set(definition.key, font)
-      return font
-    } catch {
-      // Continue to the built-in fallback.
-    }
-  }
-
-  const font = await pdfDoc.embedFont(definition.fallback)
-  cache.set(definition.key, font)
-  return font
+  return definition
 }
 
-function splitLongToken(token, font, fontSize, maxWidth) {
-  const chunks = []
-  let chunk = ''
-  for (const character of token) {
-    if (font.widthOfTextAtSize(chunk + character, fontSize) > maxWidth && chunk) {
-      chunks.push(chunk)
-      chunk = character
-    } else {
-      chunk += character
-    }
-  }
-  if (chunk) chunks.push(chunk)
-  return chunks
+/**
+ * Any file Simple can open as PDF bytes (see office-import.cjs): PDFs pass
+ * through, everything else is converted without an office suite.
+ * @returns {Promise<{data: Buffer|Uint8Array, warnings: string[], kind: string, converted: boolean}>}
+ */
+function importAsPdf(bytes, name, sourcePath = null) {
+  return convertToPdf(bytes, sourcePath ? { name, sourcePath } : { name })
 }
 
-function wrapParagraph(paragraph, font, fontSize, maxWidth) {
-  if (!paragraph) return ['']
-  const sourceWords = paragraph.trim().split(/\s+/)
-  const words = sourceWords.flatMap((word) => (
-    font.widthOfTextAtSize(word, fontSize) > maxWidth
-      ? splitLongToken(word, font, fontSize, maxWidth)
-      : [word]
-  ))
-  const lines = []
-  let line = ''
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word
-    if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
-      line = candidate
-    } else {
-      if (line) lines.push(line)
-      line = word
-    }
-  }
-  if (line) lines.push(line)
-  return lines.length ? lines : ['']
-}
-
-async function textToPdfBytes(text, title = 'Converted document') {
-  const { PDFDocument, rgb } = getPdfLib()
-  const pdfDoc = await PDFDocument.create()
-  const font = await getPdfFont(pdfDoc)
-  const pageWidth = 595.28
-  const pageHeight = 841.89
-  const margin = 54
-  const fontSize = 11
-  const lineHeight = 16
-  const maxWidth = pageWidth - margin * 2
-  const paragraphs = String(text || '').replace(/\r\n?/g, '\n').split('\n')
-  const lines = paragraphs.flatMap((paragraph) => wrapParagraph(paragraph, font, fontSize, maxWidth))
-  let page = pdfDoc.addPage([pageWidth, pageHeight])
-  let y = pageHeight - margin
-
-  for (const line of lines) {
-    if (y < margin + lineHeight) {
-      page = pdfDoc.addPage([pageWidth, pageHeight])
-      y = pageHeight - margin
-    }
-    try {
-      page.drawText(line, { x: margin, y, font, size: fontSize, color: rgb(0.07, 0.07, 0.08) })
-    } catch {
-      const compatibleLine = line.replace(/[^\x20-\x7E]/g, '?')
-      page.drawText(compatibleLine, { x: margin, y, font, size: fontSize, color: rgb(0.07, 0.07, 0.08) })
-    }
-    y -= lineHeight
-  }
-
-  pdfDoc.setTitle(title)
-  pdfDoc.setCreator('simple')
-  pdfDoc.setProducer('simple')
-  return pdfDoc.save()
-}
-
-function escapeHtml(value) {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-async function htmlToPdfBytes(bodyHtml, title = 'Converted document') {
-  const conversionDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-convert-'))
-  const htmlPath = path.join(conversionDirectory, 'document.html')
-  const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>
-@page { size: A4; margin: 18mm 17mm 19mm; }
-html { color: #111113; background: #fff; font-family: "Segoe UI", Arial, sans-serif; }
-body { margin: 0; font-size: 10.5pt; line-height: 1.48; overflow-wrap: anywhere; }
-h1 { font-size: 22pt; line-height: 1.18; margin: 0 0 12pt; }
-h2 { font-size: 17pt; line-height: 1.22; margin: 17pt 0 8pt; }
-h3 { font-size: 13.5pt; line-height: 1.25; margin: 14pt 0 6pt; }
-p { margin: 0 0 8pt; }
-ul, ol { margin: 0 0 9pt; padding-left: 22pt; }
-li { margin: 0 0 3pt; }
-table { width: 100%; margin: 8pt 0 12pt; border-collapse: collapse; break-inside: avoid; }
-th, td { padding: 5pt 6pt; border: 0.6pt solid #c9c9ce; vertical-align: top; }
-th { background: #f4f4f5; font-weight: 650; }
-img { max-width: 100%; height: auto; break-inside: avoid; }
-blockquote { margin: 9pt 0; padding: 2pt 0 2pt 12pt; border-left: 2pt solid #d4d4d8; color: #52525b; }
-a { color: #18181b; text-decoration: underline; }
-pre { padding: 8pt; border: 0.6pt solid #e4e4e7; background: #fafafa; white-space: pre-wrap; }
-</style></head><body>${bodyHtml}</body></html>`
-  let conversionWindow = null
+/** True for a path Simple opens: a known extension, or a PDF without one. */
+async function openablePath(filePath) {
+  if (isImportableName(filePath)) return true
+  let handle
   try {
-    await fs.writeFile(htmlPath, html, 'utf8')
-    conversionWindow = new BrowserWindow({
-      show: false,
-      width: 900,
-      height: 1100,
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        javascript: false,
-        devTools: false,
-      },
-    })
-    await conversionWindow.loadFile(htmlPath)
-    await new Promise((resolve) => setTimeout(resolve, 180))
-    return new Uint8Array(await conversionWindow.webContents.printToPDF({
-      printBackground: true,
-      pageSize: 'A4',
-      preferCSSPageSize: true,
-      margins: { top: 0, bottom: 0, left: 0, right: 0 },
-    }))
+    handle = await fs.open(filePath, 'r')
+    const { buffer, bytesRead } = await handle.read(Buffer.alloc(1024), 0, 1024, 0)
+    return sniffType(buffer.subarray(0, bytesRead)) === 'pdf'
+  } catch {
+    return false
   } finally {
-    if (conversionWindow && !conversionWindow.isDestroyed()) conversionWindow.destroy()
-    await fs.rm(conversionDirectory, { recursive: true, force: true }).catch(() => {})
+    await handle?.close().catch(() => {})
   }
-}
-
-async function convertInputToPdf(buffer, extension, name) {
-  const ext = extension.toLowerCase()
-  if (ext === '.pdf') return buffer
-  if (['.png', '.jpg', '.jpeg'].includes(ext)) {
-    return imageToPdfBytes(buffer, ext, safeBaseName(name))
-  }
-  if (['.txt', '.md'].includes(ext)) {
-    return textToPdfBytes(buffer.toString('utf8'), safeBaseName(name))
-  }
-  if (ext === '.docx' || ext === '.doc') {
-    const { convertOfficeBytes } = require('./office-converter.cjs')
-    return convertOfficeBytes({ bytes: buffer, inputExtension: ext.slice(1), outputExtension: 'pdf', filter: 'writer_pdf_Export' })
-  }
-  throw new Error(`Unsupported file type: ${ext || 'unknown'}`)
 }
 
 async function filePayload(filePath) {
-  const ext = path.extname(filePath).toLowerCase()
-  if (!SUPPORTED_EXTENSIONS.has(ext)) throw new Error('This file type is not supported.')
+  if (!(await openablePath(filePath))) throw unsupportedFormatError(filePath)
   const original = await fs.readFile(filePath)
-  const converted = ext !== '.pdf'
-  // Keep the fs Buffer for PDFs. Constructing a Uint8Array from it used to
-  // duplicate the complete file before Electron performed its unavoidable IPC
-  // serialization copy.
-  const pdfBytes = converted ? await convertInputToPdf(original, ext, filePath) : original
-  const signatureDetected = ext === '.pdf' && original.includes(PDF_SIGNATURE_FIELD)
+  // A PDF keeps the fs Buffer: constructing a Uint8Array from it used to
+  // duplicate the complete file before Electron's unavoidable IPC copy.
+  const result = await importAsPdf(original, path.basename(filePath), filePath)
   return {
-    data: serializableBytes(pdfBytes),
-    name: converted ? `${safeBaseName(filePath)}.pdf` : path.basename(filePath),
-    path: converted ? null : filePath,
+    data: serializableBytes(result.data),
+    name: result.converted ? `${safeBaseName(filePath)}.pdf` : path.basename(filePath),
+    path: result.converted ? null : filePath,
     sourcePath: filePath,
-    converted,
-    signatureDetected,
+    converted: result.converted,
+    ...(result.warnings.length ? { warnings: result.warnings } : {}),
+    ...documentProtection(result.converted ? '' : '.pdf', original),
   }
 }
 
-async function loadPdf(data) {
+/**
+ * `signatureDetected` makes the renderer save a copy instead of overwriting a
+ * signed original. `encrypted` is decided from the whole file: linearized
+ * files keep /Encrypt near the start, which a scan of the tail misses.
+ */
+function documentProtection(ext, bytes) {
+  if (ext !== '.pdf') return { signatureDetected: false, encrypted: false }
+  return {
+    signatureDetected: detectSignatures(bytes).signed,
+    encrypted: hasEncryptionDictionary(bytes),
+  }
+}
+
+async function loadPdf(data, name = '') {
   const { PDFDocument } = getPdfLib()
-  return PDFDocument.load(toBytes(data), {
-    updateMetadata: false,
-    throwOnInvalidObject: false,
-  })
+  const bytes = toBytes(data)
+  try {
+    return await PDFDocument.load(bytes, {
+      updateMetadata: false,
+      throwOnInvalidObject: false,
+    })
+  } catch (error) {
+    // pdf-lib's "Input document to `PDFDocument.load` is encrypted…" becomes
+    // PASSWORD_REQUIRED or OWNER_LOCKED with a message a user can act on.
+    if (isEncryptedPdfError(error)) throw await encryptedDocumentError(bytes, name)
+    throw error
+  }
+}
+
+/** Pages copied from another file: owner-locked sources are decrypted to a copy. */
+async function loadSourcePdf(bytes, name) {
+  return loadPdf(await readableCopy(bytes, name), name)
+}
+
+function pageAt(pdfDoc, index) {
+  const pages = pdfDoc.getPages()
+  return Number.isInteger(index) && index >= 0 && index < pages.length ? pages[index] : undefined
 }
 
 async function reorderDocument(pdfDoc, order) {
@@ -375,7 +320,14 @@ async function applyMutation(data, operation) {
         .sort((a, b) => b - a)
       if (!indices.length) return pdfDoc.save()
       if (indices.length >= pdfDoc.getPageCount()) throw new Error('A PDF must keep at least one page.')
+      const leaves = pageLeaves(pdfDoc)
+      const removedRefs = indices.map((index) => leaves[index]?.ref).filter(Boolean)
       indices.forEach((index) => pdfDoc.removePage(index))
+      // pdf-lib's removePage() leaves its page list cache stale.
+      pdfDoc.pageCache?.invalidate?.()
+      // Otherwise the page, its text and images stay recoverable in the saved
+      // file, and bookmarks, links and fields keep pointing at it.
+      detachRemovedPages(pdfDoc, removedRefs)
       break
     }
     case 'rotate': {
@@ -420,6 +372,28 @@ async function applyMutation(data, operation) {
       pdfDoc.insertPage(Math.max(0, Math.min(operation.index, pdfDoc.getPageCount())), [width, height])
       break
     }
+    case 'ocr-text-layer': {
+      // Recognised text arrives from the renderer and is validated here. With
+      // replaceExisting, invisible text recognised earlier (by Simple or by
+      // another tool) is removed first; pages listed without words only lose it.
+      const op = validateOcrLayerOperation(operation, pdfDoc.getPageCount())
+      let replaced = false
+      if (op.replaceExisting) {
+        const bytes = toBytes(data)
+        const cleaned = await removeInvisibleText(bytes, op.pages.map((page) => page.pageIndex))
+        if (cleaned !== bytes) {
+          pdfDoc = await loadPdf(cleaned)
+          replaced = true
+        }
+      }
+      const pages = op.pages.filter((page) => page.lines.length)
+      const fontRef = pages.length ? addGlyphlessFont(pdfDoc) : null
+      for (const page of pages) addOcrTextLayer(pdfDoc, page.pageIndex, page.lines, { fontRef, meta: op.meta })
+      // The earlier layers' content streams and fonts are no longer referenced;
+      // drop them so the replaced text does not linger in the file.
+      if (replaced) compactUnreachable(pdfDoc)
+      break
+    }
     default:
       throw new Error(`Unknown PDF operation: ${operation.type}`)
   }
@@ -442,52 +416,71 @@ function applyDocumentEdits(pdfDoc, documentEdits = {}) {
   }
 }
 
-async function insertDocuments(baseData, insertIndex, paths) {
-  const { PDFDocument } = getPdfLib()
+function withoutNamePrefix(error, name) {
+  const message = String(error?.message || error || 'This file could not be added.')
+  const prefix = `${path.basename(String(name))}: `
+  return message.startsWith(prefix) ? message.slice(prefix.length) : message
+}
+
+/**
+ * Inserts the pages of every source at `insertIndex`. Each source converts
+ * on its own: one that cannot be read is skipped and reported in `skipped`
+ * (never silently, and never aborting the others).
+ * @param {{name: string, sourcePath?: string, read: () => Promise<Buffer>}[]} sources
+ * @returns {Promise<{data: Uint8Array, added: number, skipped: {name: string, code: string|null, reason: string}[], warnings: string[]}>}
+ */
+async function insertSources(baseData, insertIndex, sources) {
   const baseDoc = await loadPdf(baseData)
   const originalCount = baseDoc.getPageCount()
-  let targetIndex = Math.max(0, Math.min(Number(insertIndex) || 0, baseDoc.getPageCount()))
-  for (const filePath of paths) {
-    const ext = path.extname(filePath).toLowerCase()
-    const sourceBuffer = await fs.readFile(filePath)
-    const sourceBytes = await convertInputToPdf(sourceBuffer, ext, filePath)
-    const sourceDoc = await PDFDocument.load(sourceBytes)
-    if (sourceDoc.getForm().getFields().length) {
-      throw new Error(`“${path.basename(filePath)}” contains interactive form fields. Flatten or print it to a static PDF before adding its pages.`)
+  const start = Math.max(0, Math.min(Number(insertIndex) || 0, originalCount))
+  let targetIndex = start
+  const skipped = []
+  const warnings = []
+  let firstError = null
+  for (const source of sources) {
+    try {
+      const converted = await importAsPdf(await source.read(), source.name, source.sourcePath)
+      const sourceDoc = await loadSourcePdf(converted.data, source.name)
+      if (sourceDoc.getForm().getFields().length) {
+        throw new Error(`“${source.name}” contains interactive form fields. Flatten or print it to a static PDF before adding its pages.`)
+      }
+      // Links between the inserted pages point at their inserted copies, not
+      // at hidden duplicates of the source pages.
+      const { pages } = copyPagesRemapped(baseDoc, sourceDoc, sourceDoc.getPageIndices())
+      for (const page of pages) baseDoc.insertPage(targetIndex++, page)
+      for (const warning of converted.warnings) warnings.push(`${source.name}: ${warning}`)
+    } catch (error) {
+      firstError ||= error
+      skipped.push({ name: source.name, code: typeof error?.code === 'string' ? error.code : null, reason: withoutNamePrefix(error, source.name) })
     }
-    const pages = await baseDoc.copyPages(sourceDoc, sourceDoc.getPageIndices())
-    for (const page of pages) baseDoc.insertPage(targetIndex++, page)
+  }
+  if (targetIndex === start) {
+    if (!skipped.length) throw new Error('Drop a supported PDF or document file between the pages.')
+    // One file: its own error, unchanged. Several: one message naming each.
+    if (skipped.length === 1) throw firstError
+    throw codedError('NOTHING_ADDED', `No pages were added. ${skipped.map((item) => `${item.name}: ${item.reason}`).join(' ')}`, { skipped })
   }
   return {
     data: await baseDoc.save({ useObjectStreams: true }),
     added: baseDoc.getPageCount() - originalCount,
+    skipped,
+    warnings,
   }
 }
 
-async function insertDocumentPayloads(baseData, insertIndex, inputs) {
-  const { PDFDocument } = getPdfLib()
-  const baseDoc = await loadPdf(baseData)
-  const originalCount = baseDoc.getPageCount()
-  let targetIndex = Math.max(0, Math.min(Number(insertIndex) || 0, originalCount))
-  for (const input of Array.isArray(inputs) ? inputs : []) {
-    const name = String(input?.name || 'document.pdf')
-    const ext = path.extname(name).toLowerCase()
-    if (!SUPPORTED_EXTENSIONS.has(ext)) continue
-    const sourceBytes = await convertInputToPdf(toBytes(input.data), ext, name)
-    const sourceDoc = await PDFDocument.load(sourceBytes, { updateMetadata: false, throwOnInvalidObject: false })
-    if (sourceDoc.getForm().getFields().length) {
-      throw new Error(`“${name}” contains interactive form fields. Flatten or print it to a static PDF before adding its pages.`)
-    }
-    const pages = await baseDoc.copyPages(sourceDoc, sourceDoc.getPageIndices())
-    for (const page of pages) baseDoc.insertPage(targetIndex++, page)
-  }
-  if (targetIndex === Math.max(0, Math.min(Number(insertIndex) || 0, originalCount))) {
-    throw new Error('Drop a supported PDF or document file between the pages.')
-  }
-  return {
-    data: await baseDoc.save({ useObjectStreams: true }),
-    added: baseDoc.getPageCount() - originalCount,
-  }
+function insertDocuments(baseData, insertIndex, paths) {
+  return insertSources(baseData, insertIndex, paths.map((filePath) => ({
+    name: path.basename(filePath),
+    sourcePath: filePath,
+    read: () => fs.readFile(filePath),
+  })))
+}
+
+function insertDocumentPayloads(baseData, insertIndex, inputs) {
+  return insertSources(baseData, insertIndex, (Array.isArray(inputs) ? inputs : []).map((input) => ({
+    name: String(input?.name || 'document.pdf'),
+    read: async () => toBytes(input?.data ?? []),
+  })))
 }
 
 async function exportedPages(data, indices, suggestedName) {
@@ -498,8 +491,12 @@ async function exportedPages(data, indices, suggestedName) {
     .filter((index) => Number.isInteger(index) && index >= 0 && index < sourceDoc.getPageCount())
     .sort((a, b) => a - b)
   if (!validIndices.length) throw new Error('Select at least one page to export.')
-  const pages = await resultDoc.copyPages(sourceDoc, validIndices)
+  // pdf-lib's copyPages() also copied every page that a link, bookmark-like
+  // destination or annotation of a selected page referred to, as hidden
+  // content. Copy only the selected pages and cut references to the others.
+  const { pages, excludedRefs } = copyPagesRemapped(resultDoc, sourceDoc, validIndices)
   pages.forEach((page) => resultDoc.addPage(page))
+  detachRemovedPages(resultDoc, excludedRefs)
   resultDoc.setTitle(safeBaseName(suggestedName || 'Exported pages'))
   resultDoc.setProducer('simple')
   return resultDoc.save({ useObjectStreams: true })
@@ -558,27 +555,41 @@ function hasReliableWindowsFontMatch(requestedFamily) {
   return /times new roman|calibri|cambria|arial|helvetica|courier new|georgia|garamond|palatino|verdana|tahoma|trebuchet|segoe ui/.test(family)
 }
 
+const pageFontKeys = new WeakMap()
+
+/** One /Font resource entry per font and page, however many lines use it. */
+function pageFontKey(page, font) {
+  let keys = pageFontKeys.get(page.node)
+  if (!keys) pageFontKeys.set(page.node, keys = new Map())
+  if (!keys.has(font.ref.tag)) keys.set(font.ref.tag, page.node.newFontDictionary(font.name, font.ref))
+  return keys.get(font.ref.tag)
+}
+
+/**
+ * Draw one line. `font` is a pdf-lib font or a FontRuns: consecutive runs
+ * share one text object, so the text position advances exactly as it would
+ * for a single string.
+ */
 function drawStyledTextLine(page, font, text, options) {
   const {
     beginText, endText, popGraphicsState, pushGraphicsState,
     rotateAndSkewTextRadiansAndTranslate, setCharacterSpacing,
     setCharacterSqueeze, setFillingRgbColor, setFontAndSize, showText,
   } = getPdfLib()
-  const fontKey = page.node.newFontDictionary(font.name, font.ref)
+  const runs = (typeof font.runs === 'function' ? font.runs(text) : [{ font, text }]).filter((run) => run.text)
+  if (!runs.length) return
   const operators = [
     pushGraphicsState(),
     beginText(),
     setFillingRgbColor(options.color[0], options.color[1], options.color[2]),
-    setFontAndSize(fontKey, options.size),
   ]
   if (Math.abs(options.scaleX - 1) > 0.001) operators.push(setCharacterSqueeze(options.scaleX * 100))
   if (Math.abs(options.letterSpacing) > 0.001) operators.push(setCharacterSpacing(options.letterSpacing))
-  operators.push(
-    rotateAndSkewTextRadiansAndTranslate(options.angle, 0, 0, options.x, options.y),
-    showText(font.encodeText(text)),
-    endText(),
-    popGraphicsState(),
-  )
+  operators.push(rotateAndSkewTextRadiansAndTranslate(options.angle, 0, 0, options.x, options.y))
+  for (const run of runs) {
+    operators.push(setFontAndSize(pageFontKey(page, run.font), options.size), showText(run.font.encodeText(run.text)))
+  }
+  operators.push(endText(), popGraphicsState())
   page.pushOperators(...operators)
 }
 
@@ -600,55 +611,288 @@ function drawStyledSeparatedLine(page, font, text, options, spaceAdvance) {
 function dataUrlBytes(dataUrl) {
   const match = /^data:(image\/(?:png|jpe?g));base64,([A-Za-z0-9+/=\r\n]+)$/i.exec(String(dataUrl || ''))
   if (!match) throw new Error('The edited image data is not valid.')
-  return { mime: match[1].toLowerCase(), bytes: Buffer.from(match[2], 'base64') }
+  // An exact copy at offset 0: small decoded Buffers share Node's pool, and
+  // pdf-lib's JPEG reader ignores byteOffset ('SOI not found in JPEG').
+  return { mime: match[1].toLowerCase(), bytes: new Uint8Array(Buffer.from(match[2], 'base64')) }
 }
 
-async function flattenOverlays(data, overlays = [], formValues = {}, documentEdits = {}) {
+function shortText(value, limit = 40) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text
+}
+
+function overlayDescription(overlay) {
+  if (overlay.type === 'text') return overlay.originalText ? 'Edited text' : 'Added text'
+  if (overlay.type === 'object') return overlay.kind === 'image' ? 'An image' : 'An object'
+  if (overlay.type === 'ink') return 'A drawing'
+  return 'A mark-up'
+}
+
+/** Operators pushed by a failed overlay are taken back out. */
+function operatorMark(page) {
+  const stream = page.contentStream
+  return { stream, length: stream?.operators?.length ?? 0 }
+}
+
+function rollbackOperators(page, mark) {
+  const stream = page.contentStream
+  if (!stream?.operators) return
+  stream.operators.length = stream === mark.stream ? Math.min(mark.length, stream.operators.length) : 0
+}
+
+/**
+ * Place a point given in a text box's reading frame: `u` along the baseline
+ * from the box's start edge, `v` down from its top edge. The frame is centred
+ * on the PDF rect and turned by `angle`, as the editor rotates the box about
+ * its centre; for 0/90/180/270 this equals the box corners used before.
+ */
+function textFramePoint(rect, boxWidth, boxHeight, angle, u, v) {
+  const cosine = Math.cos(angle)
+  const sine = Math.sin(angle)
+  const along = u - boxWidth / 2
+  const down = v - boxHeight / 2
+  return {
+    x: rect.x + rect.width / 2 + along * cosine + down * sine,
+    y: rect.y + rect.height / 2 + along * sine - down * cosine,
+  }
+}
+
+/**
+ * The scan part of a text overlay (an edit of scanned, OCR'd text; see
+ * src/lib/ocr/scanEdit.ts), checked: which recognised text it replaces
+ * (`removal`), what it draws (the changed words, or the whole line) and the
+ * retouch patch that hides the old printed words. Returns null for ordinary
+ * text, { invalid: true } for a scan edit that cannot be written safely.
+ */
+function scanEditPlan(overlay) {
+  const scan = overlay?.scan
+  if (!scan || typeof scan !== 'object') return null
+  const point = (value) => (value && Number.isFinite(Number(value.x)) && Number.isFinite(Number(value.y)) ? { x: Number(value.x), y: Number(value.y) } : null)
+  const runOf = (value) => {
+    if (!value || typeof value !== 'object') return null
+    const origin = point(value.origin)
+    const dir = point(value.dir)
+    const length = Number(value.length)
+    const fontSize = Number(value.fontSize)
+    if (!origin || !dir || !Number.isFinite(length) || length < 0 || length > 1e5 || !(fontSize > 0 && fontSize <= 500)) return null
+    const norm = Math.hypot(dir.x, dir.y)
+    if (!(Math.abs(norm - 1) < 0.05)) return null
+    return { origin, dir: { x: dir.x / norm, y: dir.y / norm }, length, fontSize }
+  }
+  const patchOf = (value) => (value && typeof value.dataUrl === 'string' && /^data:image\/png;base64,/i.test(value.dataUrl) && validRect(value.rect)
+    ? { dataUrl: value.dataUrl, rect: validRect(value.rect) }
+    : null)
+  const replace = scan.replace && typeof scan.replace === 'object' ? scan.replace : null
+  const removal = runOf(replace ? replace.run : scan.run)
+  const source = replace || overlay
+  const drawing = {
+    text: String(source.text ?? ''),
+    rect: validRect(source.rect),
+    baselineOffset: Number(source.baselineOffset),
+    originalText: String(source.originalText ?? ''),
+    originalRect: validRect(source.originalRect),
+    patch: patchOf(replace ? replace.patch : scan.patch),
+  }
+  if (!removal || !drawing.rect) return { invalid: true }
+  return {
+    mode: scan.mode === 'recognized-text' ? 'recognized-text' : 'appearance',
+    removal,
+    drawing,
+    paper: parseColor(scan.paper, [1, 1, 1]),
+    // Prepared without a patch: there was no printed ink to hide. Otherwise
+    // (preparation failed or never finished) the paper colour covers the words.
+    cover: scan.status === 'ready' ? null : drawing.originalRect || validRect(overlay.inkRect) || validRect(overlay.originalRect),
+  }
+}
+
+/**
+ * Boxes along a run of recognised text for removeNativeText(), which removes
+ * the glyphs whose centres fall in a box. Short pieces of the run's band keep
+ * a slanted line's box from reaching into the lines above and below it.
+ */
+function scanRemovalTargets(overlay, run) {
+  const up = { x: -run.dir.y, y: run.dir.x }
+  const pieces = Math.max(1, Math.ceil(run.length / Math.max(0.5, run.fontSize * 0.8)))
+  const angle = Math.atan2(run.dir.y, run.dir.x)
+  const targets = []
+  for (let index = 0; index < pieces; index += 1) {
+    const u0 = (run.length * index) / pieces
+    const u1 = (run.length * (index + 1)) / pieces
+    const corners = [[u0, -0.25], [u1, -0.25], [u0, 0.85], [u1, 0.85]].map(([u, v]) => ({
+      x: run.origin.x + run.dir.x * u + up.x * v * run.fontSize,
+      y: run.origin.y + run.dir.y * u + up.y * v * run.fontSize,
+    }))
+    const xs = corners.map((corner) => corner.x)
+    const ys = corners.map((corner) => corner.y)
+    const x = Math.min(...xs)
+    const y = Math.min(...ys)
+    // No original text: a piece over a gap between words may find nothing.
+    targets.push({ type: 'text', cover: true, pageIndex: overlay.pageIndex, originalText: '', angle: Math.abs(angle) < 0.01 ? 0 : angle, originalRect: { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y } })
+  }
+  return targets
+}
+
+/**
+ * Flatten edits into the PDF and report what could not be written as asked.
+ * @returns {Promise<{ data: Uint8Array, warnings: object[], failures: object[], signatureDetected: boolean }>}
+ */
+async function flattenOverlaysDetailed(data, overlays = [], formValues = {}, documentEdits = {}) {
   const { layoutText, resolveTextFit } = await import('./text-layout.mjs')
-  const { BlendMode, LineCapStyle, rgb } = getPdfLib()
-  const pdfDoc = await loadPdf(await removeNativeText(toBytes(data), overlays))
+  const {
+    BlendMode, LineCapStyle, concatTransformationMatrix, popGraphicsState, pushGraphicsState, rgb,
+  } = getPdfLib()
+  const warnings = []
+  const failures = []
+  const list = (Array.isArray(overlays) ? overlays : []).filter((overlay) => overlay && typeof overlay === 'object')
+  const skipped = new Set()
+
+  // Edits of scanned text: their old printed words are hidden by a retouch
+  // patch and only their recognised (invisible) text is removed from the
+  // content, run by run. A malformed one is left out, never drawn over the
+  // words it was meant to replace.
+  const scanPlans = new Map()
+  for (const overlay of list) {
+    if (overlay.type !== 'text') continue
+    const plan = scanEditPlan(overlay)
+    if (!plan) continue
+    if (plan.invalid) {
+      skipped.add(overlay)
+      failures.push(problem('OVERLAY_NOT_SAVED',
+        `Edited scanned text on page ${Number(overlay.pageIndex) + 1} could not be saved: its position on the page is missing. Edit the line again.`,
+        { overlayId: overlay.id, pageIndex: overlay.pageIndex }))
+      continue
+    }
+    scanPlans.set(overlay, plan)
+  }
+  const removals = [
+    ...list.filter((overlay) => !scanPlans.has(overlay) && !skipped.has(overlay)),
+    ...[...scanPlans].flatMap(([overlay, plan]) => scanRemovalTargets(overlay, plan.removal)),
+  ]
+
+  // An edit whose original glyphs cannot be found is reported and left out;
+  // drawing its replacement over the old text would garble both.
+  const removed = await removeNativeText(toBytes(data), removals, {
+    onUnlocated: (edit) => {
+      skipped.add(edit)
+      failures.push(problem('TEXT_SOURCE_NOT_FOUND',
+        `The original text “${shortText(edit.originalText)}” on page ${Number(edit.pageIndex) + 1} could not be located, so this edit was not saved. Reopen the text selection and edit it again.`,
+        { overlayId: edit.id, pageIndex: edit.pageIndex }))
+    },
+  })
+  const pdfDoc = await loadPdf(removed)
+  const signatureDetected = documentSignatureStatus(pdfDoc).signed
   applyDocumentEdits(pdfDoc, documentEdits)
   const fontCache = new Map()
+  const fonts = new FontLibrary(pdfDoc)
 
-  try {
-    const form = pdfDoc.getForm()
-    for (const [name, value] of Object.entries(formValues || {})) {
-      try {
-        const field = form.getField(name)
-        if (typeof field.setText === 'function') field.setText(String(value))
-        else if (typeof field.check === 'function' && typeof field.uncheck === 'function') {
-          if (value) field.check()
-          else field.uncheck()
-        } else if (typeof field.select === 'function') field.select(String(value))
-      } catch {
-        // A malformed or duplicated field should not prevent the rest of the save.
-      }
-    }
-    if (Object.keys(formValues || {}).length) {
-      const formFont = await getPdfFont(pdfDoc, 'Segoe UI', fontCache, { text: Object.values(formValues).join(' ') })
-      form.updateFieldAppearances(formFont)
-    }
-  } catch {
-    // Documents without a valid AcroForm simply skip this step.
-  }
+  // Form values: only fields whose value really changes are touched.
+  const formReport = await applyFormValues(pdfDoc, formValues, { fonts })
+  warnings.push(...formReport.warnings)
+  failures.push(...formReport.failures)
 
   // Native image edits target the image invocation itself. Remove that `Do`
   // operator before drawing its replacement so moving/deleting an image does
   // not leave the old pixels beneath a white patch. Unsupported inline/nested
   // images retain the existing visual-cover fallback below.
   const removedObjectOverlayIds = new Set()
-  for (const overlay of overlays) {
-    if (overlay?.type !== 'object' || overlay.kind !== 'image' || overlay.cover === false) continue
+  for (const overlay of list) {
+    if (overlay.type !== 'object' || overlay.kind !== 'image' || overlay.cover === false) continue
     const sourceRect = validRect(overlay.originalRect)
-    const page = pdfDoc.getPage(overlay.pageIndex)
+    const page = pageAt(pdfDoc, overlay.pageIndex)
     if (!sourceRect || !page) continue
-    if (removePageImageDraws(page, [sourceRect]) > 0) removedObjectOverlayIds.add(overlay.id)
+    try {
+      if (removePageImageDraws(page, [sourceRect]) > 0) removedObjectOverlayIds.add(overlay.id)
+    } catch {
+      // The white cover below still hides the original image.
+    }
   }
 
-  for (const overlay of overlays) {
-    const page = pdfDoc.getPage(overlay.pageIndex)
+  // Retouch patches go first, under every edit, so a patch can never cover
+  // the new text of another edit. Each is an RGBA image whose alpha covers
+  // only the old glyphs: the scan image itself is not changed. Without a
+  // patch (it could not be made) the paper colour hides the old words.
+  const patchRanges = new Map()
+  for (const [overlay, plan] of scanPlans) {
+    if (plan.mode !== 'appearance' || skipped.has(overlay)) continue
+    const page = pageAt(pdfDoc, overlay.pageIndex)
     if (!page) continue
+    const mark = operatorMark(page)
+    try {
+      if (plan.drawing.patch) {
+        const source = dataUrlBytes(plan.drawing.patch.dataUrl)
+        const image = await pdfDoc.embedPng(source.bytes)
+        page.drawImage(image, { ...plan.drawing.patch.rect })
+      } else if (plan.cover) {
+        const [r, g, b] = plan.paper
+        page.drawRectangle({ x: plan.cover.x - 0.5, y: plan.cover.y - 0.5, width: plan.cover.width + 1, height: plan.cover.height + 1, color: rgb(r, g, b), borderWidth: 0 })
+      }
+      const stream = page.contentStream
+      patchRanges.set(overlay, { stream, start: stream === mark.stream ? mark.length : 0, end: stream?.operators?.length ?? 0 })
+    } catch (error) {
+      rollbackOperators(page, mark)
+      skipped.add(overlay)
+      failures.push(problem('OVERLAY_NOT_SAVED',
+        `Edited scanned text on page ${overlay.pageIndex + 1} could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+        { overlayId: overlay.id, pageIndex: overlay.pageIndex }))
+    }
+  }
+  const failedPatches = []
 
+  let glyphlessFont = null
+  for (const overlay of list) {
+    if (skipped.has(overlay)) continue
+    const page = pageAt(pdfDoc, overlay.pageIndex)
+    if (!page) {
+      failures.push(problem('OVERLAY_PAGE_MISSING',
+        `${overlayDescription(overlay)} belongs to page ${Number(overlay.pageIndex) + 1}, which is no longer in the document, so it was not saved.`,
+        { overlayId: overlay.id, pageIndex: overlay.pageIndex }))
+      continue
+    }
+    const mark = operatorMark(page)
+    const plan = scanPlans.get(overlay)
+    try {
+      if (plan?.mode === 'recognized-text') {
+        // Only the recognised text changes: written invisibly over the
+        // scanned words it describes; the page looks exactly as before.
+        const text = plan.drawing.text.replace(/\s+/g, ' ').trim()
+        if (text) {
+          glyphlessFont ||= addGlyphlessFont(pdfDoc)
+          const run = plan.removal
+          writeInvisibleRun(page, glyphlessFontKey(page, glyphlessFont), {
+            text, origin: run.origin, dir: run.dir, width: Math.max(run.length, run.fontSize * 0.5), fontSize: run.fontSize,
+            meta: { engine: 'Simple (corrected)', language: 'eng' },
+          })
+        }
+      } else if (plan) {
+        await drawOverlay(page, {
+          ...overlay,
+          text: plan.drawing.text,
+          rect: plan.drawing.rect,
+          baselineOffset: Number.isFinite(plan.drawing.baselineOffset) ? plan.drawing.baselineOffset : undefined,
+          originalText: plan.drawing.originalText,
+          originalRect: plan.drawing.originalRect || validRect(overlay.originalRect),
+          // The matched Windows font, scaled as the editor showed it.
+          preserveSourceMetrics: false,
+          fontKey: undefined,
+          fontData: undefined,
+        })
+      } else {
+        await drawOverlay(page, overlay)
+      }
+    } catch (error) {
+      rollbackOperators(page, mark)
+      // Never leave the old words retouched away without their replacement.
+      if (patchRanges.has(overlay)) failedPatches.push(patchRanges.get(overlay))
+      failures.push(problem('OVERLAY_NOT_SAVED',
+        `${overlayDescription(overlay)} on page ${overlay.pageIndex + 1} could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+        { overlayId: overlay.id, pageIndex: overlay.pageIndex }))
+    }
+  }
+  for (const range of failedPatches.sort((a, b) => b.start - a.start)) {
+    if (range.stream?.operators) range.stream.operators.splice(range.start, Math.max(0, range.end - range.start))
+  }
+
+  async function drawOverlay(page, overlay) {
     if (overlay.type === 'ink') {
       const points = Array.isArray(overlay.points)
         ? overlay.points.filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y))
@@ -664,12 +908,12 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
           lineCap: LineCapStyle.Round,
         })
       }
-      continue
+      return
     }
 
     const rect = overlay.rect || {}
     const values = [rect.x, rect.y, rect.width, rect.height]
-    if (!values.every(Number.isFinite)) continue
+    if (!values.every(Number.isFinite)) return
 
     if (overlay.type === 'highlight') {
       const [r, g, b] = parseColor(overlay.color)
@@ -731,20 +975,33 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
     }
 
     if (overlay.type === 'text') {
-      let font = await getPdfFont(pdfDoc, overlay.fontFamily || 'Segoe UI', fontCache, overlay)
+      const family = String(overlay.fontFamily || 'Segoe UI').toLowerCase()
+      const style = {
+        bold: Number(overlay.fontWeight) >= 600 || /bold|black|semibold|demi/.test(family),
+        italic: overlay.fontStyle === 'italic' || /italic|oblique/.test(family),
+      }
+      const text = String(overlay.text || '')
+      // Measured strings include the source text, so it must be covered too.
+      const coverageText = `${text}\n${overlay.originalText || ''}`
+      let font = await fonts.runsFor(await getPdfFont(pdfDoc, overlay.fontFamily || 'Segoe UI', fontCache, overlay), coverageText, style)
       const size = Math.max(4, Math.min(96, Number(overlay.fontSize) || Math.max(8, rect.height * 0.72)))
       const [r, g, b] = parseColor(overlay.color, [0.04, 0.04, 0.05])
       let scaleX = Math.max(0.25, Math.min(4, Number(overlay.scaleX) || 1))
       const letterSpacing = Math.max(-4, Math.min(20, Number(overlay.letterSpacing) || 0))
       const angle = Number.isFinite(overlay.angle) ? Number(overlay.angle) : 0
-      // Text typed on a rotated page reads along the rotated axes. Lay lines
-      // out in the displayed box (reading width × stacked height) and map the
-      // result back into the unrotated rect below.
       const displayRotation = (((Number(overlay.displayRotation) || 0) % 360) + 360) % 360
-      const sideways = displayRotation === 90 || displayRotation === 270
+      const sourceRect = validRect(overlay.originalRect)
+      // The box is laid out in its reading frame (reading width × stacked
+      // height) and then mapped into the unrotated PDF rect. A native run
+      // stores the axis-aligned box of its rotated glyphs, so a vertical
+      // label reads along the rect's height; a box the user rotated in the
+      // inspector keeps its own width and turns about its centre. The
+      // renderer may send `rectAngle` (the angle the rect was captured at).
+      const rectAngle = Number.isFinite(Number(overlay.rectAngle)) ? Number(overlay.rectAngle) : sourceRect ? angle : 0
+      const sideways = Math.abs(Math.sin(rectAngle + displayRotation * Math.PI / 180)) > 0.7
       const boxWidth = sideways ? rect.height : rect.width
       const boxHeight = sideways ? rect.width : rect.height
-      const sourceRect = validRect(overlay.originalRect)
+      const textAngle = angle + displayRotation * Math.PI / 180
       const preserveSourceMetrics = overlay.preserveSourceMetrics !== false && Math.abs(angle) < 0.01
       if (preserveSourceMetrics && sourceRect && overlay.originalText && overlay.fontData?.byteLength && hasReliableWindowsFontMatch(overlay.fontFamily)) {
         // PDF.js sometimes exposes a decoded browser font whose glyph outlines
@@ -758,11 +1015,11 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
           sourceRect.width,
         )
         if (embeddedError > 0.025) {
-          const matchedFont = await getPdfFont(pdfDoc, overlay.fontFamily || 'Segoe UI', fontCache, {
+          const matchedFont = await fonts.runsFor(await getPdfFont(pdfDoc, overlay.fontFamily || 'Segoe UI', fontCache, {
             ...overlay,
             fontKey: undefined,
             fontData: undefined,
-          })
+          }), coverageText, style)
           const matchedError = relativeWidthError(
             textWidthAtSize(matchedFont, overlay.originalText, size, letterSpacing, scaleX),
             sourceRect.width,
@@ -810,63 +1067,97 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
           }
         }
       }
-      const layout = layoutText(String(overlay.text || ''), boxWidth, (line) => (
-        sourceSpaceAdvance === null
-          ? textWidthAtSize(font, line, size, letterSpacing, scaleX)
-          : separatedTextWidth(font, line, size, letterSpacing, scaleX, sourceSpaceAdvance)
-      ), resolveTextFit(overlay))
-      scaleX *= layout.fitScale
-      if (sourceSpaceAdvance !== null) sourceSpaceAdvance *= layout.fitScale
-      const lines = layout.lines
-      const lineHeight = Math.max(size * 0.8, Number(overlay.lineHeight) || size * 1.18)
-      // Baseline distance measured downward from the displayed top of the box.
-      let baselineV = Number.isFinite(overlay.baselineOffset)
-        ? boxHeight - Number(overlay.baselineOffset)
-        : Math.min(size, boxHeight)
-      const lastContentLine = lines.findLastIndex((line) => line.trim())
-      // A PDF.js selection box can end above its source baseline (e.g. fonts
-      // with unusual ascent metrics). Preserving that one native baseline is
-      // valid; it must not make Save, Print, and every export format fail.
-      const preservesNativeBaseline = sourceRect && Number.isFinite(overlay.baselineOffset) && lastContentLine === 0
-      if (!preservesNativeBaseline && lastContentLine >= 0 && baselineV + lastContentLine * lineHeight > boxHeight + 0.5) {
-        throw new Error(`Text on page ${overlay.pageIndex + 1} does not fit its box. Enlarge or move the text box, or reduce its font size before saving.`)
+      const fitMode = resolveTextFit(overlay)
+      // Lay the text out at `factor` × its size. Size, spacing and line
+      // height scale together; the first native baseline stays where it was.
+      const layoutAt = (factor) => {
+        const fontSize = size * factor
+        const spacing = letterSpacing * factor
+        const spaceAdvance = sourceSpaceAdvance === null ? null : sourceSpaceAdvance * factor
+        const layout = layoutText(text, boxWidth, (line) => (
+          spaceAdvance === null
+            ? textWidthAtSize(font, line, fontSize, spacing, scaleX)
+            : separatedTextWidth(font, line, fontSize, spacing, scaleX, spaceAdvance)
+        ), fitMode)
+        const lineHeight = Math.max(fontSize * 0.8, (Number(overlay.lineHeight) || size * 1.18) * factor)
+        // Baseline distance measured downward from the displayed top of the box.
+        // A rotated native run comes without a measured baseline; its box is
+        // one line tall, with the baseline at the font's ascent.
+        const baselineV = Number.isFinite(overlay.baselineOffset)
+          ? boxHeight - Number(overlay.baselineOffset)
+          : sourceRect && Math.abs(angle) >= 0.01
+            ? Math.min(fontSize, boxHeight * NATIVE_RUN_ASCENT)
+            : Math.min(fontSize, boxHeight)
+        const lastContentLine = layout.lines.findLastIndex((line) => line.trim())
+        // A PDF.js selection box can end above its source baseline (e.g. fonts
+        // with unusual ascent metrics). Preserving that one native baseline is
+        // valid; it must not make Save, Print, and every export format fail.
+        const preservesNativeBaseline = sourceRect && Number.isFinite(overlay.baselineOffset) && lastContentLine === 0
+        const fits = preservesNativeBaseline || lastContentLine < 0 || baselineV + lastContentLine * lineHeight <= boxHeight + 0.5
+        return { fontSize, spacing, spaceAdvance, layout, lineHeight, baselineV, fits }
       }
-      for (const line of lines) {
-        const lineWidth = sourceSpaceAdvance === null
-          ? textWidthAtSize(font, line, size, letterSpacing, scaleX)
-          : separatedTextWidth(font, line, size, letterSpacing, scaleX, sourceSpaceAdvance)
+      let chosen = layoutAt(1)
+      if (!chosen.fits) {
+        // Text that does not fit is made smaller, never cut off. Below the
+        // minimum size it is drawn past the box and reported.
+        const minimum = Math.min(1, MIN_FITTED_TEXT_SIZE / size)
+        const smallest = layoutAt(minimum)
+        if (!smallest.fits) {
+          chosen = smallest
+          warnings.push(problem('TEXT_OVERFLOW',
+            `Text on page ${overlay.pageIndex + 1} (“${shortText(text)}”) is too long for its box even at ${Math.round(smallest.fontSize * 10) / 10} pt, so it runs past the box. Enlarge the box to keep it inside.`,
+            { overlayId: overlay.id, pageIndex: overlay.pageIndex, fontSize: smallest.fontSize, originalFontSize: size }))
+        } else {
+          let low = minimum
+          let high = 1
+          for (let step = 0; step < 14; step += 1) {
+            const middle = (low + high) / 2
+            if (layoutAt(middle).fits) low = middle
+            else high = middle
+          }
+          chosen = layoutAt(low)
+          warnings.push(problem('TEXT_SHRUNK',
+            `Text on page ${overlay.pageIndex + 1} (“${shortText(text)}”) did not fit its box and was reduced from ${Math.round(size * 10) / 10} pt to ${Math.round(chosen.fontSize * 10) / 10} pt.`,
+            { overlayId: overlay.id, pageIndex: overlay.pageIndex, fontSize: chosen.fontSize, originalFontSize: size }))
+        }
+      }
+      const lineScaleX = scaleX * chosen.layout.fitScale
+      const lineSpaceAdvance = chosen.spaceAdvance === null ? null : chosen.spaceAdvance * chosen.layout.fitScale
+      let baselineV = chosen.baselineV
+      for (const line of chosen.layout.lines) {
+        const lineWidth = lineSpaceAdvance === null
+          ? textWidthAtSize(font, line, chosen.fontSize, chosen.spacing, lineScaleX)
+          : separatedTextWidth(font, line, chosen.fontSize, chosen.spacing, lineScaleX, lineSpaceAdvance)
         const align = overlay.align === 'center' || overlay.align === 'right' ? overlay.align : 'left'
         const lineU = align === 'center'
           ? Math.max(0, (boxWidth - lineWidth) / 2)
           : align === 'right'
             ? Math.max(0, boxWidth - lineWidth)
             : 0
-        const textX = displayRotation === 90
-          ? rect.x + baselineV
-          : displayRotation === 180
-            ? rect.x + rect.width - lineU
-            : displayRotation === 270
-              ? rect.x + rect.width - baselineV
-              : rect.x + lineU
-        const textY = displayRotation === 90
-          ? rect.y + lineU
-          : displayRotation === 180
-            ? rect.y + baselineV
-            : displayRotation === 270
-              ? rect.y + rect.height - lineU
-              : rect.y + boxHeight - baselineV
+        const origin = textFramePoint(rect, boxWidth, boxHeight, textAngle, lineU, baselineV)
         const drawOptions = {
-          x: textX,
-          y: textY,
-          size,
+          x: origin.x,
+          y: origin.y,
+          size: chosen.fontSize,
           color: [r, g, b],
-          scaleX,
-          letterSpacing,
-          angle: angle + displayRotation * Math.PI / 180,
+          scaleX: lineScaleX,
+          letterSpacing: chosen.spacing,
+          angle: textAngle,
         }
-        if (sourceSpaceAdvance === null) drawStyledTextLine(page, font, line, drawOptions)
-        else drawStyledSeparatedLine(page, font, line, drawOptions, sourceSpaceAdvance)
-        baselineV += lineHeight
+        if (lineSpaceAdvance === null) drawStyledTextLine(page, font, line, drawOptions)
+        else drawStyledSeparatedLine(page, font, line, drawOptions, lineSpaceAdvance)
+        baselineV += chosen.lineHeight
+      }
+      const missing = [...new Set(Array.from(text))].filter((character) => font.missing.has(character))
+      if (missing.length) {
+        failures.push(problem('MISSING_GLYPHS',
+          `Text on page ${overlay.pageIndex + 1} contains ${missing.length === 1 ? 'a character' : 'characters'} (${missing.join(' ')}) that no installed font can draw; ${missing.length === 1 ? 'it was' : 'they were'} replaced by “�”.`,
+          {
+            overlayId: overlay.id,
+            pageIndex: overlay.pageIndex,
+            chars: missing,
+            blockingMessage: `Text on page ${overlay.pageIndex + 1} contains ${missing.length === 1 ? 'a character' : 'characters'} (${missing.join(' ')}) that no installed font can draw. Remove ${missing.length === 1 ? 'it' : 'them'} and save again.`,
+          }))
       }
     }
 
@@ -888,31 +1179,56 @@ async function flattenOverlays(data, overlays = [], formValues = {}, documentEdi
         const image = source.mime === 'image/png'
           ? await pdfDoc.embedPng(source.bytes)
           : await pdfDoc.embedJpg(source.bytes)
-        page.drawImage(image, {
-          x: rect.x,
-          y: rect.y,
-          width: rect.width,
-          height: rect.height,
-          opacity: Math.max(0.05, Math.min(1, Number(overlay.opacity) || 1)),
-        })
+        const opacity = Math.max(0.05, Math.min(1, Number(overlay.opacity) || 1))
+        // Chromium shows (and sizes the box for) a JPEG turned by its EXIF
+        // orientation; pdf-lib embeds the stored pixels, so turn them here.
+        const orientation = source.mime === 'image/png' ? 1 : jpegOrientation(source.bytes)
+        if (orientation === 1) {
+          page.drawImage(image, { x: rect.x, y: rect.y, width: rect.width, height: rect.height, opacity })
+        } else {
+          const swapped = orientation >= 5
+          const rawWidth = swapped ? rect.height : rect.width
+          const rawHeight = swapped ? rect.width : rect.height
+          const placement = orientationPlacement(orientation, rawWidth, rawHeight)
+          page.pushOperators(
+            pushGraphicsState(),
+            concatTransformationMatrix(1, 0, 0, 1, rect.x, rect.y),
+            concatTransformationMatrix(...placement.matrix),
+          )
+          page.drawImage(image, { x: 0, y: 0, width: rawWidth, height: rawHeight, opacity })
+          page.pushOperators(popGraphicsState())
+        }
       }
     }
   }
+
   pdfDoc.setProducer('simple')
-  return pdfDoc.save({ useObjectStreams: true })
+  // Replaced content streams, removed images and old field appearances are
+  // no longer referenced; drop them so the edited-away content is not kept.
+  await pdfDoc.flush()
+  compactUnreachable(pdfDoc)
+  const output = await pdfDoc.save({ useObjectStreams: true, updateFieldAppearances: false })
+  if (formReport.written.length) failures.push(...await verifyFormValues(output, formReport.written))
+  return { data: output, warnings, failures, signatureDetected }
 }
 
+/**
+ * Legacy contract (bytes only). Callers that cannot show a problem report
+ * get an error instead of a file that silently lacks an edit: any failure,
+ * or a warning that changed what the user typed, aborts with a clear message.
+ */
+async function flattenOverlays(data, overlays = [], formValues = {}, documentEdits = {}) {
+  const result = await flattenOverlaysDetailed(data, overlays, formValues, documentEdits)
+  const blocking = [...result.failures, ...result.warnings.filter((warning) => warning.dataLoss)]
+  if (blocking.length) throw unsavedChangesError(blocking)
+  return result.data
+}
+
+// Every user-visible write goes through the shared verified write: temp file in the
+// same folder, flush, read-back check, then replace with retries while another
+// program (another PDF reader, a scanner, a backup tool) holds the file.
 async function atomicWrite(targetPath, data) {
-  const directory = path.dirname(targetPath)
-  const extension = path.extname(targetPath) || '.pdf'
-  const tempPath = path.join(directory, `.${path.basename(targetPath, extension)}-${crypto.randomUUID()}${extension}.tmp`)
-  try {
-    await fs.writeFile(tempPath, toBytes(data))
-    await fs.rename(tempPath, targetPath)
-  } catch (error) {
-    await fs.rm(tempPath, { force: true }).catch(() => {})
-    throw error
-  }
+  await safeWriteFile(targetPath, toBytes(data))
 }
 
 function printerCapabilityHints(options = {}) {
@@ -986,8 +1302,12 @@ function createWindow(openPath = null) {
       nodeIntegration: false,
       sandbox: true,
       devTools: !app.isPackaged,
+      additionalArguments: bridgeArguments(IO_MODULE),
     },
   })
+  // Save / Don't Save / Cancel on every close path, never closing during a save,
+  // and crash/hang/sign-out handling.
+  guard.installWindowGuard(browserWindow)
 
   browserWindow.removeMenu()
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -1014,11 +1334,6 @@ function createWindow(openPath = null) {
       imageExportSessions.delete(id)
       if (session.directory) void fs.rm(session.targetPath, { recursive: true, force: true }).catch(() => {})
     }
-  })
-  browserWindow.on('close', (event) => {
-    if (isQuitting || closeApprovedWindows.has(browserWindow)) return
-    event.preventDefault()
-    browserWindow.webContents.send('window:close-requested')
   })
   return browserWindow
 }
@@ -1073,7 +1388,22 @@ async function exportTextDocument(event, input = {}) {
   })
   if (result.canceled || !result.filePath) return null
   const targetPath = withRequiredExtension(result.filePath, metadata.extension)
-  await atomicWrite(targetPath, await buildTextExport(format, input.pages, input.title || baseName))
+  // Markdown keeps its pictures as files in a folder beside it, named after it.
+  let imageFolder
+  if (format === 'md') {
+    const stem = safeExportBaseName(path.basename(targetPath, path.extname(targetPath)))
+    for (let suffix = 1; suffix < 1_000 && !imageFolder; suffix += 1) {
+      const candidate = suffix === 1 ? `${stem} images` : `${stem} images (${suffix})`
+      try { await fs.access(path.join(path.dirname(targetPath), candidate)) } catch { imageFolder = candidate }
+    }
+  }
+  const output = await buildTextExportFiles(format, input.pages, input.title || baseName, { imageFolder })
+  if (output.assets.length && imageFolder) {
+    const folder = path.join(path.dirname(targetPath), imageFolder)
+    await fs.mkdir(folder, { recursive: true })
+    for (const asset of output.assets) await atomicWrite(path.join(folder, asset.name), asset.data)
+  }
+  await atomicWrite(targetPath, output.data)
   return targetPath
 }
 
@@ -1167,7 +1497,38 @@ async function cancelImageExport(event, id) {
 }
 
 function supportedPaths(argv) {
-  return [...new Set(argv.filter((argument) => SUPPORTED_EXTENSIONS.has(path.extname(argument).toLowerCase())))]
+  return [...new Set(argv.filter((argument) => isImportableName(argument)))]
+}
+
+/** File-picker filters for documents; office-engine formats only when one is installed. */
+async function documentDialogFilters() {
+  return importDialogFilters({ engine: await officeEngineAvailable() })
+}
+
+async function hasIntactSignature(filePath) {
+  try {
+    return (await fileSignatureStatus(filePath)).intact
+  } catch {
+    return false
+  }
+}
+
+let textBackgroundCacheInstance = null
+
+/** Text-removal previews, cached per document revision and page. */
+function textBackgroundCache() {
+  textBackgroundCacheInstance ||= createTextBackgroundCache({
+    parse: (bytes) => loadPdf(bytes),
+    extractPage: async (source, pageIndex) => {
+      const single = await getPdfLib().PDFDocument.create()
+      const { pages, excludedRefs } = copyPagesRemapped(single, source, [pageIndex])
+      single.addPage(pages[0])
+      detachRemovedPages(single, excludedRefs)
+      return single.save()
+    },
+    removeText: (pageBytes, edits) => removeNativeText(pageBytes, edits),
+  })
+  return textBackgroundCacheInstance
 }
 
 function registerIpc() {
@@ -1175,13 +1536,7 @@ function registerIpc() {
     const result = await showOpenDialogFor(event, {
       title: 'Open a document',
       properties: ['openFile'],
-      filters: [
-        { name: 'Documents', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'doc', 'txt', 'md'] },
-        { name: 'PDF files', extensions: ['pdf'] },
-        { name: 'Images', extensions: ['png', 'jpg', 'jpeg'] },
-        { name: 'Word files', extensions: ['docx', 'doc'] },
-        { name: 'Text files', extensions: ['txt', 'md'] },
-      ],
+      filters: await documentDialogFilters(),
     })
     if (result.canceled || !result.filePaths[0]) return null
     return filePayload(result.filePaths[0])
@@ -1193,20 +1548,12 @@ function registerIpc() {
       const result = await showOpenDialogFor(event, {
         title: 'Open a document',
         properties: ['openFile'],
-        filters: [
-          { name: 'Documents', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'doc', 'txt', 'md'] },
-          { name: 'PDF files', extensions: ['pdf'] },
-          { name: 'Images', extensions: ['png', 'jpg', 'jpeg'] },
-          { name: 'Word files', extensions: ['docx', 'doc'] },
-          { name: 'Text files', extensions: ['txt', 'md'] },
-        ],
+        filters: await documentDialogFilters(),
       })
       if (result.canceled || !result.filePaths[0]) return false
       selectedPath = result.filePaths[0]
     }
-    if (!SUPPORTED_EXTENSIONS.has(path.extname(selectedPath).toLowerCase())) {
-      throw new Error('This file type is not supported.')
-    }
+    if (!(await openablePath(selectedPath))) throw unsupportedFormatError(selectedPath)
     createWindow(selectedPath)
     return true
   })
@@ -1215,16 +1562,16 @@ function registerIpc() {
 
   ipcMain.handle('file:open-bytes', async (_event, input) => {
     const buffer = toBytes(input.data)
-    const ext = path.extname(input.name).toLowerCase()
-    const converted = ext !== '.pdf'
-    const pdfBytes = await convertInputToPdf(buffer, ext, input.name)
+    const name = String(input?.name || 'Document')
+    const result = await importAsPdf(buffer, name)
     return {
-      data: serializableBytes(pdfBytes),
-      name: converted ? `${safeBaseName(input.name)}.pdf` : input.name,
+      data: serializableBytes(result.data),
+      name: result.converted ? `${safeBaseName(name)}.pdf` : name,
       path: null,
       sourcePath: null,
-      converted,
-      signatureDetected: ext === '.pdf' && buffer.includes(PDF_SIGNATURE_FIELD),
+      converted: result.converted,
+      ...(result.warnings.length ? { warnings: result.warnings } : {}),
+      ...documentProtection(result.converted ? '' : '.pdf', buffer),
     }
   })
 
@@ -1234,44 +1581,57 @@ function registerIpc() {
   })
 
   ipcMain.handle('pdf:mutate', async (_event, data, operation) => serializableBytes(await applyMutation(data, operation)))
-  ipcMain.handle('pdf:text-background', async (_event, data, pageIndex, edits) => {
-    const source = await loadPdf(data)
-    const single = await getPdfLib().PDFDocument.create()
-    const [page] = await single.copyPages(source, [pageIndex])
-    single.addPage(page)
-    return serializableBytes(await removeNativeText(await single.save(), edits.map(edit => ({ ...edit, pageIndex: 0 }))))
+  ipcMain.handle('pdf:text-background', async (_event, data, pageIndex, edits) => (
+    serializableBytes(await textBackgroundCache().render(data, pageIndex, edits))
+  ))
+  // `report: true` (as a fifth argument, or inside documentEdits so the
+  // current preload passes it through) returns { ok, data, warnings,
+  // failures, signatureDetected } instead of throwing on the first problem.
+  ipcMain.handle('pdf:flatten-overlays', async (_event, data, overlays, formValues, documentEdits, options) => {
+    const report = options?.report === true || documentEdits?.report === true
+    if (!report) return serializableBytes(await flattenOverlays(data, overlays, formValues, documentEdits))
+    const result = await flattenOverlaysDetailed(data, overlays, formValues, documentEdits)
+    return {
+      ok: result.failures.length === 0,
+      data: serializableBytes(result.data),
+      warnings: result.warnings,
+      failures: result.failures,
+      signatureDetected: result.signatureDetected,
+    }
   })
-  ipcMain.handle('pdf:flatten-overlays', async (_event, data, overlays, formValues, documentEdits) => serializableBytes(await flattenOverlays(data, overlays, formValues, documentEdits)))
 
+  // Both insert handlers return { data, added, skipped, warnings }: files that
+  // could not be added are listed in `skipped` with a plain reason.
   ipcMain.handle('pdf:insert-files', async (event, data, insertIndex) => {
     const result = await showOpenDialogFor(event, {
       title: 'Add pages',
       properties: ['openFile', 'multiSelections'],
-      filters: [{ name: 'Documents', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'doc', 'docx', 'txt', 'md'] }],
+      filters: await documentDialogFilters(),
     })
     if (result.canceled || !result.filePaths.length) return null
     const inserted = await insertDocuments(data, insertIndex, result.filePaths)
-    return { data: serializableBytes(inserted.data), added: inserted.added }
+    return { ...inserted, data: serializableBytes(inserted.data) }
   })
 
   ipcMain.handle('pdf:insert-dropped-files', async (_event, data, insertIndex, inputs) => {
     const inserted = await insertDocumentPayloads(data, insertIndex, inputs)
-    return { data: serializableBytes(inserted.data), added: inserted.added }
+    return { ...inserted, data: serializableBytes(inserted.data) }
   })
 
+  // Any picture format becomes PNG or JPEG here (WebP, GIF, BMP, AVIF, ICO and
+  // SVG through Chromium, TIFF's first page directly), so the editor and the
+  // flattener only ever see those two.
   ipcMain.handle('file:pick-image', async (event) => {
     const result = await showOpenDialogFor(event, {
       title: 'Choose an image',
       properties: ['openFile'],
-      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg'] }],
+      filters: importDialogFilters({ imagesOnly: true }),
     })
     if (result.canceled || !result.filePaths[0]) return null
     const filePath = result.filePaths[0]
-    const extension = path.extname(filePath).toLowerCase()
-    const mime = extension === '.png' ? 'image/png' : 'image/jpeg'
-    const imageBytes = await fs.readFile(filePath)
+    const image = await pickedImageData(await fs.readFile(filePath), path.basename(filePath))
     return {
-      dataUrl: `data:${mime};base64,${imageBytes.toString('base64')}`,
+      dataUrl: `data:${image.mime};base64,${image.data.toString('base64')}`,
       name: path.basename(filePath),
     }
   })
@@ -1341,17 +1701,26 @@ function registerIpc() {
 
   ipcMain.handle('pdf:save', async (event, input) => {
     let targetPath = input.forceDialog ? null : input.path
+    let defaultPath = input.name || 'Untitled.pdf'
+    let keptSignedOriginal = false
+    if (targetPath && await hasIntactSignature(targetPath)) {
+      // Never overwrite a validly signed original without asking: a full
+      // rewrite destroys the signed revision. Offer a copy beside it.
+      defaultPath = path.join(path.dirname(targetPath), `${path.basename(targetPath, path.extname(targetPath))} (edited).pdf`)
+      targetPath = null
+      keptSignedOriginal = true
+    }
     if (!targetPath) {
       const result = await showSaveDialogFor(event, {
-        title: input.forceDialog ? 'Save PDF as' : 'Save PDF',
-        defaultPath: input.name || 'Untitled.pdf',
+        title: input.forceDialog || keptSignedOriginal ? 'Save PDF as' : 'Save PDF',
+        defaultPath,
         filters: [{ name: 'PDF file', extensions: ['pdf'] }],
       })
       if (result.canceled || !result.filePath) return null
       targetPath = result.filePath.toLowerCase().endsWith('.pdf') ? result.filePath : `${result.filePath}.pdf`
     }
     await atomicWrite(targetPath, input.data)
-    return { path: targetPath, name: path.basename(targetPath) }
+    return { path: targetPath, name: path.basename(targetPath), ...(keptSignedOriginal ? { keptSignedOriginal } : {}) }
   })
 
   ipcMain.handle('shell:show-item', (_event, filePath) => shell.showItemInFolder(filePath))
@@ -1371,7 +1740,7 @@ function registerIpc() {
   ipcMain.on('window:confirm-close', (event) => {
     const browserWindow = callingWindow(event)
     if (!browserWindow) return
-    closeApprovedWindows.add(browserWindow)
+    // The window guard asks the page again; after Save or Discard it reports no changes.
     browserWindow.close()
   })
 }
@@ -1393,9 +1762,19 @@ if (!gotLock) {
     }
   })
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     void cleanupStalePrintDirectories()
     registerIpc()
+    registerSharedIo({
+      ipcMain,
+      module: IO_MODULE,
+      guard,
+      stores,
+      officeEngine,
+      openInWindow: (filePath) => { createWindow(filePath); return true },
+    })
+    // Finish or undo any save a crash interrupted before documents open.
+    await sweep().catch((error) => console.error('[simple-io] sweep failed', error))
     const incoming = supportedPaths(process.argv)
     if (incoming.length) {
       for (const filePath of incoming) createWindow(filePath)

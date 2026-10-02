@@ -1,6 +1,6 @@
 {
   "name": "simple-image",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A private, local-first image viewer and editor for Windows.",
   "author": "simple",
   "license": "MIT",
@@ -17,9 +17,13 @@
     "smoke:context-menu": "node qa/context-menu-smoke.cjs",
     "smoke:print": "electron qa/print-smoke.cjs",
     "smoke:print-render": "electron qa/print-render-smoke.cjs",
-    "smoke:packaged-print": "node qa/packaged-print-smoke.cjs"
+    "smoke:packaged-print": "node qa/packaged-print-smoke.cjs",
+    "smoke:psd": "electron qa/psd-smoke.cjs",
+    "smoke:advanced": "electron qa/advanced-smoke.cjs",
+    "perf:advanced": "electron qa/advanced-perf.cjs"
   },
   "dependencies": {
+    "ag-psd": "31.0.2",
     "lucide-react": "^0.468.0",
     "pdf-lib": "^1.17.1",
     "react": "^18.3.1",
@@ -79,7 +83,14 @@
           "gif",
           "bmp",
           "svg",
-          "avif"
+          "avif",
+          "jfif",
+          "jpe",
+          "jif",
+          "apng",
+          "ico",
+          "svgz",
+          "psd"
         ],
         "name": "Image",
         "description": "Image file",

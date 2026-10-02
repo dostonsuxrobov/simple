@@ -1,3 +1,5 @@
+import { tokenizeFormulaText } from './formula-editing'
+
 /**
  * A cut is destructive, so clearing must be gated on an affirmative clipboard
  * result. Rejections are treated as failed copies as an additional safety net.
@@ -189,4 +191,109 @@ export function writeClipboardEvent(event: Pick<ClipboardEvent, 'clipboardData' 
   if (payload.html) event.clipboardData.setData('text/html', payload.html)
   event.preventDefault()
   return true
+}
+
+/** What the internal clipboard remembers about where a copy or cut came from. */
+export interface ClipboardSourceStamp {
+  /** Document the cells were copied from (null when unknown). */
+  documentId: string | null
+  sheetId: string
+  /** Identity of the source sheet's cell map at copy time. */
+  cells: unknown
+}
+
+/**
+ * Cut mode (and the copy marquee) only stays valid while the copied cells are exactly where
+ * they were: same document, same sheet, and an untouched cell map. Any edit, insert, delete,
+ * sort, undo or newly opened workbook replaces the cell map, so Ctrl+V can no longer move
+ * the wrong rectangle, as Excel cancels cut mode on those changes.
+ */
+export function clipboardSourceIntact(
+  stamp: ClipboardSourceStamp | null | undefined,
+  current: { documentId: string | null; sheets: ReadonlyArray<{ id: string; cells: unknown }> } | null | undefined,
+): boolean {
+  if (!stamp || !current) return false
+  if (stamp.documentId !== current.documentId) return false
+  const sheet = current.sheets.find((item) => item.id === stamp.sheetId)
+  return Boolean(sheet) && sheet!.cells === stamp.cells
+}
+
+function columnNumber(label: string) {
+  let value = 0
+  for (const character of label.toUpperCase()) value = value * 26 + character.charCodeAt(0) - 64
+  return value - 1
+}
+
+function columnText(index: number) {
+  let value = index + 1
+  let label = ''
+  while (value > 0) {
+    const remainder = (value - 1) % 26
+    label = String.fromCharCode(65 + remainder) + label
+    value = Math.floor((value - 1) / 26)
+  }
+  return label
+}
+
+function quoteSheet(name: string) {
+  if (/^[A-Za-z_][A-Za-z0-9_.]*$/.test(name) && !/^[A-Za-z]{1,3}\d+$/.test(name) && !/^R\d*C\d*$/i.test(name)) return name
+  return `'${name.replace(/'/g, "''")}'`
+}
+
+function shiftCellText(text: string, rowDelta: number, colDelta: number) {
+  const match = /^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$/.exec(text)
+  if (!match) return text
+  const column = columnNumber(match[2]) + colDelta
+  const row = Number(match[4]) + rowDelta
+  if (column < 0 || row < 1 || column > 16_383 || row > 1_048_576) return '#REF!'
+  return `${match[1]}${columnText(column)}${match[3]}${row}`
+}
+
+export interface MovedFormulaPlacement {
+  /** Sheet the formula lived on (and the block was cut from). */
+  sourceSheet: string
+  /** Sheet the block was pasted on. */
+  destinationSheet: string
+  /** 0-based bounds of the cut block on the source sheet. */
+  rect: { top: number; left: number; bottom: number; right: number }
+  rowDelta: number
+  colDelta: number
+}
+
+/**
+ * Rewrites a formula that travels with a cut block to another sheet, the way Excel does:
+ * references inside the block follow it (and stay unqualified, since the block now lives on
+ * the formula's new sheet), while every other reference that implicitly meant the source
+ * sheet gains an explicit `Source!` prefix so it keeps pointing at the same cells.
+ * References qualified with another sheet are left alone.
+ */
+export function relocateMovedFormula(formula: string, placement: MovedFormulaPlacement): string {
+  const text = `=${formula}`
+  const source = placement.sourceSheet.toLocaleLowerCase()
+  const { rect } = placement
+  let output = ''
+  let last = 0
+  for (const token of tokenizeFormulaText(text)) {
+    const reference = token.reference
+    if (token.kind !== 'reference' || !reference) continue
+    const qualified = reference.sheet !== undefined
+    if (qualified && reference.sheet!.toLocaleLowerCase() !== source) continue
+    const bang = reference.text.lastIndexOf('!')
+    const body = reference.text.slice(bang + 1)
+    const wholeLine = reference.bottom - reference.top >= 1_048_575 || reference.right - reference.left >= 16_383
+    const inside = !wholeLine && reference.top >= rect.top && reference.bottom <= rect.bottom && reference.left >= rect.left && reference.right <= rect.right
+    let replacement: string
+    if (inside) {
+      const spill = body.endsWith('#') ? '#' : ''
+      const moved = body.replace(/#$/, '').split(':').map((part) => shiftCellText(part, placement.rowDelta, placement.colDelta)).join(':')
+      replacement = `${qualified ? `${quoteSheet(placement.destinationSheet)}!` : ''}${moved}${spill}`
+    } else {
+      if (qualified) continue
+      replacement = `${quoteSheet(placement.sourceSheet)}!${body}`
+    }
+    output += text.slice(last, token.start) + replacement
+    last = token.end
+  }
+  if (!last) return formula
+  return (output + text.slice(last)).slice(1)
 }

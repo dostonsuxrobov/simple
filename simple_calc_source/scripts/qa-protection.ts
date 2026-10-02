@@ -27,6 +27,11 @@ assert.ok(check(locked, (d) => { d.sheets[0].cells.E5 = { value: 'x' } }), 'nor 
 assert.equal(check(locked, (d) => { d.sheets[0].cells.B1.value = 5 }), null, 'unlocked cells stay editable')
 assert.equal(check(locked, (d) => { d.sheets[0].cells.D3 = { value: 'ok' } }), null)
 assert.ok(check(locked, (d) => { d.sheets[0].cells.B1.style = { font: { bold: true }, protection: { locked: false } } }), 'formatting needs permission')
+// Review F5: typing '00123 sets the apostrophe flag; it is part of the entry, not formatting.
+assert.equal(check(locked, (d) => { d.sheets[0].cells.B1 = { value: '00123', style: { protection: { locked: false }, quotePrefix: 1 } } }), null, "an apostrophe entry is accepted in an unlocked cell")
+assert.equal(check(locked, (d) => { d.sheets[0].cells.D4 = { value: '007', style: { quotePrefix: 1 } } }), null, 'also in a cell unlocked by its column')
+assert.ok(check(locked, (d) => { d.sheets[0].cells.A1 = { value: '00123', style: { quotePrefix: 1 } } }), 'a locked cell still refuses it')
+assert.ok(check(locked, (d) => { d.sheets[0].cells.B1.style = { font: { bold: true }, protection: { locked: false }, quotePrefix: 1 } }), 'real formatting still needs permission')
 assert.equal(check(locked, (d) => { d.sheets[0].cells.C1.result = 4; d.sheets[0].cells.C1.display = '4' }), null, 'recalculated results are not edits')
 assert.ok(check(locked, (d) => { d.sheets[0].colWidths['2'] = 20 }))
 assert.ok(check(locked, (d) => { d.sheets[0].images = [] }), 'objects are protected')

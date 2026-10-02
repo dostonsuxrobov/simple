@@ -4,10 +4,10 @@
 import {
   compareValues,
   createCriterionTest,
+  criterionOperandValue,
   isEvaluationError,
   isEvaluationRange,
   isLambdaValue,
-  numericTextValue,
   scalarArgument,
   toNumber,
   toText,
@@ -84,7 +84,8 @@ function headerKey(value: Scalar): string {
 function databaseCriterion(cell: Scalar): CriterionTest | EvaluationError | null {
   if (cell === null || cell === "") return null;
   if (isEvaluationError(cell)) return cell;
-  if (typeof cell === "string" && !/^(<=|>=|<>|=|<|>)/.test(cell) && numericTextValue(cell) === null) {
+  // Only real text matches as a prefix; "1/1/2024", "50%" or "$1" compare as values.
+  if (typeof cell === "string" && !/^(<=|>=|<>|=|<|>)/.test(cell) && typeof criterionOperandValue(cell) === "string") {
     return createCriterionTest(`${cell}*`);
   }
   return createCriterionTest(cell);

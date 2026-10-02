@@ -75,7 +75,16 @@ function contentOf(cell: CellData | undefined) {
 }
 
 function formatOf(cell: CellData | undefined) {
-  return JSON.stringify(FORMAT_KEYS.map((key) => cell?.[key] ?? null))
+  return JSON.stringify(FORMAT_KEYS.map((key) => {
+    const value = cell?.[key] ?? null
+    // The apostrophe flag (quotePrefix) belongs to the entry, not to formatting: Excel accepts
+    // '00123 in an unlocked cell of a sheet that does not allow formatting.
+    if (key === 'style' && value && typeof value === 'object' && 'quotePrefix' in value) {
+      const { quotePrefix: _quotePrefix, ...rest } = value as Record<string, unknown>
+      return Object.keys(rest).length ? rest : null
+    }
+    return value
+  }))
 }
 
 interface PatchLike { path: Array<string | number> }

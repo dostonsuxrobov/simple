@@ -110,6 +110,47 @@ function parsePageRange(value, totalPages) {
   return [...selected].sort((left, right) => left - right)
 }
 
+// Printers cannot mark the outer 4–6 mm of a sheet. Page marks therefore stay at
+// least a quarter inch inside the paper edge even with the None margin preset,
+// and each mark is centred in its own reserved band so the preview and the
+// physical print share one geometry.
+const MARK_BAND = 18
+const MARK_MIN_INSET = 18
+const MARK_FONT_SIZE = 8
+// Helvetica cap height as a fraction of the font size; centring the capitals
+// leaves room for descenders inside the same band.
+const MARK_CAP_HEIGHT = 0.718
+
+function printPageGeometry(pageSize, marginPoints, options = {}) {
+  const title = Boolean(options.printTitle)
+  const numbers = Boolean(options.printPageNumbers)
+  const top = title ? Math.max(marginPoints.top, MARK_MIN_INSET) : marginPoints.top
+  const bottom = numbers ? Math.max(marginPoints.bottom, MARK_MIN_INSET) : marginPoints.bottom
+  const headerBand = title ? MARK_BAND : 0
+  const footerBand = numbers ? MARK_BAND : 0
+  const availableWidth = Math.max(18, pageSize.width - marginPoints.left - marginPoints.right)
+  const availableHeight = Math.max(18, pageSize.height - top - bottom - headerBand - footerBand)
+  const contentBottom = bottom + footerBand
+  // Marks may be wider than a zero-margin content box, so they get their own
+  // printable horizontal inset.
+  const markLeft = Math.max(marginPoints.left, MARK_MIN_INSET)
+  const markRight = Math.max(marginPoints.right, MARK_MIN_INSET)
+  const markWidth = Math.max(18, pageSize.width - markLeft - markRight)
+  const baselineInBand = (bandBottom) => bandBottom + (MARK_BAND - MARK_CAP_HEIGHT * MARK_FONT_SIZE) / 2
+  return {
+    availableWidth,
+    availableHeight,
+    contentLeft: marginPoints.left,
+    contentBottom,
+    headerBand,
+    footerBand,
+    markLeft,
+    markWidth,
+    titleBaseline: title ? baselineInBand(pageSize.height - top - MARK_BAND) : null,
+    pageNumberBaseline: numbers ? baselineInBand(bottom) : null,
+  }
+}
+
 function fitScale(sourceWidth, sourceHeight, availableWidth, availableHeight, settings) {
   if (settings.scaling === 'actual') return 1
   if (settings.scaling === 'custom') return settings.scalePercent / 100
@@ -227,8 +268,6 @@ async function composePrintPdf(input) {
   const font = await output.embedFont(StandardFonts.Helvetica)
   const title = cleanTitle(input?.name)
   const printableTitle = safeTextForFont(title, font)
-  const headerBand = settings.printTitle ? 18 : 0
-  const footerBand = settings.printPageNumbers ? 18 : 0
 
   const embeddedPages = await output.embedPdf(source, selected)
   const outputSizes = embeddedPages.map((embedded) => settings.paper === 'Document'
@@ -252,36 +291,33 @@ async function composePrintPdf(input) {
       bottom: pageMargins.bottom * POINTS_PER_INCH,
       left: pageMargins.left * POINTS_PER_INCH,
     }
-    const availableWidth = Math.max(18, pageSize.width - margin.left - margin.right)
-    const availableHeight = Math.max(18, pageSize.height - margin.top - margin.bottom - headerBand - footerBand)
+    const geometry = printPageGeometry(pageSize, margin, settings)
+    const { availableWidth, availableHeight, contentBottom } = geometry
     const page = output.addPage([pageSize.width, pageSize.height])
     const scale = fitScale(embedded.width, embedded.height, availableWidth, availableHeight, settings)
     const drawnWidth = embedded.width * scale
     const drawnHeight = embedded.height * scale
-    const contentBottom = margin.bottom + footerBand
     const x = settings.centerContent ? margin.left + (availableWidth - drawnWidth) / 2 : margin.left
     const y = settings.centerContent ? contentBottom + (availableHeight - drawnHeight) / 2 : contentBottom + availableHeight - drawnHeight
     page.drawPage(embedded, { x, y, width: drawnWidth, height: drawnHeight })
 
     if (settings.printTitle) {
-      const size = 8
-      const value = trimToWidth(printableTitle, font, size, availableWidth)
+      const value = trimToWidth(printableTitle, font, MARK_FONT_SIZE, geometry.markWidth)
       page.drawText(value, {
-        x: margin.left,
-        y: pageSize.height - margin.top - size,
-        size,
+        x: geometry.markLeft,
+        y: geometry.titleBaseline,
+        size: MARK_FONT_SIZE,
         font,
         color: rgb(0.28, 0.28, 0.28),
       })
     }
     if (settings.printPageNumbers) {
-      const size = 8
       const value = `Page ${index + 1} of ${embeddedPages.length}`
-      const width = font.widthOfTextAtSize(value, size)
+      const width = font.widthOfTextAtSize(value, MARK_FONT_SIZE)
       page.drawText(value, {
-        x: margin.left + Math.max(0, (availableWidth - width) / 2),
-        y: margin.bottom,
-        size,
+        x: geometry.markLeft + Math.max(0, (geometry.markWidth - width) / 2),
+        y: geometry.pageNumberBaseline,
+        size: MARK_FONT_SIZE,
         font,
         color: rgb(0.28, 0.28, 0.28),
       })
@@ -318,6 +354,7 @@ module.exports = {
   resolvePrinter,
   normalizePrintSettings,
   parsePageRange,
+  printPageGeometry,
   safeTextForFont,
   validatePdfBytes,
 }

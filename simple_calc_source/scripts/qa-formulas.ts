@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { evaluateFormula, shiftFormulaReferences } from '../src/lib/formulas.ts'
+import { describeFormulaError, diagnoseFormula, evaluateFormula, findLookupIndex, shiftFormulaReferences } from '../src/lib/formulas.ts'
 import type { FormulaEvaluationHooks } from '../src/lib/formulas.ts'
 
 const cells: Record<string, number | string | boolean | null> = {
@@ -187,7 +187,8 @@ assert.equal(formula('MEDIAN({3,1,2})'), 2)
 assert.equal(formula('MATCH("b",{"a","b","c"},0)'), 2)
 assert.equal(formula('SUM({1,#DIV/0!})'), '#DIV/0!')
 assert.equal(formula('{1,2;3}'), '#VALUE!')
-assert.equal(formula('{}'), '#PARSE!')
+// Unreadable formulas evaluate to an Excel error (never the non-standard #PARSE!).
+assert.equal(formula('{}'), '#NAME?')
 assert.equal(formula('SUM(1;2;3)'), 6)
 assert.equal(formula('C1:C3'), 10)
 
@@ -525,4 +526,166 @@ assert.equal(formula('INDEX(TRANSPOSE(B1:C3),1,2)'), 'West')
 assert.equal(formula('ROWS(TRANSPOSE(A1:B3))'), 2)
 assert.equal(formula('COLUMNS(TRANSPOSE(A1:B3))'), 3)
 
-process.stdout.write('Formula QA passed: 42 legacy checks plus 326 new formula, grammar, and hook checks.\n')
+// ---- Regression cases for the verified engine bugs (calc-formula-engine-1 … -12, CALC-007) ----
+{
+  const sheet: Record<string, unknown> = {
+    // Dates 2023-03-15, 2024-01-01, 2024-04-19, text, blank, 2024-12-31, 2025-01-01.
+    C1: 45000, C2: 45292, C3: 45400, C4: 'x', C6: 45657, C7: 45658,
+    B1: 1, B2: 2, B3: 3, B4: '10',
+    E1: 'apple', E2: 'banana', E3: 'cherry', F1: 1, F2: 2, F3: 3,
+    H1: 2, H2: 'Hello', H3: true, H4: '20240115',
+    J1: '5', J2: true, J3: '10', J4: 4, K1: 1, K2: '#DIV/0!',
+    M1: 'a*c', M2: 'abc', N1: 10, N2: 20,
+  }
+  const run = (source: string) => evaluateFormula(source, 'Sheet1', (_s, address) => sheet[address] as never, { resolverReturnsValues: true })
+
+  // calc-formula-engine-1: criteria read dates, %, currency and thousands like typed input;
+  // text criteria with < or > only compare text.
+  assert.equal(run('COUNTIFS(C1:C7,">=1/1/2024",C1:C7,"<=12/31/2024")'), 3)
+  assert.equal(run('SUMIFS(C1:C7,C1:C7,">=1/1/2024")'), 182007)
+  assert.equal(run('COUNTIF(C1:C7,"1/1/2024")'), 1)
+  assert.equal(run('COUNTIF(C1:C7,"Jan 1, 2024")'), 1)
+  assert.equal(run('COUNTIF(C1:C7,">=2024-01-01")'), 4)
+  assert.equal(run('COUNTIF(B1:B5,">50%")'), 3)
+  assert.equal(run('COUNTIF(B1:B5,">$1")'), 2)
+  assert.equal(run('COUNTIF(B1:B5,"<1,000")'), 3)
+  assert.equal(run('COUNTIF(C1:C7,"<m")'), 0)
+  assert.equal(run('COUNTIF(E1:E3,"<c")'), 2)
+  assert.equal(run('COUNTIF(B1:B5,"10")'), 1, 'equality still matches numeric text')
+  assert.equal(run('COUNTIF(B1:B5,"<>10")'), 4)
+  assert.equal(run('COUNTIF(B1:B5,"")'), 1)
+  assert.equal(run('COUNTIF(B1:B5,"<>")'), 4)
+  assert.equal(run('COUNTIF(E1:E3,"b*")'), 1)
+  assert.equal(run('COUNTIF(F1:F3,"1*")'), 0, 'wildcards only match text')
+  assert.equal(run('COUNTIF(M1:M2,"a~*c")'), 1)
+  assert.equal(run('COUNTIF(H1:H4,TRUE)'), 1)
+  assert.equal(run('COUNTIF(K1:K2,">0")'), 1, 'errors in the range are skipped, not returned')
+  assert.equal(run('COUNTIF(K1:K2,"#DIV/0!")'), 1)
+  assert.equal(run('SUMIF(K1:K2,"<>#DIV/0!")'), 1)
+  assert.equal(run('MAXIFS(C1:C7,C1:C7,"<1/1/2025")'), 45657)
+  assert.equal(run('AVERAGEIF(N1:N2,">$15")'), 20)
+
+  // calc-formula-engine-6: wildcards in exact-match lookups, fractional index arguments.
+  assert.equal(run('VLOOKUP("ban*",E1:F3,2,FALSE)'), 2)
+  assert.equal(run('VLOOKUP("*err*",E1:F3,2,FALSE)'), 3)
+  assert.equal(run('MATCH("?pple",E1:E3,0)'), 1)
+  assert.equal(run('MATCH("a~*c",M1:M2,0)'), 1)
+  assert.equal(run('MATCH("a*c",M1:M2,0)'), 1)
+  assert.equal(run('HLOOKUP("ap*",E1:E3,2,FALSE)'), 'banana')
+  assert.equal(run('VLOOKUP("zz*",E1:F3,2,FALSE)'), '#N/A')
+  assert.equal(run('INDEX(E1:E3,2.5)'), 'banana')
+  assert.equal(run('INDEX(E1:F3,2.9,1.2)'), 'banana')
+  assert.equal(run('VLOOKUP("banana",E1:F3,2.5,FALSE)'), 2)
+  assert.equal(run('INDEX(E1:E3,-1)'), '#VALUE!')
+  assert.equal(run('VLOOKUP("banana",E1:F3,0.5,FALSE)'), '#VALUE!')
+  assert.equal(run('INDEX({1,2,3},2)'), 2)
+  {
+    // Review F8: the wildcard step limit is per cell, so a long range is searched to the end.
+    const long = Array.from({ length: 150_000 }, (_, index) => `item ${index + 1} of the list`)
+    assert.deepEqual(findLookupIndex(long, '*zzz*', 0), { kind: 'evaluationError', code: '#N/A' }, 'no match is #N/A, not #VALUE!')
+    assert.equal(findLookupIndex(long, '*149999 of*', 0), 149_998)
+  }
+
+  // calc-formula-engine-7: Excel operator precedence and the no-op unary plus.
+  assert.equal(run('-2^2'), 4)
+  assert.equal(run('-H1^2'), 4)
+  assert.equal(run('2^3^2'), 64)
+  assert.equal(run('2^-2'), 0.25)
+  assert.equal(run('2*-3^2'), 18)
+  assert.equal(run('-2%'), -0.02)
+  assert.equal(run('2^3%'), 2 ** 0.03)
+  assert.equal(run('+H2'), 'Hello')
+  assert.equal(run('+H3'), true)
+  assert.equal(run('--H3'), 1)
+
+  // calc-formula-engine-8: DATE coerces text and blanks; VALUE reads dates, times, "-$5".
+  assert.equal(run('DATE(LEFT(H4,4),MID(H4,5,2),RIGHT(H4,2))'), 45306)
+  assert.equal(run('DATE(2024,1,Z9)'), 45291)
+  assert.equal(run('DATE("2024","1","15")'), 45306)
+  assert.equal(run('DATE("x",1,1)'), '#VALUE!')
+  assert.equal(run('DATE(10000,1,1)'), '#NUM!')
+  close(run('VALUE("12:30")'), 0.5208333333333334, 1e-12)
+  assert.equal(run('VALUE("2024-01-15")'), 45306)
+  close(run('VALUE("2024-01-15 06:00")'), 45306.25, 1e-9)
+  assert.equal(run('VALUE("-$5")'), -5)
+  assert.equal(run('VALUE("0x10")'), '#VALUE!')
+  assert.equal(run('"0x10"+0'), '#VALUE!')
+
+  // calc-formula-engine-11: a single-cell reference follows the reference rule like a range.
+  assert.equal(run('SUM(J1)'), 0)
+  assert.equal(run('SUM(J1,J2)'), 0)
+  assert.equal(run('SUM(J1:J2)'), 0)
+  assert.equal(run('SUM(J1,J4)'), 4)
+  assert.equal(run('COUNT(J3)'), 0)
+  assert.equal(run('MAX(J3)'), 0)
+  assert.equal(run('AVERAGE(J3,J4)'), 4)
+  assert.equal(run('SUM("5",TRUE)'), 6, 'typed arguments still coerce')
+  assert.equal(run('COUNT("5",J1)'), 1)
+  assert.equal(run('COUNTA(K2)'), 1, 'COUNTA counts an error in a referenced cell')
+  assert.equal(run('AVERAGEA(J1,J4)'), 2, 'AVERAGEA counts referenced text as 0')
+  assert.equal(run('SUM(INDEX(J1:J4,1))'), 0)
+
+  // calc-formula-engine-12: Excel's 1900 date system for serials 0-60.
+  assert.equal(run('DATE(1900,1,1)'), 1)
+  assert.equal(run('DATE(1900,2,28)'), 59)
+  assert.equal(run('DATE(1900,2,29)'), 60)
+  assert.equal(run('DATE(1900,3,1)'), 61)
+  assert.equal(run('DATE(1900,3,0)'), 60)
+  assert.equal(run('DATE(1900,1,0)'), 0)
+  assert.equal(run('DATE(1900,1,-1)'), '#NUM!')
+  assert.equal(run('DAY(60)') + '-' + run('MONTH(60)'), '29-2')
+  assert.equal(run('DAY(59)'), 28)
+  assert.equal(run('DAY(61)') + '-' + run('MONTH(61)'), '1-3')
+  assert.equal(run('YEAR(Z9)') + '/' + run('MONTH(Z9)') + '/' + run('DAY(Z9)'), '1900/1/0')
+  assert.equal(run('YEAR(-1)'), '#NUM!')
+  assert.equal(run('YEAR(2958466)'), '#NUM!')
+  assert.equal(run('DATEVALUE("1/1/1900")'), 1)
+  assert.equal(run('DATEVALUE("2/29/1900")'), 60)
+  assert.equal(run('DATEVALUE("12/31/1899")'), '#VALUE!')
+  assert.equal(run('EDATE(60,1)'), 89)
+  assert.equal(run('EOMONTH(DATE(1900,2,1),0)'), 60)
+  assert.equal(run('DATEDIF(DATE(1900,1,1),DATE(1900,3,1),"D")'), 60)
+  assert.equal(run('WEEKNUM(0)'), 0)
+  assert.equal(run('DATE(2024,1,15)'), 45306, 'modern dates are unchanged')
+
+  // CALC-007: unreadable formulas give Excel errors, never #PARSE!.
+  assert.equal(run('SUM(1'), '#NAME?')
+  assert.equal(run('"abc'), '#NAME?')
+  assert.equal(run('1+'), '#NAME?')
+  assert.equal(run('A1048577'), '#REF!')
+  assert.equal(run('1e999'), '#NUM!')
+  assert.equal(run('{1,2;3}'), '#VALUE!')
+  assert.equal(run('#PARSE!'), '#NAME?')
+}
+
+// CALC-007: a parse-problem object the editor can show, with a repaired suggestion.
+{
+  const missing = diagnoseFormula('=SUM(A1:A3')
+  assert.equal(missing?.error, '#NAME?')
+  assert.equal(missing?.kind, 'syntax')
+  assert.equal(missing?.message, 'A closing parenthesis is missing.')
+  assert.equal(missing?.position, 4)
+  assert.equal(missing?.suggestion, '=SUM(A1:A3)')
+  assert.equal(diagnoseFormula('="abc')?.suggestion, '="abc"')
+  assert.equal(diagnoseFormula('=IF(A1>0,"yes')?.suggestion, '=IF(A1>0,"yes")')
+  assert.equal(diagnoseFormula('=SUM(1,2))')?.suggestion, '=SUM(1,2)')
+  assert.equal(diagnoseFormula('=SUM(1,2))')?.message, "There's an extra closing parenthesis.")
+  assert.equal(diagnoseFormula('=1+')?.suggestion, undefined)
+  const unknown = diagnoseFormula('=1+SUMM(A1)')
+  assert.equal(unknown?.kind, 'unknown-function')
+  assert.equal(unknown?.position, 3)
+  assert.equal(unknown?.length, 4)
+  assert.equal(diagnoseFormula('=_xlfn.XLOOKUP(1,A1:A2,B1:B2)'), null)
+  assert.equal(diagnoseFormula('=LET(x,1,f,LAMBDA(y,y+x),f(2))'), null)
+  assert.equal(diagnoseFormula('=SUM(A1:A3)'), null)
+  assert.equal(diagnoseFormula('=Total*2'), null, 'names are only checked when the host can resolve them')
+  assert.equal(diagnoseFormula('=Total*2', { isDefinedName: () => false })?.kind, 'unknown-name')
+  assert.equal(diagnoseFormula('=Total*2', { isDefinedName: (name) => name === 'Total' }), null)
+  assert.equal(diagnoseFormula('=A1048577+1')?.error, '#REF!')
+  assert.equal(diagnoseFormula('=A1048577+1')?.kind, 'reference')
+  assert.equal(diagnoseFormula('=')?.message, 'The formula is empty.')
+  assert.match(describeFormulaError('#DIV/0!') ?? '', /divides by zero/)
+  assert.equal(describeFormulaError(42), null)
+}
+
+process.stdout.write('Formula QA passed: 42 legacy checks plus 326 new formula, grammar, and hook checks, and the engine regression cases.\n')

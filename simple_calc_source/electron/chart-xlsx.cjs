@@ -1561,7 +1561,7 @@ function isChartExportable(chart) {
  * Write every model chart into the output package (JSZip instance, mutated in place).
  * `baseBuffer` is the original package used for byte-exact copies of unmodified charts.
  */
-async function writeChartsToPackage(zip, model, baseBuffer) {
+async function writeChartsToPackage(zip, model, baseBuffer, warnings) {
   const sheetsWithCharts = (model && Array.isArray(model.sheets) ? model.sheets : []).filter((sheet) => Array.isArray(sheet.charts) && sheet.charts.some(isChartExportable))
   if (!sheetsWithCharts.length) return 0
   const JSZip = require('jszip')
@@ -1569,6 +1569,20 @@ async function writeChartsToPackage(zip, model, baseBuffer) {
   const types = new ContentTypes(await readPart(zip, '[Content_Types].xml'))
   const outputSheets = await workbookSheetParts(zip)
   const read = modelReader(model)
+  const themeColors = model.metadata && model.metadata.themeColors
+  const theme = Array.isArray(themeColors) && themeColors.length >= 10 ? themeColors.map((value, index) => (/^[0-9a-f]{6}$/i.test(String(value || '')) ? String(value).toUpperCase() : OFFICE_THEME[index])) : OFFICE_THEME
+  // The base part must still be the chart that was imported: a stale part name (for example
+  // after the package was rewritten) would otherwise copy a different chart over this one.
+  const basePartMatches = async (chart, info) => {
+    try {
+      const xml = await readPart(baseZip, chart.sourcePart)
+      if (!xml) return false
+      const parsed = info.kind === 'chartex' ? parseChartExXml(xml) : parseChartXml(xml, theme)
+      return chartFingerprint(parsed) === info.fingerprint
+    } catch {
+      return false
+    }
+  }
   let baseZip = null, baseTypes = null
   const baseDrawings = new Map()
   const loadBase = async () => {
@@ -1628,7 +1642,7 @@ async function writeChartsToPackage(zip, model, baseBuffer) {
             object = drawing && drawing.objects.find((item) => relFor(item).rel?.resolved === chart.sourcePart)
             ;({ reference, rel } = relFor(object))
           }
-          if (object && reference && rel && baseZip.file(chart.sourcePart)) {
+          if (object && reference && rel && baseZip.file(chart.sourcePart) && await basePartMatches(chart, info)) {
             const copied = new Map()
             const chartPart = await copyPartGraph(baseZip, baseTypes, zip, allocator, types, chart.sourcePart, copied)
             const rId = nextRelationshipId(drawingRels, 'rIdChart')
@@ -1671,6 +1685,10 @@ async function writeChartsToPackage(zip, model, baseBuffer) {
         const id = objectId++
         anchorXml = wrapAnchor(chart.anchor, graphicFrameXml(id, chart.name || `Chart ${id - 1}`, chart.description, rId))
       }
+      if (!anchorXml && chart.type === 'unsupported' && Array.isArray(warnings)) {
+        const label = chart.title || chart.name || chart.unsupportedKind || 'chart'
+        warnings.push(`The ${String(chart.unsupportedKind || 'special')} chart "${label}" on sheet "${sheet.name}" could not be kept because its original chart data is unavailable.`)
+      }
       if (anchorXml) { anchors.push(anchorXml); written += 1 }
     }
     if (!anchors.length) continue
@@ -1702,6 +1720,10 @@ module.exports = {
   renderChartXml,
   chartFingerprint,
   parseXml,
+  workbookSheetParts,
+  readRelationships,
+  relsPathFor,
+  renderRelationships,
   // exposed for QA
   _internal: { insertDrawingElement, absoluteRef, parseRefAreas, drawingObjects, documentElement },
 }

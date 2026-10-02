@@ -1,0 +1,278 @@
+/* Print and Export dialogs: number fields, page range, custom margins and scale, and the
+   collapsed sheet page setup (print area, titles, header/footer, page breaks). Shares the
+   print dialog's tokens and sizes (styles.css .print-control-group). */
+
+.print-control-group input[type="number"],
+.print-control-group input[type="text"],
+.print-settings-grid input[type="number"],
+.print-advanced input[type="text"],
+.print-advanced textarea {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--ink);
+  background: var(--paper);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 450;
+}
+
+.print-control-group input:focus-visible,
+.print-settings-grid input:focus-visible,
+.print-advanced input:focus-visible,
+.print-advanced textarea:focus-visible {
+  outline: 2px solid rgba(63, 98, 78, 0.28);
+  outline-offset: 0;
+  border-color: #8aa596;
+}
+
+.print-control-group input[aria-invalid="true"],
+.print-settings-grid input[aria-invalid="true"] {
+  border-color: #c9787b;
+  background: #fff7f7;
+}
+
+.print-inline-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: end;
+  gap: 10px;
+}
+
+.print-control-group label.print-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  color: var(--ink);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.print-check input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.print-range-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 630;
+}
+
+.print-range-inputs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+}
+
+.print-range-inputs > span,
+.print-fit-by {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.print-margin-fields,
+.print-fit-fields,
+.print-span-field {
+  grid-column: 1 / -1;
+}
+
+.print-margin-fields {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.print-fit-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: end;
+  gap: 7px;
+}
+
+.print-fit-by {
+  padding-bottom: 9px;
+}
+
+/* Collapsed sheet page setup */
+.print-advanced {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+}
+
+.print-advanced > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: var(--ink);
+  font-size: 10.5px;
+  font-weight: 650;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.print-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+
+.print-advanced > summary:hover {
+  background: #f7faf8;
+}
+
+.print-advanced > summary:focus-visible {
+  outline: 2px solid rgba(63, 98, 78, 0.28);
+  outline-offset: -2px;
+}
+
+.print-advanced > summary svg {
+  flex: none;
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.print-advanced[open] > summary svg {
+  transform: rotate(90deg);
+}
+
+.print-advanced-body {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding: 2px 12px 12px;
+  border: 0;
+}
+
+.print-setup-row,
+.print-setup-pair {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.print-setup-pair {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+}
+
+.print-setup-pair label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.print-setup-pair .print-setup-actions {
+  grid-column: 1 / -1;
+}
+
+.print-setup-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 630;
+}
+
+.print-setup-value {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.print-setup-note {
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.print-setup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.print-small-button,
+.print-chip {
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--ink);
+  background: var(--paper);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.print-chip {
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 12px;
+  color: #31523e;
+  background: #f4f7f5;
+}
+
+.print-chip-row {
+  gap: 4px;
+}
+
+.print-small-button:hover:not(:disabled),
+.print-chip:hover:not(:disabled) {
+  border-color: #a7bbb0;
+  background: #f1f5f2;
+}
+
+.print-small-button:disabled,
+.print-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.print-hf-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.print-advanced textarea {
+  height: auto;
+  min-height: 30px;
+  padding: 7px 7px 6px;
+  line-height: 1.3;
+  resize: none;
+  field-sizing: content;
+  max-height: 96px;
+}
+
+/* Export dialog: the same custom fields in its two-column grid */
+.print-settings-grid .print-margin-fields,
+.print-settings-grid .print-fit-fields,
+.print-settings-grid .print-span-field {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.print-settings-grid .print-margin-fields label,
+.print-settings-grid .print-fit-fields label {
+  gap: 6px;
+}

@@ -41,6 +41,18 @@ const SCRIPT_FONTS = [
   { label: 'Lucida Handwriting', family: '"Lucida Handwriting", "Segoe Script", cursive' },
 ]
 
+interface SignatureDraft {
+  mode: CreateMode
+  inkColor: string
+  typedName: string
+  fontFamily: string
+  strokes: Array<Array<{ x: number; y: number }>>
+}
+
+// A signature drawn or typed but not used yet survives closing the panel
+// (Escape, a click outside, Cancel) for the rest of the session.
+let signatureDraft: SignatureDraft | null = null
+
 function readStoredSignatures(): StoredSignature[] {
   try {
     let raw = localStorage.getItem(SIGNATURES_KEY)
@@ -151,15 +163,24 @@ async function importedSignatureCanvas(dataUrl: string) {
 
 export function SignaturePanel({ onUse, onClose }: SignaturePanelProps) {
   const [signatures, setSignatures] = useState<StoredSignature[]>(readStoredSignatures)
-  const [mode, setMode] = useState<CreateMode>('draw')
-  const [inkColor, setInkColor] = useState(INK_COLORS[0].value)
-  const [typedName, setTypedName] = useState('')
-  const [fontFamily, setFontFamily] = useState(SCRIPT_FONTS[0].family)
-  const [hasDrawing, setHasDrawing] = useState(false)
+  const [mode, setMode] = useState<CreateMode>(() => signatureDraft?.mode ?? 'draw')
+  const [inkColor, setInkColor] = useState(() => signatureDraft?.inkColor ?? INK_COLORS[0].value)
+  const [typedName, setTypedName] = useState(() => signatureDraft?.typedName ?? '')
+  const [fontFamily, setFontFamily] = useState(() => signatureDraft?.fontFamily ?? SCRIPT_FONTS[0].family)
+  const [hasDrawing, setHasDrawing] = useState(() => Boolean(signatureDraft?.strokes.length))
   const [createError, setCreateError] = useState('')
   const drawCanvasRef = useRef<HTMLCanvasElement>(null)
-  const strokesRef = useRef<Array<Array<{ x: number; y: number }>>>([])
+  const strokesRef = useRef<Array<Array<{ x: number; y: number }>>>(signatureDraft?.strokes ?? [])
   const typeInputRef = useRef<HTMLInputElement>(null)
+  const draftRef = useRef({ mode, inkColor, typedName, fontFamily })
+  draftRef.current = { mode, inkColor, typedName, fontFamily }
+  // Set once the signature is used: nothing is left to keep.
+  const usedRef = useRef(false)
+
+  useEffect(() => () => {
+    const draft = { ...draftRef.current, strokes: strokesRef.current }
+    signatureDraft = usedRef.current || (!draft.strokes.length && !draft.typedName.trim()) ? null : draft
+  }, [])
 
   function redrawStrokes() {
     const canvas = drawCanvasRef.current
@@ -246,6 +267,7 @@ export function SignaturePanel({ onUse, onClose }: SignaturePanelProps) {
     const next = [stored, ...signatures].slice(0, MAX_SIGNATURES)
     setSignatures(next)
     writeStoredSignatures(next)
+    usedRef.current = true
     onUse(signature)
   }
 

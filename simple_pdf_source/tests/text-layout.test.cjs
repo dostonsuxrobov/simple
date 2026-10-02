@@ -34,7 +34,7 @@ function pdfWriter() {
   const source = fs.readFileSync(entry, 'utf8').split('\nconst gotLock =')[0]
     .replace("import('./text-layout.mjs')", `import(${JSON.stringify(pathToFileURL(path.resolve(__dirname, '../electron/text-layout.mjs')).href)})`)
   const localRequire = createRequire(entry)
-  return Function('require', `${source}\nreturn { flattenOverlays };`)((id) => id === 'electron' ? {} : localRequire(id))
+  return Function('require', `${source}\nreturn { flattenOverlays, flattenOverlaysDetailed };`)((id) => id === 'electron' ? {} : localRequire(id))
 }
 
 async function fixture() {
@@ -90,10 +90,30 @@ test('fitting a much longer native replacement writes one complete line within t
   assert.ok(items.reduce((width, item) => width + item.width, 0) <= edit.rect.width + 2)
 })
 
-test('saving overflowing wrapped text reports the box instead of dropping typed words', async () => {
+test('saving overflowing wrapped text shrinks it into the box, keeps every typed word and reports it', async () => {
   const { data, edit } = await fixture()
-  edit.rect.height = 25
-  await assert.rejects(pdfWriter().flattenOverlays(data, [edit]), /Text on page 1 does not fit its box/)
+  edit.rect.height = 40
+  const { data: output, warnings, failures } = await pdfWriter().flattenOverlaysDetailed(data, [edit])
+  assert.deepEqual(failures, [])
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0].code, 'TEXT_SHRUNK')
+  assert.equal(warnings[0].overlayId, 'replacement')
+  assert.ok(warnings[0].fontSize < 24 && warnings[0].fontSize >= 6)
+  const items = (await savedText(output)).filter((item) => item.str && item.str !== 'SOURCE')
+  assert.equal(items.map((item) => item.str).join('').replace(/\s+/g, ''), edit.text.replace(/\s+/g, ''))
+  const lowestBaseline = Math.min(...items.map((item) => item.transform[5]))
+  assert.ok(lowestBaseline >= edit.rect.y - 0.5, 'every line stays inside the box')
+  // Callers without a problem report still get the fitted file.
+  assert.ok((await pdfWriter().flattenOverlays(data, [edit])) instanceof Uint8Array)
+})
+
+test('text too long even at the smallest size runs past its box instead of failing the save', async () => {
+  const { data, edit } = await fixture()
+  edit.rect.height = 4
+  const { data: output, warnings } = await pdfWriter().flattenOverlaysDetailed(data, [edit])
+  assert.equal(warnings[0].code, 'TEXT_OVERFLOW')
+  const items = (await savedText(output)).filter((item) => item.str && item.str !== 'SOURCE')
+  assert.equal(items.map((item) => item.str).join('').replace(/\s+/g, ''), edit.text.replace(/\s+/g, ''))
 })
 
 test('a native baseline below its selection box can be saved and exported', async () => {

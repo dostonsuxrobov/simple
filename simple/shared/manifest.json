@@ -1,0 +1,186 @@
+{
+  "schemaVersion": 1,
+  "header": "// Vendored from simple/shared/{source} by simple/scripts/sync-shared.cjs. Do not edit here.",
+  "destinations": {
+    "electron": "electron/simple-io",
+    "renderer": "src/simple-io"
+  },
+  "preloadBlock": {
+    "source": "preload/io-bridge.cjs",
+    "file": "electron/preload.cjs",
+    "begin": "// <simple-io-bridge v1>",
+    "end": "// </simple-io-bridge>"
+  },
+  "sameBytes": [
+    [
+      "electron/io-catalog.json",
+      "renderer/io-catalog.json"
+    ]
+  ],
+  "workspaces": {
+    "pdf": {
+      "folder": "simple_pdf_source",
+      "enabled": true,
+      "electron": [
+        "electron/io-core.cjs",
+        "electron/safe-write.cjs",
+        "electron/validators.cjs",
+        "electron/formats.cjs",
+        "electron/formats.json",
+        "electron/text-codec.cjs",
+        "electron/io-dialogs.cjs",
+        "electron/io-catalog.json",
+        "electron/document-guard.cjs",
+        "electron/stores.cjs",
+        "electron/office-engine.cjs",
+        "electron/html-to-pdf.cjs",
+        "electron/io-ipc.cjs"
+      ],
+      "renderer": [
+        "renderer/document-session.ts",
+        "renderer/io-client.ts",
+        "renderer/export-model.ts",
+        "renderer/io-catalog.json"
+      ],
+      "preload": true,
+      "wiring": [
+        {
+          "call": "registerSharedIo(",
+          "when": "electron/io-ipc.cjs"
+        },
+        {
+          "call": "installWindowGuard(",
+          "when": "electron/document-guard.cjs"
+        }
+      ]
+    },
+    "calc": {
+      "folder": "simple_calc_source",
+      "enabled": true,
+      "electron": [
+        "electron/io-core.cjs",
+        "electron/safe-write.cjs",
+        "electron/validators.cjs",
+        "electron/formats.cjs",
+        "electron/formats.json",
+        "electron/text-codec.cjs",
+        "electron/io-dialogs.cjs",
+        "electron/io-catalog.json",
+        "electron/document-guard.cjs",
+        "electron/stores.cjs",
+        "electron/office-engine.cjs",
+        "electron/html-to-pdf.cjs",
+        "electron/io-ipc.cjs"
+      ],
+      "renderer": [
+        "renderer/document-session.ts",
+        "renderer/io-client.ts",
+        "renderer/export-model.ts",
+        "renderer/io-catalog.json"
+      ],
+      "preload": true,
+      "wiring": [
+        {
+          "call": "registerSharedIo(",
+          "when": "electron/io-ipc.cjs"
+        },
+        {
+          "call": "installWindowGuard(",
+          "when": "electron/document-guard.cjs"
+        }
+      ]
+    },
+    "docs": {
+      "folder": "simple_doc_source",
+      "enabled": true,
+      "electron": [
+        "electron/io-core.cjs",
+        "electron/safe-write.cjs",
+        "electron/validators.cjs",
+        "electron/formats.cjs",
+        "electron/formats.json",
+        "electron/text-codec.cjs",
+        "electron/io-dialogs.cjs",
+        "electron/io-catalog.json",
+        "electron/document-guard.cjs",
+        "electron/stores.cjs",
+        "electron/office-engine.cjs",
+        "electron/io-ipc.cjs"
+      ],
+      "renderer": [
+        "renderer/document-session.ts",
+        "renderer/io-client.ts",
+        "renderer/export-model.ts",
+        "renderer/io-catalog.json"
+      ],
+      "preload": true,
+      "wiring": [
+        {
+          "call": "registerSharedIo(",
+          "when": "electron/io-ipc.cjs"
+        },
+        {
+          "call": "installWindowGuard(",
+          "when": "electron/document-guard.cjs"
+        }
+      ]
+    },
+    "image": {
+      "folder": "simple_image_source",
+      "enabled": true,
+      "electron": [
+        "electron/io-core.cjs",
+        "electron/safe-write.cjs",
+        "electron/validators.cjs",
+        "electron/formats.cjs",
+        "electron/formats.json",
+        "electron/text-codec.cjs",
+        "electron/io-dialogs.cjs",
+        "electron/io-catalog.json",
+        "electron/document-guard.cjs",
+        "electron/stores.cjs",
+        "electron/io-ipc.cjs"
+      ],
+      "renderer": [
+        "renderer/document-session.ts",
+        "renderer/io-client.ts",
+        "renderer/export-model.ts",
+        "renderer/io-catalog.json"
+      ],
+      "preload": true,
+      "wiring": [
+        {
+          "call": "registerSharedIo(",
+          "when": "electron/io-ipc.cjs"
+        },
+        {
+          "call": "installWindowGuard(",
+          "when": "electron/document-guard.cjs"
+        }
+      ]
+    },
+    "video": {
+      "folder": "simple_video_source",
+      "enabled": false,
+      "electron": [
+        "electron/io-core.cjs",
+        "electron/safe-write.cjs",
+        "electron/validators.cjs",
+        "electron/formats.cjs",
+        "electron/formats.json",
+        "electron/text-codec.cjs",
+        "electron/io-dialogs.cjs",
+        "electron/io-catalog.json",
+        "electron/io-ipc.cjs"
+      ],
+      "renderer": [],
+      "preload": true,
+      "wiring": [
+        {
+          "call": "registerSharedIo(",
+          "when": "electron/io-ipc.cjs"
+        }
+      ]
+    }
+  }
+}

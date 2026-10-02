@@ -3,7 +3,11 @@ import { SSF } from "xlsx";
 /** Values a cell resolver may return to the formula engine. */
 export type FormulaPrimitive = number | string | boolean | Date | null | undefined;
 
-/** Spreadsheet errors returned by the evaluator. */
+/**
+ * Spreadsheet errors returned by the evaluator. `#PARSE!` is only recognised (values saved by
+ * older versions); the evaluator reports a formula it cannot read with an Excel error such as
+ * `#NAME?` and `diagnoseFormula` explains why.
+ */
 export type FormulaError =
   | "#NULL!"
   | "#DIV/0!"
@@ -87,6 +91,20 @@ export interface FormulaEvaluationHooks {
   getSheetNames?: () => string[];
   /** Resolve a sheet reference (id or name) to its display name. */
   getSheetName?: (sheetId: string) => string | null;
+  /**
+   * The resolver returns finished cell values, never formula text. A text value that starts
+   * with "=" (an apostrophe entry, imported text, a FORMULATEXT result) then stays text instead
+   * of being evaluated as a formula.
+   */
+  resolverReturnsValues?: boolean;
+  /**
+   * Evaluate as a pre-dynamic-array ("legacy") formula, which is what a plain formula stored in
+   * a workbook file means to Excel: a range reference in a single-value position (an operator
+   * operand, a scalar function argument, IF's condition, ...) is implicitly intersected with the
+   * formula's row or column, and an array result is reduced to one value instead of spilling.
+   * Array-argument functions such as SUMPRODUCT still receive whole arrays.
+   */
+  implicitIntersection?: boolean;
 }
 
 /** One-based bounds of an Excel table and its column names. */
@@ -259,10 +277,17 @@ function structuredBlockEnd(source: string, start: number): number | null {
   return null;
 }
 
+/**
+ * A formula the parser cannot read. `formulaError` is the Excel error the formula evaluates to
+ * (#NAME? for syntax problems, #REF! for impossible references, #NUM! for numbers out of range,
+ * #VALUE! for ragged array constants); `position` is the offset in the formula body.
+ */
 class FormulaParseError extends Error {
   constructor(
-    readonly formulaError: FormulaError = "#PARSE!",
-    message = "Invalid formula",
+    readonly formulaError: FormulaError = "#NAME?",
+    message = "There's a problem with this formula.",
+    readonly position = 0,
+    readonly length = 0,
   ) {
     super(message);
   }
@@ -275,7 +300,9 @@ function nextNonWhitespace(source: string, start: number): string {
 }
 
 function tokenize(source: string): Token[] {
-  if (source.length > MAX_FORMULA_LENGTH) throw new FormulaParseError();
+  if (source.length > MAX_FORMULA_LENGTH) {
+    throw new FormulaParseError("#VALUE!", "This formula is too long.", MAX_FORMULA_LENGTH);
+  }
 
   const tokens: Token[] = [];
   let position = 0;
@@ -305,7 +332,9 @@ function tokenize(source: string): Token[] {
           break;
         }
       }
-      if (!closed) throw new FormulaParseError();
+      if (!closed) {
+        throw new FormulaParseError("#NAME?", "Some text is missing its closing quotation mark (\").", start, source.length - start);
+      }
       tokens.push({ kind: "string", text: source.slice(start, position), value, position: start });
       continue;
     }
@@ -328,7 +357,9 @@ function tokenize(source: string): Token[] {
           break;
         }
       }
-      if (!closed) throw new FormulaParseError();
+      if (!closed) {
+        throw new FormulaParseError("#REF!", "A sheet name is missing its closing apostrophe (').", start, source.length - start);
+      }
       tokens.push({ kind: "sheet", text: source.slice(start, position), value, position: start });
       continue;
     }
@@ -348,7 +379,9 @@ function tokenize(source: string): Token[] {
     );
     if (numberMatch) {
       const value = Number(numberMatch[0]);
-      if (!Number.isFinite(value)) throw new FormulaParseError("#NUM!");
+      if (!Number.isFinite(value)) {
+        throw new FormulaParseError("#NUM!", `The number ${numberMatch[0]} is too large.`, position, numberMatch[0].length);
+      }
       tokens.push({ kind: "number", text: numberMatch[0], value, position });
       position += numberMatch[0].length;
       continue;
@@ -357,7 +390,10 @@ function tokenize(source: string): Token[] {
     if (character === "#") {
       const errorMatch = /^#[A-Za-z0-9/]+[!?]?/.exec(source.slice(position));
       const text = errorMatch?.[0].toUpperCase();
-      if (!text || !isFormulaError(text)) throw new FormulaParseError();
+      if (!text || !isFormulaError(text) || text === "#PARSE!") {
+        const shown = errorMatch?.[0] ?? "#";
+        throw new FormulaParseError("#NAME?", `${shown} isn't an error value this app knows.`, position, shown.length);
+      }
       tokens.push({ kind: "error", text, value: text, position });
       position += errorMatch![0].length;
       continue;
@@ -400,7 +436,9 @@ function tokenize(source: string): Token[] {
       const end = position + identifierMatch[0].length;
       if (source[end] === "[") {
         const blockEnd = structuredBlockEnd(source, end);
-        if (blockEnd === null) throw new FormulaParseError();
+        if (blockEnd === null) {
+          throw new FormulaParseError("#REF!", "A table reference is missing its closing bracket (]).", end, source.length - end);
+        }
         tokens.push({
           kind: "structured",
           text: source.slice(position, blockEnd),
@@ -423,7 +461,9 @@ function tokenize(source: string): Token[] {
 
     if (character === "[") {
       const blockEnd = structuredBlockEnd(source, position);
-      if (blockEnd === null) throw new FormulaParseError();
+      if (blockEnd === null) {
+        throw new FormulaParseError("#REF!", "A table reference is missing its closing bracket (]).", position, source.length - position);
+      }
       tokens.push({
         kind: "structured",
         text: source.slice(position, blockEnd),
@@ -464,7 +504,7 @@ function tokenize(source: string): Token[] {
       continue;
     }
 
-    throw new FormulaParseError();
+    throw new FormulaParseError("#NAME?", `The character ${character} can't be used here.`, position, 1);
   }
 
   tokens.push({ kind: "eof", text: "", position: source.length });
@@ -590,9 +630,37 @@ class FormulaParser {
   constructor(private readonly tokens: Token[]) {}
 
   parse(): FormulaNode {
+    if (this.atEnd()) throw new FormulaParseError("#NAME?", "The formula is empty.", this.current.position);
     const expression = this.parseComparison();
-    if (this.current.kind !== "eof") throw new FormulaParseError();
+    if (!this.atEnd()) throw this.unexpected();
     return expression;
+  }
+
+  private atEnd(): boolean {
+    return this.current.kind === "eof";
+  }
+
+  /** The error for a token the grammar does not allow at this point. */
+  private unexpected(): FormulaParseError {
+    const token = this.current;
+    if (token.kind === "eof") {
+      return new FormulaParseError("#NAME?", "The formula ends too soon: a value or a closing parenthesis is missing.", token.position);
+    }
+    if (token.kind === "rightParen") {
+      return new FormulaParseError("#NAME?", "There's an extra closing parenthesis.", token.position, 1);
+    }
+    if (token.kind === "operator") {
+      return new FormulaParseError("#NAME?", `The ${token.text} operator needs a value on both sides.`, token.position, token.text.length);
+    }
+    return new FormulaParseError("#NAME?", `Unexpected ${token.text} in the formula.`, token.position, token.text.length);
+  }
+
+  private expectClosingParenthesis(opening: number): void {
+    if (this.match("rightParen")) return;
+    if (this.current.kind === "eof") {
+      throw new FormulaParseError("#NAME?", "A closing parenthesis is missing.", opening, this.current.position - opening);
+    }
+    throw this.unexpected();
   }
 
   private get current(): Token {
@@ -647,31 +715,30 @@ class FormulaParser {
   }
 
   private parseMultiplicative(): FormulaNode {
-    let node = this.parseUnary();
+    let node = this.parsePower();
     while (this.current.kind === "operator" && ["*", "/"].includes(this.current.text)) {
       const operator = this.advance().text;
-      node = { kind: "binary", operator, left: node, right: this.parseUnary() };
+      node = { kind: "binary", operator, left: node, right: this.parsePower() };
+    }
+    return node;
+  }
+
+  // Excel precedence: negation binds tighter than "^" (=-2^2 is 4) and "^" groups from the
+  // left (=2^3^2 is 64); an exponent may itself be negated (=2^-2).
+  private parsePower(): FormulaNode {
+    let node = this.parseUnary();
+    while (this.match("operator", "^")) {
+      node = { kind: "binary", operator: "^", left: node, right: this.parseUnary() };
     }
     return node;
   }
 
   private parseUnary(): FormulaNode {
-    if (this.current.kind === "operator" && ["+", "-"].includes(this.current.text)) {
-      const operator = this.advance().text as "+" | "-";
+    if (this.current.kind === "operator" && ["+", "-", "@"].includes(this.current.text)) {
+      const operator = this.advance().text as "+" | "-" | "@";
       return { kind: "unary", operator, operand: this.parseUnary() };
     }
-    if (this.match("operator", "@")) {
-      return { kind: "unary", operator: "@", operand: this.parseUnary() };
-    }
-    return this.parsePower();
-  }
-
-  private parsePower(): FormulaNode {
-    let node = this.parsePostfix();
-    if (this.match("operator", "^")) {
-      node = { kind: "binary", operator: "^", left: node, right: this.parseUnary() };
-    }
-    return node;
+    return this.parsePostfix();
   }
 
   private parsePostfix(): FormulaNode {
@@ -732,21 +799,22 @@ class FormulaParser {
       return this.withRangeOperator({ kind: "name", name: text });
     }
 
-    if (this.match("leftParen")) {
+    if (this.current.kind === "leftParen") {
+      const opening = this.advance().position;
       const expression = this.parseComparison();
-      if (!this.match("rightParen")) throw new FormulaParseError();
+      this.expectClosingParenthesis(opening);
       return this.withInvocations(expression);
     }
 
-    throw new FormulaParseError();
+    throw this.unexpected();
   }
 
   /** `LAMBDA(x, x + 1)(2)` and `(LAMBDA(x, x))(1)` call a computed function value. */
   private withInvocations(node: FormulaNode): FormulaNode {
     let current = node;
     while (this.current.kind === "leftParen") {
-      this.advance();
-      const args = this.parseArgumentList();
+      const opening = this.advance().position;
+      const args = this.parseArgumentList(opening);
       current = { kind: "invoke", callee: current, arguments: args };
     }
     return current;
@@ -775,15 +843,16 @@ class FormulaParser {
     if (this.current.kind === "identifier") {
       return { kind: "name", name: String(this.advance().value) };
     }
-    if (this.match("leftParen")) {
+    if (this.current.kind === "leftParen") {
+      const opening = this.advance().position;
       const expression = this.parseComparison();
-      if (!this.match("rightParen")) throw new FormulaParseError();
+      this.expectClosingParenthesis(opening);
       return expression;
     }
-    throw new FormulaParseError("#REF!");
+    throw new FormulaParseError("#REF!", "A range needs a cell reference after the colon (:).", this.current.position, this.current.text.length);
   }
 
-  private parseArgumentList(): FormulaNode[] {
+  private parseArgumentList(opening: number): FormulaNode[] {
     const args: FormulaNode[] = [];
     if (!this.match("rightParen")) {
       do {
@@ -791,32 +860,38 @@ class FormulaParser {
         if (kind === "comma" || kind === "semicolon" || kind === "rightParen") args.push({ kind: "omitted" });
         else args.push(this.parseComparison());
       } while (this.match("comma") || this.match("semicolon"));
-      if (!this.match("rightParen")) throw new FormulaParseError();
+      this.expectClosingParenthesis(opening);
     }
     return args;
   }
 
   private parseCall(): CallNode {
     const name = String(this.advance().value);
-    if (!this.match("leftParen")) throw new FormulaParseError();
-    return { kind: "call", name, arguments: this.parseArgumentList() };
+    const opening = this.current.position;
+    if (!this.match("leftParen")) throw this.unexpected();
+    return { kind: "call", name, arguments: this.parseArgumentList(opening) };
   }
 
   private parseArray(): ArrayNode {
-    this.advance();
+    const opening = this.advance().position;
+    if (this.current.kind === "rightBrace") {
+      throw new FormulaParseError("#NAME?", "An array constant needs at least one value between { and }.", opening, this.current.position - opening + 1);
+    }
     const rows: EvaluationScalar[][] = [[this.parseArrayElement()]];
     while (!this.match("rightBrace")) {
       if (this.match("comma")) {
         rows[rows.length - 1].push(this.parseArrayElement());
       } else if (this.match("semicolon")) {
         rows.push([this.parseArrayElement()]);
+      } else if (this.current.kind === "eof") {
+        throw new FormulaParseError("#NAME?", "An array constant is missing its closing brace (}).", opening, this.current.position - opening);
       } else {
-        throw new FormulaParseError();
+        throw this.unexpected();
       }
     }
     const columnCount = rows[0].length;
     if (rows.some((row) => row.length !== columnCount)) {
-      throw new FormulaParseError("#VALUE!");
+      throw new FormulaParseError("#VALUE!", "Every row of an array constant needs the same number of values.", opening);
     }
     const values: EvaluationScalar[] = [];
     for (const row of rows) values.push(...row);
@@ -832,21 +907,28 @@ class FormulaParser {
       const value = this.advance().value as number;
       return negative ? -value : value;
     }
-    if (negative) throw new FormulaParseError();
-    if (this.current.kind === "string") {
+    if (this.current.kind === "string" && !negative) {
       return this.advance().value as string;
     }
-    if (this.current.kind === "error") {
+    if (this.current.kind === "error" && !negative) {
       return evaluationError(this.advance().value as FormulaError);
     }
-    if (this.current.kind === "identifier") {
+    if (this.current.kind === "identifier" && !negative) {
       const name = String(this.current.value).toUpperCase();
       if (name === "TRUE" || name === "FALSE") {
         this.advance();
         return name === "TRUE";
       }
     }
-    throw new FormulaParseError();
+    if (this.current.kind === "eof") {
+      throw new FormulaParseError("#NAME?", "An array constant is missing its closing brace (}).", this.current.position);
+    }
+    throw new FormulaParseError(
+      "#NAME?",
+      "An array constant can only hold numbers, text, TRUE/FALSE, or error values.",
+      this.current.position,
+      this.current.text.length,
+    );
   }
 
   private parseReference(): ReferenceNode | WholeRangeNode | SpillNode | null {
@@ -864,18 +946,22 @@ class FormulaParser {
     }
 
     if (this.current.kind === "spill") {
-      const address = parseA1Address(String(this.advance().value));
-      if (!address) throw new FormulaParseError("#REF!");
+      const token = this.advance();
+      const address = parseA1Address(String(token.value));
+      if (!address) throw new FormulaParseError("#REF!", `${token.text} is outside the sheet.`, token.position, token.text.length);
       return { kind: "spill", sheet, address };
     }
 
     if (this.current.kind !== "cell") {
-      if (sheet !== undefined) throw new FormulaParseError("#REF!");
+      if (sheet !== undefined) {
+        throw new FormulaParseError("#REF!", "A sheet name must be followed by a cell or range reference.", this.current.position, this.current.text.length);
+      }
       return null;
     }
 
-    const address = parseA1Address(String(this.advance().value));
-    if (!address) throw new FormulaParseError("#REF!");
+    const token = this.advance();
+    const address = parseA1Address(String(token.value));
+    if (!address) throw new FormulaParseError("#REF!", `${token.text} is outside the sheet.`, token.position, token.text.length);
     return { kind: "reference", sheet, address };
   }
 
@@ -885,7 +971,9 @@ class FormulaParser {
     if (token.kind === "columnRange") {
       const first = columnLabelToNumber(firstText.replace("$", ""));
       const second = columnLabelToNumber(secondText.replace("$", ""));
-      if (first === null || second === null) throw new FormulaParseError("#REF!");
+      if (first === null || second === null) {
+        throw new FormulaParseError("#REF!", `${token.text} is outside the sheet.`, token.position, token.text.length);
+      }
       return {
         kind: "wholeRange",
         sheet,
@@ -902,7 +990,7 @@ class FormulaParser {
       first > MAX_EXCEL_ROW ||
       second > MAX_EXCEL_ROW
     ) {
-      throw new FormulaParseError("#REF!");
+      throw new FormulaParseError("#REF!", `${token.text} is outside the sheet.`, token.position, token.text.length);
     }
     return {
       kind: "wholeRange",
@@ -959,6 +1047,15 @@ interface EvaluationContext {
   scope: EvaluationScope | null;
   /** Sheet/cell the top-level formula belongs to (for [@Column], ROW(), implicit intersection). */
   formulaSheetId: string;
+  /** A legacy (pre-dynamic-array) formula: references in value positions are intersected. */
+  legacy: boolean;
+  /** Nesting depth of array-argument functions (SUMPRODUCT, ...) that suspend intersection. */
+  arrayContext: number;
+  /**
+   * Set when a multi-cell reference reached a single-value position outside array arguments
+   * (SUM(A1:A3*2)): a legacy formula would have intersected it there.
+   */
+  usedArrayEvaluation: boolean;
 }
 
 export function evaluationError(code: FormulaError): EvaluationError {
@@ -983,9 +1080,7 @@ export function isLambdaValue(value: unknown): value is LambdaValue {
 }
 
 export function localDateToExcelSerial(date: Date): number {
-  const day =
-    (Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) - EXCEL_EPOCH_UTC) /
-    MILLISECONDS_PER_DAY;
+  const day = excelSerialFromUtcTime(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
   const fraction =
     (date.getHours() * 3_600_000 +
       date.getMinutes() * 60_000 +
@@ -1017,9 +1112,20 @@ export function toNumber(value: EvaluationValue): number | EvaluationError {
   if (typeof value === "boolean") return value ? 1 : 0;
   const trimmed = value.trim();
   if (trimmed === "") return 0;
-  const number = Number(trimmed);
-  if (Number.isFinite(number)) return number;
-  // Excel coerces numeric-looking text such as "$1,200", "15%", and dates in arithmetic.
+  const converted = numberFromText(trimmed);
+  return converted !== null ? converted : evaluationError("#VALUE!");
+}
+
+/**
+ * The number Excel reads from text in arithmetic and VALUE(): plain numbers, "$1,200",
+ * "-$5", "15%", "(5)", dates, times, and date-times. Hexadecimal and similar JavaScript
+ * spellings are not numbers. Returns null for other text.
+ */
+export function numberFromText(text: string): number | null {
+  const trimmed = text.trim();
+  if (trimmed === "") return null;
+  const plain = numericTextValue(trimmed);
+  if (plain !== null) return plain;
   const invariant = parseInvariantValue(trimmed);
   if (invariant !== null) return invariant;
   const date = parseDatePrefix(trimmed);
@@ -1028,8 +1134,7 @@ export function toNumber(value: EvaluationValue): number | EvaluationError {
     const time = parseTimeOfDay(date.rest);
     if (time !== null) return date.serial + time;
   }
-  const time = parseTimeOfDay(trimmed);
-  return time !== null ? time : evaluationError("#VALUE!");
+  return parseTimeOfDay(trimmed);
 }
 
 export function toBoolean(value: EvaluationValue): boolean | EvaluationError {
@@ -1197,7 +1302,7 @@ function applyScalarBinaryOperator(
     if (leftNumber === 0 && rightNumber < 0) return evaluationError("#DIV/0!");
     result = leftNumber ** rightNumber;
   } else {
-    return evaluationError("#PARSE!");
+    return evaluationError("#VALUE!");
   }
 
   return Number.isFinite(result) ? result : evaluationError("#NUM!");
@@ -1235,7 +1340,8 @@ function resolveReference(
   try {
     const resolved = context.resolver(sheetId, address);
     if (resolved instanceof Date || resolved === null || typeof resolved !== "object") {
-      if (typeof resolved === "string" && resolved.startsWith("=")) {
+      // Hosts that hand back finished values (the calculation engine) mean "=..." as text.
+      if (typeof resolved === "string" && resolved.startsWith("=") && !context.hooks.resolverReturnsValues) {
         value = evaluateFormulaText(resolved, sheetId, context);
       } else if (isFormulaError(resolved)) {
         value = evaluationError(resolved);
@@ -1619,18 +1725,57 @@ export function wildcardSearchPosition(value: string, pattern: string): number |
   return evaluationError("#VALUE!");
 }
 
+type CriterionOperator = "=" | "<>" | "<" | ">" | "<=" | ">=";
+
+/**
+ * Read the operand of a COUNTIF/SUMIFS/database criterion the way Excel reads typed input:
+ * numbers, "1,000", "50%", "$1", "(5)", dates, times and date-times compare as numbers,
+ * TRUE/FALSE as logicals and "#N/A"-style text as error values. Anything else stays text
+ * (and may hold * ? ~ wildcards).
+ */
+export function criterionOperandValue(text: string): number | boolean | string | EvaluationError {
+  const trimmed = text.trim();
+  if (trimmed === "") return text;
+  const upper = trimmed.toUpperCase();
+  if (upper === "TRUE" || upper === "FALSE") return upper === "TRUE";
+  if (isFormulaError(upper) && upper !== "#PARSE!") return evaluationError(upper);
+  const number = numberFromText(trimmed);
+  return number !== null ? number : text;
+}
+
+function criterionComparison(operator: CriterionOperator, comparison: number): boolean {
+  if (operator === "=") return comparison === 0;
+  if (operator === "<>") return comparison !== 0;
+  if (operator === "<") return comparison < 0;
+  if (operator === ">") return comparison > 0;
+  if (operator === "<=") return comparison <= 0;
+  return comparison >= 0;
+}
+
+function compareCriterionText(left: string, right: string): number {
+  const a = left.toLocaleLowerCase();
+  const b = right.toLocaleLowerCase();
+  return a === b ? 0 : a < b ? -1 : 1;
+}
+
+/**
+ * Order of a cell value against a typed criterion operand, or null when Excel never compares
+ * the two: numbers only compare with numbers (plain numeric text counts for = and <>), logicals
+ * with logicals, and text with text, so `"<m"` never matches a number or a blank cell.
+ */
 export function compareCriterionValue(
   value: EvaluationScalar,
   operand: EvaluationScalar,
+  equality = true,
 ): number | null | EvaluationError {
-  if (isEvaluationError(value)) return value;
   if (isEvaluationError(operand)) return operand;
+  if (isEvaluationError(value)) return null;
 
   if (typeof operand === "number") {
     const candidate =
       typeof value === "number"
         ? value
-        : typeof value === "string"
+        : typeof value === "string" && equality
           ? numericTextValue(value)
           : null;
     if (candidate === null) return null;
@@ -1642,11 +1787,8 @@ export function compareCriterionValue(
     return value === operand ? 0 : value ? 1 : -1;
   }
 
-  const leftText = value === null ? "" : typeof value === "boolean" ? (value ? "TRUE" : "FALSE") : String(value);
-  const rightText = operand === null ? "" : String(operand);
-  const left = leftText.toLocaleLowerCase();
-  const right = rightText.toLocaleLowerCase();
-  return left === right ? 0 : left < right ? -1 : 1;
+  if (typeof value !== "string") return null;
+  return compareCriterionText(value, operand === null ? "" : String(operand));
 }
 
 export type CriterionTest = (
@@ -1658,43 +1800,47 @@ export function createCriterionTest(
 ): CriterionTest | EvaluationError {
   if (isEvaluationError(criterion)) return criterion;
 
-  let operator = "=";
-  let operand: EvaluationScalar = criterion;
-  let wildcard: WildcardToken[] | null = null;
-  const wildcardWork = { steps: 0 };
+  let operator: CriterionOperator = "=";
+  // A reference to an empty cell is the criterion 0 (Excel's COUNTIFS rule).
+  let operand: number | boolean | string | EvaluationError = criterion === null ? 0 : criterion;
   if (typeof criterion === "string") {
     const match = /^(<=|>=|<>|=|<|>)([\s\S]*)$/.exec(criterion);
-    if (match) {
-      operator = match[1];
-      operand = match[2];
-    }
-
-    const operandText = String(operand);
-    const numericOperand = numericTextValue(operandText);
-    if (numericOperand !== null) operand = numericOperand;
-    else if (operator === "=" || operator === "<>") {
-      wildcard = wildcardTokens(operandText, true);
-    }
+    if (match) operator = match[1] as CriterionOperator;
+    operand = criterionOperandValue(match ? match[2] : criterion);
   }
+  const equality = operator === "=" || operator === "<>";
+  const wildcard =
+    typeof operand === "string" && operand !== "" && equality ? wildcardTokens(operand, true) : null;
 
   return (value: EvaluationScalar): boolean | EvaluationError => {
-    if (isEvaluationError(value)) return value;
+    // Error values only match an error criterion ("#N/A"); "<>x" counts them as different.
+    if (isEvaluationError(operand)) {
+      const same = isEvaluationError(value) && value.code === operand.code;
+      return operator === "=" ? same : operator === "<>" ? !same : false;
+    }
+    if (isEvaluationError(value)) return operator === "<>";
+
+    if (operand === "") {
+      // "" / "=" match empty cells, "<>" non-empty ones.
+      const empty = value === null || value === "";
+      if (operator === "=") return empty;
+      if (operator === "<>") return !empty;
+      return typeof value === "string" && criterionComparison(operator, compareCriterionText(value, ""));
+    }
+
     if (wildcard) {
-      const text = value === null ? "" : typeof value === "boolean" ? (value ? "TRUE" : "FALSE") : String(value);
-      const matches = wildcardMatches(text, wildcard, true, wildcardWork);
+      // Wildcard text only ever matches text cells.
+      if (typeof value !== "string") return operator === "<>";
+      // The step limit applies to each cell, never to the whole range.
+      const matches = wildcardMatches(value, wildcard, true);
       if (matches === null) return evaluationError("#VALUE!");
       return operator === "<>" ? !matches : matches;
     }
 
-    const comparison = compareCriterionValue(value, operand);
+    const comparison = compareCriterionValue(value, operand, equality);
     if (isEvaluationError(comparison)) return comparison;
     if (comparison === null) return operator === "<>";
-    if (operator === "=") return comparison === 0;
-    if (operator === "<>") return comparison !== 0;
-    if (operator === "<") return comparison < 0;
-    if (operator === ">") return comparison > 0;
-    if (operator === "<=") return comparison <= 0;
-    return comparison >= 0;
+    return criterionComparison(operator, comparison);
   };
 }
 
@@ -1864,6 +2010,12 @@ export function parseInvariantValue(value: string): number | null {
     source = source.slice(1, -1).trim();
   }
 
+  // A sign may come before the currency symbol: "-$5", "+€12".
+  const signedCurrency = /^([+-])\s*(?=[\$£€¥₹])/.exec(source);
+  if (signedCurrency) {
+    if (signedCurrency[1] === "-") sign = -sign;
+    source = source.slice(signedCurrency[0].length);
+  }
   source = source.replace(/^[\$£€¥₹]\s*/, "");
   let divisor = 1;
   if (source.endsWith("%")) {
@@ -1883,15 +2035,70 @@ export function parseInvariantValue(value: string): number | null {
   return Number.isFinite(result) ? result : null;
 }
 
+// ---- Excel's 1900 date system -----------------------------------------------------------------
+// Serial 1 is 1900-01-01 and Excel counts a nonexistent 1900-02-29 as serial 60 (Lotus 1-2-3
+// compatibility), so from 1900-03-01 (serial 61) on, serials are plain day counts from
+// 1899-12-30, while earlier dates are one less. Serial 0 displays as 1900-01-00.
+
+/** First serial on which Excel's calendar and the real calendar agree (1900-03-01). */
+const FIRST_ALIGNED_SERIAL = 61;
+
+/**
+ * Excel serial of a UTC instant (milliseconds), with Excel's 1900 leap-day offset. A time on
+ * 1899-12-30 (how file libraries hand over time-only values) stays a time of day.
+ */
+export function excelSerialFromUtcTime(milliseconds: number): number {
+  const days = (milliseconds - EXCEL_EPOCH_UTC) / MILLISECONDS_PER_DAY;
+  return days >= 1 && days < FIRST_ALIGNED_SERIAL ? days - 1 : days;
+}
+
+/** Days in a month of Excel's calendar (February 1900 has 29 days). */
+export function excelDaysInMonth(year: number, month: number): number {
+  if (year === 1900 && month === 2) return 29;
+  return daysInUtcMonth(year, month - 1) ?? 31;
+}
+
+/**
+ * Calendar parts of an Excel serial's whole day, including 1900-01-00 (serial 0) and
+ * 1900-02-29 (serial 60). Null for negative or non-finite serials.
+ */
+export function excelDateParts(serial: number): { year: number; month: number; day: number } | null {
+  if (!Number.isFinite(serial)) return null;
+  const whole = Math.floor(serial);
+  if (whole < 0) return null;
+  if (whole === 0) return { year: 1900, month: 1, day: 0 };
+  if (whole === 60) return { year: 1900, month: 2, day: 29 };
+  const date = new Date(EXCEL_EPOCH_UTC + (whole < 60 ? whole + 1 : whole) * MILLISECONDS_PER_DAY);
+  if (!Number.isFinite(date.getTime())) return null;
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
+}
+
+/**
+ * The serial DATE(year, month, day) gives for a full year: months and days roll over through
+ * Excel's calendar, so DATE(1900,2,29) and DATE(1900,3,0) are both 60. Null when not finite.
+ */
+export function excelSerialFromParts(year: number, month: number, day: number): number | null {
+  const first = createUtcDate(year, month - 1, 1);
+  if (!first) return null;
+  const serial = excelSerialFromUtcTime(first.getTime()) + day - 1;
+  return Number.isFinite(serial) ? serial : null;
+}
+
+/**
+ * A calendar date for a serial, for calculations that need a JavaScript Date. Serials before
+ * 1900-03-01 map to their Excel calendar day (serial 60, which has no real date, maps to
+ * 1900-02-28); use excelDateParts when the exact Excel day matters.
+ */
 export function utcDateFromSerial(serial: number): Date | null {
   if (!Number.isFinite(serial)) return null;
-  const milliseconds = EXCEL_EPOCH_UTC + Math.floor(serial) * MILLISECONDS_PER_DAY;
-  const date = new Date(milliseconds);
+  const whole = Math.floor(serial);
+  const days = whole >= 0 && whole < 60 ? whole + 1 : whole;
+  const date = new Date(EXCEL_EPOCH_UTC + days * MILLISECONDS_PER_DAY);
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
 export function serialFromUtcDate(date: Date): number | EvaluationError {
-  const serial = (date.getTime() - EXCEL_EPOCH_UTC) / MILLISECONDS_PER_DAY;
+  const serial = excelSerialFromUtcTime(date.getTime());
   return Number.isFinite(serial) ? serial : evaluationError("#NUM!");
 }
 
@@ -1929,12 +2136,35 @@ export function lookupComparison(
   return left === right ? 0 : left < right ? -1 : 1;
 }
 
+/** Whether text holds an unescaped * or ? wildcard, or a ~ escape. */
+export function hasWildcard(text: string): boolean {
+  return /[*?~]/.test(text);
+}
+
+/**
+ * Position of a lookup value among candidates. Exact mode (0) treats * ? ~ in a text key as
+ * wildcards (VLOOKUP/HLOOKUP with FALSE, MATCH with 0), matching only text candidates; the
+ * approximate modes never use wildcards.
+ */
 export function findLookupIndex(
   candidates: EvaluationScalar[],
   searchKey: EvaluationScalar,
   searchType: -1 | 0 | 1,
 ): number | EvaluationError {
   if (isEvaluationError(searchKey)) return searchKey;
+
+  if (searchType === 0 && typeof searchKey === "string" && hasWildcard(searchKey)) {
+    const tokens = wildcardTokens(searchKey, true);
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
+      if (typeof candidate !== "string") continue;
+      // The step limit applies to each candidate: a long lookup range is not a reason to fail.
+      const matched = wildcardMatches(candidate, tokens, true);
+      if (matched === null) return evaluationError("#VALUE!");
+      if (matched) return index;
+    }
+    return evaluationError("#N/A");
+  }
 
   let result = -1;
   for (let index = 0; index < candidates.length; index += 1) {
@@ -2001,24 +2231,40 @@ function evaluateLookupFunction(
     if (isEvaluationError(range)) return range;
     let row = 0;
     let column = 0;
+    // Excel truncates fractional positions (INDEX(A1:A10, RAND()*10+1)).
     if (args[1] !== undefined) {
       const value = toNumber(scalarArgument(args[1]));
-      if (isEvaluationError(value) || !Number.isInteger(value) || value < 0) {
-        return isEvaluationError(value) ? value : evaluationError("#VALUE!");
-      }
-      row = value;
+      if (isEvaluationError(value)) return value;
+      if (value < 0) return evaluationError("#VALUE!");
+      row = Math.trunc(value);
     }
     if (args[2] !== undefined) {
       const value = toNumber(scalarArgument(args[2]));
-      if (isEvaluationError(value) || !Number.isInteger(value) || value < 0) {
-        return isEvaluationError(value) ? value : evaluationError("#VALUE!");
-      }
-      column = value;
+      if (isEvaluationError(value)) return value;
+      if (value < 0) return evaluationError("#VALUE!");
+      column = Math.trunc(value);
+    } else if (range.rowCount === 1 && range.columnCount > 1) {
+      // INDEX({1,2,3}, 2): one position in a single row counts along the row.
+      column = row;
+      row = 0;
     }
     if (row > range.rowCount || column > range.columnCount) {
       return evaluationError("#REF!");
     }
-    return rangeSlice(range, row, column);
+    const sliced = rangeSlice(range, row, column);
+    // INDEX returns a reference: keep where the slice sits so it can be intersected.
+    const origin = isEvaluationRange(args[0]) && !args[0].sparse ? args[0].origin : undefined;
+    if (!origin || !isEvaluationRange(sliced)) return sliced;
+    return {
+      ...sliced,
+      origin: {
+        sheetId: origin.sheetId,
+        firstRow: row ? origin.firstRow + row - 1 : origin.firstRow,
+        lastRow: row ? origin.firstRow + row - 1 : origin.lastRow,
+        firstColumn: column ? origin.firstColumn + column - 1 : origin.firstColumn,
+        lastColumn: column ? origin.firstColumn + column - 1 : origin.lastColumn,
+      },
+    };
   }
 
   if (name === "MATCH") {
@@ -2046,9 +2292,10 @@ function evaluateLookupFunction(
   if (isEvaluationError(searchKey)) return searchKey;
   const range = asRectangularValues(args[1]);
   if (isEvaluationError(range)) return range;
-  const rawIndex = toNumber(scalarArgument(args[2]));
-  if (isEvaluationError(rawIndex)) return rawIndex;
-  if (!Number.isInteger(rawIndex) || rawIndex < 1) return evaluationError("#VALUE!");
+  const indexValue = toNumber(scalarArgument(args[2]));
+  if (isEvaluationError(indexValue)) return indexValue;
+  const rawIndex = Math.trunc(indexValue);
+  if (rawIndex < 1) return evaluationError("#VALUE!");
   const maximumIndex = name === "VLOOKUP" ? range.columnCount : range.rowCount;
   if (rawIndex > maximumIndex) return evaluationError("#REF!");
 
@@ -2127,8 +2374,12 @@ function monthIndexFromName(token: string): number | null {
   return index >= 0 ? index : null;
 }
 
+/** Serial of a typed calendar date (two-digit years as in Excel), or null when it is not a date Excel accepts. */
 export function dateSerialFromParts(year: number, month: number, day: number): number | null {
   const fullYear = year < 100 ? (year < 30 ? 2000 + year : 1900 + year) : year;
+  if (fullYear < 1900) return null;
+  // Excel's calendar has a 1900-02-29.
+  if (fullYear === 1900 && month === 2 && day === 29) return 60;
   const date = createUtcDate(fullYear, month - 1, day);
   if (
     !date ||
@@ -2455,6 +2706,11 @@ export interface FunctionEvaluation {
   depth: number;
   argumentNodes: FormulaNode[];
   evaluate: (node: FormulaNode) => EvaluationValue;
+  /**
+   * Evaluate an argument that takes a single value (IF's condition, CHOOSE's index, ...). In a
+   * legacy formula a multi-cell reference there is implicitly intersected.
+   */
+  evaluateValue: (node: FormulaNode) => EvaluationValue;
   /** Call a LAMBDA value with already-evaluated arguments. */
   invokeLambda: (lambda: EvaluationValue, args: EvaluationValue[]) => EvaluationValue;
   /** The sheet rectangle an argument node refers to, or null when it is not a reference. */
@@ -2506,7 +2762,6 @@ function evaluateXlookup(call: FunctionEvaluation): EvaluationValue {
     matchMode === 2 && typeof searchKey === "string"
       ? wildcardTokens(searchKey, true)
       : null;
-  const wildcardWork = { steps: 0 };
   let exact = -1;
   let approximate = -1;
   const start = searchMode < 0 ? candidates.length - 1 : 0;
@@ -2515,7 +2770,7 @@ function evaluateXlookup(call: FunctionEvaluation): EvaluationValue {
     const candidate = candidates[index];
     if (wildcard) {
       if (typeof candidate !== "string") continue;
-      const matched = wildcardMatches(candidate, wildcard, true, wildcardWork);
+      const matched = wildcardMatches(candidate, wildcard, true);
       if (matched === null) return evaluationError("#VALUE!");
       if (matched) {
         exact = index;
@@ -3078,6 +3333,12 @@ function textBeforeAfterSpec(name: "TEXTBEFORE" | "TEXTAFTER"): FunctionSpec {
   };
 }
 
+/** Calendar parts of a date argument, or #NUM! outside 1900-01-00 .. 9999-12-31. */
+function dateArgumentParts(serial: number): { year: number; month: number; day: number } | EvaluationError {
+  if (serial >= MAX_DATE_SERIAL + 1) return evaluationError("#NUM!");
+  return excelDateParts(serial) ?? evaluationError("#NUM!");
+}
+
 function datePartSpec(name: "YEAR" | "MONTH" | "DAY"): FunctionSpec {
   return {
     minArgs: 1,
@@ -3085,11 +3346,12 @@ function datePartSpec(name: "YEAR" | "MONTH" | "DAY"): FunctionSpec {
     impl: (values) => {
       const serial = toNumber(scalarArgument(values[0]));
       if (isEvaluationError(serial)) return serial;
-      const date = utcDateFromSerial(serial);
-      if (!date) return evaluationError("#NUM!");
-      if (name === "YEAR") return date.getUTCFullYear();
-      if (name === "MONTH") return date.getUTCMonth() + 1;
-      return date.getUTCDate();
+      // A blank cell is serial 0, 1900-01-00: YEAR 1900, MONTH 1, DAY 0, as in Excel.
+      const parts = dateArgumentParts(serial);
+      if (isEvaluationError(parts)) return parts;
+      if (name === "YEAR") return parts.year;
+      if (name === "MONTH") return parts.month;
+      return parts.day;
     },
   };
 }
@@ -3103,23 +3365,16 @@ function edateSpec(name: "EDATE" | "EOMONTH"): FunctionSpec {
       const rawMonths = toNumber(scalarArgument(values[1]));
       if (isEvaluationError(serial)) return serial;
       if (isEvaluationError(rawMonths)) return rawMonths;
-      const start = utcDateFromSerial(serial);
-      if (!start) return evaluationError("#NUM!");
-      const months = Math.trunc(rawMonths);
-      const targetFirst = createUtcDate(
-        start.getUTCFullYear(),
-        start.getUTCMonth() + months,
-        1,
-      );
-      if (!targetFirst) return evaluationError("#NUM!");
-      const targetYear = targetFirst.getUTCFullYear();
-      const targetMonth = targetFirst.getUTCMonth();
-      if (targetYear < 0 || targetYear > 10_000) return evaluationError("#NUM!");
-      const lastDay = daysInUtcMonth(targetYear, targetMonth);
-      if (lastDay === null) return evaluationError("#NUM!");
-      const day = name === "EOMONTH" ? lastDay : Math.min(start.getUTCDate(), lastDay);
-      const result = createUtcDate(targetYear, targetMonth, day);
-      return result ? serialFromUtcDate(result) : evaluationError("#NUM!");
+      const start = dateArgumentParts(serial);
+      if (isEvaluationError(start)) return start;
+      const totalMonths = start.year * 12 + start.month - 1 + Math.trunc(rawMonths);
+      const targetYear = Math.floor(totalMonths / 12);
+      const targetMonth = totalMonths - targetYear * 12 + 1;
+      if (targetYear < 1900 || targetYear > 9999) return evaluationError("#NUM!");
+      const lastDay = excelDaysInMonth(targetYear, targetMonth);
+      const day = name === "EOMONTH" ? lastDay : Math.min(start.day, lastDay);
+      const result = excelSerialFromParts(targetYear, targetMonth, day);
+      return result === null || result < 0 || result > MAX_DATE_SERIAL ? evaluationError("#NUM!") : result;
     },
   };
 }
@@ -3227,7 +3482,7 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
     impl: (_values, call) => {
       if (call.argumentNodes.length % 2 !== 0) return evaluationError("#VALUE!");
       for (let index = 0; index < call.argumentNodes.length; index += 2) {
-        const condition = toBoolean(call.evaluate(call.argumentNodes[index]));
+        const condition = toBoolean(call.evaluateValue(call.argumentNodes[index]));
         if (isEvaluationError(condition)) return condition;
         if (condition) return call.evaluate(call.argumentNodes[index + 1]);
       }
@@ -3239,11 +3494,11 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
     maxArgs: Infinity,
     lazy: true,
     impl: (_values, call) => {
-      const subject = scalarArgument(call.evaluate(call.argumentNodes[0]));
+      const subject = scalarArgument(call.evaluateValue(call.argumentNodes[0]));
       if (isEvaluationError(subject)) return subject;
       let index = 1;
       for (; index + 1 < call.argumentNodes.length; index += 2) {
-        const candidate = scalarArgument(call.evaluate(call.argumentNodes[index]));
+        const candidate = scalarArgument(call.evaluateValue(call.argumentNodes[index]));
         if (isEvaluationError(candidate)) return candidate;
         const comparison = compareValues(subject, candidate);
         if (isEvaluationError(comparison)) continue;
@@ -3354,6 +3609,13 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
       const sheetId = target.sheet ?? call.currentSheetId;
       const address = addressWithoutAnchors(target.address);
       if (address.startsWith("#")) return evaluationError("#REF!");
+      // Depend on the target so turning it into (or out of) a formula recalculates.
+      call.context.hooks.trackRange?.(sheetId, {
+        startRow: target.address.row,
+        endRow: target.address.row,
+        startColumn: target.address.column,
+        endColumn: target.address.column,
+      });
       const hook = call.context.hooks.isFormulaCell;
       if (hook) {
         try {
@@ -3364,7 +3626,7 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
       }
       try {
         const resolved = call.context.resolver(sheetId, address);
-        if (typeof resolved === "string") return resolved.startsWith("=");
+        if (typeof resolved === "string") return resolved.startsWith("=") && !call.context.hooks.resolverReturnsValues;
         return (
           typeof resolved === "object" &&
           resolved !== null &&
@@ -3778,7 +4040,8 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
     impl: (values) => {
       const text = toText(scalarArgument(values[0]));
       if (isEvaluationError(text)) return text;
-      const parsed = parseInvariantValue(text);
+      // Any number, currency, percentage, date, or time constant Excel recognises.
+      const parsed = numberFromText(text);
       return parsed === null ? evaluationError("#VALUE!") : parsed;
     },
   },
@@ -3898,21 +4161,21 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
     minArgs: 3,
     maxArgs: 3,
     impl: (values) => {
+      // Arguments coerce like any number: DATE(LEFT(t,4),MID(t,5,2),RIGHT(t,2)) and blank
+      // cells (0) work as in Excel.
       const parts: number[] = [];
       for (const value of values) {
-        const scalar = scalarArgument(value);
-        if (isEvaluationError(scalar)) return scalar;
-        if (typeof scalar !== "number") return evaluationError("#VALUE!");
-        parts.push(Math.trunc(scalar));
+        const number = toNumber(scalarArgument(value));
+        if (isEvaluationError(number)) return number;
+        parts.push(Math.trunc(number));
       }
-      let [year, month, day] = parts;
-      if (year < 0 || year > 10_000) return evaluationError("#NUM!");
+      let [year] = parts;
+      const [, month, day] = parts;
+      if (year < 0 || year > 9999) return evaluationError("#NUM!");
       if (year <= 1899) year += 1900;
-      const date = createUtcDate(year, month - 1, day);
-      if (!date || date.getUTCFullYear() < 0 || date.getUTCFullYear() > 10_000) {
-        return evaluationError("#NUM!");
-      }
-      return serialFromUtcDate(date);
+      const serial = excelSerialFromParts(year, month, day);
+      if (serial === null || serial < 0 || serial > MAX_DATE_SERIAL) return evaluationError("#NUM!");
+      return serial;
     },
   },
   YEAR: datePartSpec("YEAR"),
@@ -3990,18 +4253,19 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
         if (isEvaluationError(rawType)) return rawType;
         type = Math.trunc(rawType);
       }
-      const date = utcDateFromSerial(serial);
-      if (!date) return evaluationError("#NUM!");
-      if (type === 21) return isoWeekNumber(date);
+      const parts = dateArgumentParts(serial);
+      if (isEvaluationError(parts)) return parts;
+      if (type === 21) {
+        const date = utcDateFromSerial(serial);
+        return date ? isoWeekNumber(date) : evaluationError("#NUM!");
+      }
       let weekStart: number;
       if (type === 1 || type === 17) weekStart = 0;
       else if (type === 2) weekStart = 1;
       else if (type >= 11 && type <= 16) weekStart = type - 10;
       else return evaluationError("#NUM!");
-      const jan1 = createUtcDate(date.getUTCFullYear(), 0, 1);
-      if (!jan1) return evaluationError("#NUM!");
-      const jan1Serial = serialFromUtcDate(jan1);
-      if (isEvaluationError(jan1Serial)) return jan1Serial;
+      const jan1Serial = excelSerialFromParts(parts.year, 1, 1);
+      if (jan1Serial === null) return evaluationError("#NUM!");
       const offset = (dowFromSerial(jan1Serial) - weekStart + 7) % 7;
       const dayOfYear = Math.floor(serial) - jan1Serial + 1;
       return Math.floor((dayOfYear - 1 + offset) / 7) + 1;
@@ -4020,39 +4284,31 @@ export const FUNCTION_REGISTRY: Record<string, FunctionSpec> = {
       const startSerial = Math.trunc(rawStart);
       const endSerial = Math.trunc(rawEnd);
       if (startSerial < 0 || startSerial > endSerial) return evaluationError("#NUM!");
-      const start = utcDateFromSerial(startSerial);
-      const end = utcDateFromSerial(endSerial);
-      if (!start || !end) return evaluationError("#NUM!");
+      const start = dateArgumentParts(startSerial);
+      if (isEvaluationError(start)) return start;
+      const end = dateArgumentParts(endSerial);
+      if (isEvaluationError(end)) return end;
       const kind = unit.trim().toUpperCase();
       if (kind === "D") return endSerial - startSerial;
       const beforeAnniversary =
-        end.getUTCMonth() < start.getUTCMonth() ||
-        (end.getUTCMonth() === start.getUTCMonth() &&
-          end.getUTCDate() < start.getUTCDate());
+        end.month < start.month || (end.month === start.month && end.day < start.day);
       if (kind === "Y") {
-        return end.getUTCFullYear() - start.getUTCFullYear() - (beforeAnniversary ? 1 : 0);
+        return end.year - start.year - (beforeAnniversary ? 1 : 0);
       }
       const wholeMonths =
-        (end.getUTCFullYear() - start.getUTCFullYear()) * 12 +
-        end.getUTCMonth() -
-        start.getUTCMonth() -
-        (end.getUTCDate() < start.getUTCDate() ? 1 : 0);
+        (end.year - start.year) * 12 + end.month - start.month - (end.day < start.day ? 1 : 0);
       if (kind === "M") return wholeMonths;
       if (kind === "YM") return ((wholeMonths % 12) + 12) % 12;
       if (kind === "MD") {
-        if (end.getUTCDate() >= start.getUTCDate()) {
-          return end.getUTCDate() - start.getUTCDate();
-        }
-        const previousMonthDays = daysInUtcMonth(end.getUTCFullYear(), end.getUTCMonth() - 1);
-        if (previousMonthDays === null) return evaluationError("#NUM!");
-        return end.getUTCDate() + previousMonthDays - start.getUTCDate();
+        if (end.day >= start.day) return end.day - start.day;
+        const previousYear = end.month === 1 ? end.year - 1 : end.year;
+        const previousMonth = end.month === 1 ? 12 : end.month - 1;
+        return end.day + excelDaysInMonth(previousYear, previousMonth) - start.day;
       }
       if (kind === "YD") {
-        const anchorYear = end.getUTCFullYear() - (beforeAnniversary ? 1 : 0);
-        const anchor = createUtcDate(anchorYear, start.getUTCMonth(), start.getUTCDate());
-        if (!anchor) return evaluationError("#NUM!");
-        const anchorSerial = serialFromUtcDate(anchor);
-        if (isEvaluationError(anchorSerial)) return anchorSerial;
+        const anchorYear = end.year - (beforeAnniversary ? 1 : 0);
+        const anchorSerial = excelSerialFromParts(anchorYear, start.month, start.day);
+        if (anchorSerial === null) return evaluationError("#NUM!");
         return endSerial - anchorSerial;
       }
       return evaluationError("#NUM!");
@@ -4888,14 +5144,14 @@ const CORE_FUNCTIONS: Record<string, FunctionSpec> = {
     maxArgs: 255,
     lazy: true,
     reference: (call) => {
-      const index = toNumber(scalarArgument(call.evaluate(call.argumentNodes[0])));
+      const index = toNumber(scalarArgument(call.evaluateValue(call.argumentNodes[0])));
       if (isEvaluationError(index)) return index;
       const chosen = Math.trunc(index);
       if (chosen < 1 || chosen >= call.argumentNodes.length) return evaluationError("#VALUE!");
       return call.referenceBounds(call.argumentNodes[chosen]);
     },
     impl: (_values, call) => {
-      const selector = call.evaluate(call.argumentNodes[0]);
+      const selector = call.evaluateValue(call.argumentNodes[0]);
       const pick = (value: EvaluationScalar): EvaluationValue => {
         const index = toNumber(value);
         if (isEvaluationError(index)) return index;
@@ -4920,13 +5176,13 @@ const CORE_FUNCTIONS: Record<string, FunctionSpec> = {
     maxArgs: 3,
     lazy: true,
     reference: (call) => {
-      const condition = toBoolean(scalarArgument(call.evaluate(call.argumentNodes[0])));
+      const condition = toBoolean(scalarArgument(call.evaluateValue(call.argumentNodes[0])));
       if (isEvaluationError(condition)) return condition;
       const branch = condition ? call.argumentNodes[1] : call.argumentNodes[2];
       return branch ? call.referenceBounds(branch) : null;
     },
     impl: (_values, call) => {
-      const condition = call.evaluate(call.argumentNodes[0]);
+      const condition = call.evaluateValue(call.argumentNodes[0]);
       const whenFalse = (): EvaluationValue =>
         call.argumentNodes[2] ? call.evaluate(call.argumentNodes[2]) : false;
       if (isEvaluationRange(condition) && !condition.sparse && condition.values.length > 1) {
@@ -4965,7 +5221,7 @@ const CORE_FUNCTIONS: Record<string, FunctionSpec> = {
     maxArgs: 2,
     lazy: true,
     impl: (_values, call) => {
-      const value = call.evaluate(call.argumentNodes[0]);
+      const value = call.evaluateValue(call.argumentNodes[0]);
       const fallbackNode = call.argumentNodes[1];
       if (isEvaluationRange(value) && !value.sparse) {
         if (!value.values.some(isEvaluationError)) return value;
@@ -4995,7 +5251,7 @@ const CORE_FUNCTIONS: Record<string, FunctionSpec> = {
     maxArgs: 2,
     lazy: true,
     impl: (_values, call) => {
-      const value = call.evaluate(call.argumentNodes[0]);
+      const value = call.evaluateValue(call.argumentNodes[0]);
       const isNa = (entry: EvaluationScalar) => isEvaluationError(entry) && entry.code === "#N/A";
       if (isEvaluationRange(value) && !value.sparse) {
         if (!value.values.some(isNa)) return value;
@@ -5167,6 +5423,61 @@ for (const name of ["UNIQUE", "SORT", "FILTER", "SEQUENCE", "TRANSPOSE"]) {
   if (FUNCTION_REGISTRY[name]) FUNCTION_REGISTRY[name] = { ...FUNCTION_REGISTRY[name], returnsArray: true };
 }
 
+/**
+ * Aggregates whose arguments follow Excel's reference rule: text, logicals and errors inside
+ * a referenced cell are skipped (or, for the *A variants, counted) the same whether the
+ * reference is A1 or A1:A9, while typed arguments ("5", TRUE) are coerced. Their reference
+ * arguments are therefore passed as ranges, even when they cover a single cell.
+ */
+const REFERENCE_ARGUMENT_FUNCTIONS = new Set([
+  "SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "PRODUCT", "MEDIAN", "MODE", "MODE.SNGL",
+  "MODE.MULT", "STDEV", "STDEV.S", "STDEV.P", "STDEVP", "VAR", "VAR.S", "VAR.P", "VARP",
+  "AVERAGEA", "MAXA", "MINA", "STDEVA", "STDEVPA", "VARA", "VARPA", "SUMSQ", "GEOMEAN",
+  "HARMEAN", "AVEDEV", "DEVSQ", "KURT", "SKEW", "SKEW.P",
+]);
+
+/**
+ * Parameters that take whole arrays even in a legacy (pre-dynamic-array) formula, so
+ * implicit intersection is suspended inside them: =SUMPRODUCT((A1:A9="x")*B1:B9) and
+ * =LOOKUP(2,1/(A1:A9="x"),B1:B9) need no Ctrl+Shift+Enter in any Excel version.
+ */
+const LEGACY_ARRAY_ARGUMENTS: Record<string, "all" | number[]> = {
+  SUMPRODUCT: "all",
+  LOOKUP: [1, 2],
+  INDEX: [0],
+  MMULT: "all",
+  MDETERM: "all",
+  MINVERSE: "all",
+  TRANSPOSE: "all",
+  FREQUENCY: "all",
+  LINEST: "all",
+  LOGEST: "all",
+  TREND: "all",
+  GROWTH: "all",
+  SUMX2MY2: "all",
+  SUMX2PY2: "all",
+  SUMXMY2: "all",
+  AGGREGATE: "all",
+};
+
+function takesLegacyArray(name: string, index: number): boolean {
+  const positions = LEGACY_ARRAY_ARGUMENTS[name];
+  return positions === "all" || Boolean(positions?.includes(index));
+}
+
+/**
+ * Single-value parameters of the lazy functions; their other arguments pass a value (or
+ * reference) through to the result.
+ */
+const LAZY_VALUE_ARGUMENTS: Record<string, (index: number, count: number) => boolean> = {
+  IF: (index) => index === 0,
+  IFS: (index) => index % 2 === 0,
+  CHOOSE: (index) => index === 0,
+  SWITCH: (index, count) => index === 0 || (index % 2 === 1 && index < count - 1),
+  IFERROR: (index) => index === 0,
+  IFNA: (index) => index === 0,
+};
+
 // ---------------------------------------------------------------------------------------------
 // Evaluation: calls, names, LET/LAMBDA scopes, references, spills, and structured references
 // ---------------------------------------------------------------------------------------------
@@ -5224,8 +5535,11 @@ function callWithLifting(
   let lifted = false;
   const normalized = values.slice();
   for (let index = 0; index < values.length; index += 1) {
-    const value = values[index];
-    if (!isEvaluationRange(value) || !shouldLift(spec, index)) continue;
+    if (!shouldLift(spec, index)) continue;
+    // A legacy formula intersects a reference passed for a single value instead of lifting.
+    const value = legacyValue(values[index], evaluation.context);
+    normalized[index] = value;
+    if (!isEvaluationRange(value)) continue;
     if (value.values.length === 1 && !value.sparse) {
       normalized[index] = value.values[0];
       continue;
@@ -5268,6 +5582,7 @@ function makeFunctionEvaluation(
     argumentNodes,
     hooks: context.hooks,
     evaluate: (node) => evaluateNode(node, currentSheetId, context, depth + 1),
+    evaluateValue: (node) => legacyValue(evaluateNode(node, currentSheetId, context, depth + 1), context),
     invokeLambda: (lambda, args) => invokeLambdaValue(lambda, args, context, depth + 1),
     referenceBounds: (node) => referenceBoundsOf(node, currentSheetId, context, depth + 1),
     resolveBounds: (bounds) => resolveRectangle(bounds, currentSheetId, context),
@@ -5379,9 +5694,74 @@ function evaluateCall(
   }
   if (spec.volatile) context.hooks.markVolatile?.();
   const evaluation = makeFunctionEvaluation(call.arguments, currentSheetId, context, depth);
-  if (spec.lazy) return spec.impl([], evaluation);
-  const values = call.arguments.map(evaluateArgument);
+  const legacyArrays = LEGACY_ARRAY_ARGUMENTS[name] !== undefined;
+  if (spec.lazy) {
+    if (!legacyArrays) return spec.impl([], evaluation);
+    context.arrayContext += 1;
+    try {
+      return spec.impl([], evaluation);
+    } finally {
+      context.arrayContext -= 1;
+    }
+  }
+  const referenceArguments = REFERENCE_ARGUMENT_FUNCTIONS.has(name);
+  const values = call.arguments.map((argument, index) => {
+    const arrayArgument = legacyArrays && takesLegacyArray(name, index);
+    if (arrayArgument) context.arrayContext += 1;
+    try {
+      return referenceArguments
+        ? evaluateReferenceArgument(argument, currentSheetId, context, depth)
+        : evaluateArgument(argument);
+    } finally {
+      if (arrayArgument) context.arrayContext -= 1;
+    }
+  });
   return callWithLifting(spec, values, evaluation);
+}
+
+/**
+ * An aggregate's argument: a reference to a single cell arrives as a 1x1 range (like A1:A1)
+ * so text and logicals in the cell follow the reference rule; other arguments evaluate as usual.
+ */
+function evaluateReferenceArgument(
+  node: FormulaNode,
+  currentSheetId: string,
+  context: EvaluationContext,
+  depth: number,
+): EvaluationValue {
+  if (node.kind === "reference") {
+    return resolveRectangle(
+      {
+        sheetId: node.sheet ?? currentSheetId,
+        firstRow: node.address.row,
+        lastRow: node.address.row,
+        firstColumn: node.address.column,
+        lastColumn: node.address.column,
+      },
+      currentSheetId,
+      context,
+    );
+  }
+  const value = evaluateNode(node, currentSheetId, context, depth + 1);
+  if (isEvaluationRange(value) || isLambdaValue(value)) return value;
+  // A name, table reference, or INDEX/OFFSET/INDIRECT/CHOOSE/IF that resolved to one cell.
+  const mayReferToCell =
+    node.kind === "name" ||
+    node.kind === "structured" ||
+    (node.kind === "call" &&
+      !lookupScope(context, node.name).found &&
+      Boolean(FUNCTION_REGISTRY[normalizedFunctionName(node.name)]?.reference));
+  if (!mayReferToCell) return value;
+  const bounds = referenceBoundsOf(node, currentSheetId, context, depth + 1);
+  if (
+    !bounds ||
+    isEvaluationError(bounds) ||
+    bounds.firstRow !== bounds.lastRow ||
+    bounds.firstColumn !== bounds.lastColumn
+  ) {
+    return value;
+  }
+  return resolveRectangle(bounds, currentSheetId, context);
 }
 
 function resolveName(
@@ -5648,17 +6028,52 @@ function resolveBoundsValue(
 function implicitIntersection(value: EvaluationValue, context: EvaluationContext): EvaluationValue {
   if (isLambdaValue(value)) return evaluationError("#VALUE!");
   if (!isEvaluationRange(value)) return value;
-  if (value.sparse) return evaluationError("#VALUE!");
-  if (value.values.length === 1) return value.values[0];
+  if (value.values.length === 1 && !value.sparse) return value.values[0];
   const origin = value.origin;
   const cell = context.hooks.currentCell;
-  if (!origin || !cell) return value.values[0] ?? null;
+  if (!origin || !cell) return value.sparse ? evaluationError("#VALUE!") : (value.values[0] ?? null);
   const rowIndex = value.rowCount === 1 ? 0 : cell.row - origin.firstRow;
   const columnIndex = value.columnCount === 1 ? 0 : cell.column - origin.firstColumn;
   if (rowIndex < 0 || rowIndex >= value.rowCount || columnIndex < 0 || columnIndex >= value.columnCount) {
     return evaluationError("#VALUE!");
   }
+  if (value.sparse) {
+    // A very large range (A:A on a big sheet) only holds its populated cells: read the one cell.
+    return resolveReference(
+      {
+        kind: "reference",
+        sheet: origin.sheetId,
+        address: {
+          row: origin.firstRow + rowIndex,
+          column: origin.firstColumn + columnIndex,
+          rowAbsolute: false,
+          columnAbsolute: false,
+        },
+      },
+      origin.sheetId,
+      context,
+      false,
+    );
+  }
   return value.values[rowIndex * value.columnCount + columnIndex] ?? null;
+}
+
+/**
+ * A value in a single-value position of a legacy formula: a multi-cell reference is implicitly
+ * intersected; computed arrays (and everything inside array-argument functions) pass through.
+ */
+function legacyValue(value: EvaluationValue, context: EvaluationContext): EvaluationValue {
+  if (context.arrayContext > 0 || !isEvaluationRange(value) || !value.origin) return value;
+  if (value.sparse || value.values.length > 1) context.usedArrayEvaluation = true;
+  return context.legacy ? implicitIntersection(value, context) : value;
+}
+
+/** The single value a legacy formula shows: intersected references, top-left of arrays. */
+function legacyResult(value: EvaluationValue, context: EvaluationContext): EvaluationValue {
+  if (!isEvaluationRange(value)) return value;
+  if (value.origin) return implicitIntersection(value, context);
+  if (value.sparse) return evaluationError("#VALUE!");
+  return value.values.length ? (value.values[0] ?? null) : evaluationError("#CALC!");
 }
 
 function evaluateNode(
@@ -5712,8 +6127,12 @@ function evaluateNode(
       );
     }
     case "unary": {
-      const operand = evaluateNode(node.operand, currentSheetId, context, depth + 1);
-      if (node.operator === "@") return implicitIntersection(operand, context);
+      const evaluated = evaluateNode(node.operand, currentSheetId, context, depth + 1);
+      if (node.operator === "@") return implicitIntersection(evaluated, context);
+      // Unary plus does nothing in Excel: =+A1 keeps text, logicals, and ranges as they are.
+      if (node.operator === "+") return evaluated;
+      if (isLambdaValue(evaluated)) return evaluationError("#VALUE!");
+      const operand = legacyValue(evaluated, context);
       // `--(A2:A100="x")` coerces a boolean mask to 1/0, so unary operators broadcast too.
       if (isEvaluationRange(operand)) {
         if (operand.sparse) return evaluationError("#VALUE!");
@@ -5722,7 +6141,7 @@ function evaluateNode(
           values: operand.values.map((entry) => {
             const number = toNumber(entry);
             if (isEvaluationError(number)) return number;
-            if (node.operator === "-") return -number;
+            if (node.operator === "-") return number === 0 ? 0 : -number;
             if (node.operator === "%") return number / 100;
             return number;
           }),
@@ -5732,13 +6151,13 @@ function evaluateNode(
       }
       const value = toNumber(operand);
       if (isEvaluationError(value)) return value;
-      if (node.operator === "-") return -value;
+      if (node.operator === "-") return value === 0 ? 0 : -value;
       if (node.operator === "%") return value / 100;
       return value;
     }
     case "binary": {
-      const left = evaluateNode(node.left, currentSheetId, context, depth + 1);
-      const right = evaluateNode(node.right, currentSheetId, context, depth + 1);
+      const left = legacyValue(evaluateNode(node.left, currentSheetId, context, depth + 1), context);
+      const right = legacyValue(evaluateNode(node.right, currentSheetId, context, depth + 1), context);
       if (isLambdaValue(left) || isLambdaValue(right)) return evaluationError("#VALUE!");
       return applyBinaryOperator(node.operator, left, right);
     }
@@ -5757,7 +6176,7 @@ function cachedParse(source: string): FormulaNode | FormulaError {
     try {
       entry = new FormulaParser(tokenize(source)).parse();
     } catch (error) {
-      entry = error instanceof FormulaParseError ? error.formulaError : "#PARSE!";
+      entry = error instanceof FormulaParseError ? error.formulaError : "#NAME?";
     }
     if (PARSE_CACHE.size >= PARSE_CACHE_LIMIT) PARSE_CACHE.clear();
     PARSE_CACHE.set(source, entry);
@@ -5774,8 +6193,308 @@ function formulaBody(formula: string): string {
 /** Parse a formula to its syntax tree, or return the error code it would evaluate to. */
 export function parseFormula(formula: string): FormulaNode | FormulaError {
   const source = formulaBody(formula);
-  if (!source) return "#PARSE!";
+  if (!source) return "#NAME?";
   return cachedParse(source);
+}
+
+// ---- Diagnostics for the formula editor ------------------------------------------------------
+
+/** Why a formula cannot be calculated as written, for the editor to show before committing. */
+export interface FormulaDiagnostic {
+  /** The Excel error the formula evaluates to. */
+  error: FormulaError;
+  kind: "syntax" | "reference" | "number" | "array" | "unknown-function" | "unknown-name";
+  /** A short, plain-language explanation ("A closing parenthesis is missing."). */
+  message: string;
+  /** Offset of the problem in the text passed in (a leading "=" counts). */
+  position: number;
+  /** Length of the offending text (0 when something is missing). */
+  length: number;
+  /** A repaired formula (with "="), offered when closing quotes or parentheses fix it. */
+  suggestion?: string;
+}
+
+export interface FormulaDiagnosticOptions {
+  /**
+   * Whether a workbook name (a defined name or a LAMBDA in the Name Manager) exists. When given,
+   * unknown names are reported too; unknown functions are always reported.
+   */
+  isDefinedName?: (name: string) => boolean;
+}
+
+function parseProblemKind(error: FormulaParseError): FormulaDiagnostic["kind"] {
+  if (error.formulaError === "#REF!") return "reference";
+  if (error.formulaError === "#NUM!") return "number";
+  if (error.formulaError === "#VALUE!" && /array/i.test(error.message)) return "array";
+  return "syntax";
+}
+
+/** Characters that close a formula left open: a text quote, then parentheses. */
+function closeOpenFormula(body: string): string | null {
+  let quoted = false;
+  let sheetQuoted = false;
+  let depth = 0;
+  let braces = 0;
+  for (let index = 0; index < body.length; index += 1) {
+    const character = body[index];
+    if (quoted) {
+      if (character === '"') {
+        if (body[index + 1] === '"') index += 1;
+        else quoted = false;
+      }
+      continue;
+    }
+    if (sheetQuoted) {
+      if (character === "'") {
+        if (body[index + 1] === "'") index += 1;
+        else sheetQuoted = false;
+      }
+      continue;
+    }
+    if (character === '"') quoted = true;
+    else if (character === "'") sheetQuoted = true;
+    else if (character === "(") depth += 1;
+    else if (character === ")") depth -= 1;
+    else if (character === "{") braces += 1;
+    else if (character === "}") braces -= 1;
+  }
+  if (sheetQuoted || braces < 0) return null;
+  let repaired = body;
+  if (quoted) repaired += '"';
+  if (braces > 0) repaired += "}".repeat(braces);
+  if (depth > 0) repaired += ")".repeat(depth);
+  else if (depth < 0) {
+    // Drop surplus closing parentheses at the end ("=SUM(A1:A3))").
+    let surplus = -depth;
+    while (surplus > 0 && /\)\s*$/.test(repaired)) {
+      repaired = repaired.replace(/\)(\s*)$/, "$1");
+      surplus -= 1;
+    }
+    if (surplus > 0) return null;
+  }
+  return repaired === body ? null : repaired;
+}
+
+function collectFunctionProblems(
+  node: FormulaNode,
+  bound: Set<string>,
+  options: FormulaDiagnosticOptions,
+  problems: Array<{ kind: "unknown-function" | "unknown-name"; name: string }>,
+): void {
+  switch (node.kind) {
+    case "call": {
+      const name = normalizedFunctionName(node.name);
+      let inner = bound;
+      if (name === "LET" || name === "LAMBDA") {
+        inner = new Set(bound);
+        const names = name === "LET" ? node.arguments.filter((_argument, index) => index % 2 === 0 && index < node.arguments.length - 1) : node.arguments.slice(0, -1);
+        for (const argument of names) {
+          const parameter = lambdaParameterName(argument);
+          if (parameter) inner.add(parameter);
+        }
+      }
+      const known =
+        hasFormulaFunction(node.name) ||
+        bound.has(normalizedLocalName(node.name)) ||
+        Boolean(options.isDefinedName?.(node.name));
+      if (!known) problems.push({ kind: "unknown-function", name: node.name });
+      node.arguments.forEach((argument, index) => {
+        // LET/LAMBDA parameter names are declarations, not references.
+        const declaration =
+          (name === "LET" && index % 2 === 0 && index < node.arguments.length - 1) ||
+          (name === "LAMBDA" && index < node.arguments.length - 1);
+        if (!declaration) collectFunctionProblems(argument, inner, options, problems);
+      });
+      return;
+    }
+    case "name": {
+      if (!options.isDefinedName) return;
+      if (bound.has(normalizedLocalName(node.name))) return;
+      if (!options.isDefinedName(node.name)) problems.push({ kind: "unknown-name", name: node.name });
+      return;
+    }
+    case "unary":
+      collectFunctionProblems(node.operand, bound, options, problems);
+      return;
+    case "binary":
+    case "rangeOp":
+      collectFunctionProblems(node.left, bound, options, problems);
+      collectFunctionProblems(node.right, bound, options, problems);
+      return;
+    case "invoke":
+      collectFunctionProblems(node.callee, bound, options, problems);
+      for (const argument of node.arguments) collectFunctionProblems(argument, bound, options, problems);
+      return;
+    default:
+      return;
+  }
+}
+
+/** Offset of the first identifier token spelled `name` (optionally followed by "("). */
+function identifierPosition(body: string, name: string, call: boolean): { position: number; length: number } {
+  try {
+    const tokens = tokenize(body);
+    const wanted = name.toUpperCase();
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (token.kind !== "identifier" || token.text.toUpperCase() !== wanted) continue;
+      if (call && tokens[index + 1]?.kind !== "leftParen") continue;
+      return { position: token.position, length: token.text.length };
+    }
+  } catch {
+    // Fall through to the start of the formula.
+  }
+  return { position: 0, length: 0 };
+}
+
+/**
+ * Check a formula the way the editor needs before committing it: a syntax problem (with the
+ * error it would show, where it is, and a repaired formula when closing a quote or parenthesis
+ * fixes it), or an unknown function (and, with `isDefinedName`, an unknown name). Returns null
+ * when the formula can be calculated.
+ */
+export function diagnoseFormula(formula: string, options: FormulaDiagnosticOptions = {}): FormulaDiagnostic | null {
+  const leading = /^\s*=?\s*/.exec(formula)?.[0].length ?? 0;
+  const body = formula.slice(leading).replace(/\s+$/, "");
+  let tree: FormulaNode;
+  try {
+    tree = new FormulaParser(tokenize(body)).parse();
+  } catch (error) {
+    const problem = error instanceof FormulaParseError ? error : new FormulaParseError();
+    const repaired = closeOpenFormula(body);
+    const suggestion = repaired !== null && typeof cachedParse(repaired) !== "string" ? `=${repaired}` : undefined;
+    return {
+      error: problem.formulaError,
+      kind: parseProblemKind(problem),
+      message: problem.message,
+      position: leading + problem.position,
+      length: problem.length,
+      ...(suggestion ? { suggestion } : {}),
+    };
+  }
+  const problems: Array<{ kind: "unknown-function" | "unknown-name"; name: string }> = [];
+  collectFunctionProblems(tree, new Set(), options, problems);
+  const first = problems[0];
+  if (!first) return null;
+  const located = identifierPosition(body, first.name, first.kind === "unknown-function");
+  return {
+    error: "#NAME?",
+    kind: first.kind,
+    message:
+      first.kind === "unknown-function"
+        ? `${first.name.toUpperCase()} isn't a function this app knows.`
+        : `The name ${first.name} isn't defined in this workbook.`,
+    position: leading + located.position,
+    length: located.length,
+  };
+}
+
+const FORMULA_ERROR_HELP: Record<string, string> = {
+  "#DIV/0!": "The formula divides by zero or by an empty cell.",
+  "#N/A": "A value isn't available: usually a lookup found no match.",
+  "#NAME?": "The formula contains a name it doesn't recognise, such as a misspelt function or an undefined name.",
+  "#NULL!": "The ranges in the formula don't intersect.",
+  "#NUM!": "A number is invalid for this calculation, or the result is too large or too small.",
+  "#REF!": "The formula refers to a cell that isn't valid, often one that was deleted.",
+  "#VALUE!": "A value has the wrong type, such as text where a number is needed.",
+  "#SPILL!": "The result needs more cells than are free: something is in the way of the spill range.",
+  "#CALC!": "The calculation can't give a result, for example an empty array or a function where a value is needed.",
+  "#CIRC!": "The formula refers to its own cell, directly or through other cells (a circular reference).",
+  "#PARSE!": "The formula couldn't be read.",
+  "#ERROR!": "The formula couldn't be calculated.",
+};
+
+/** A plain-language explanation of an error value, for hover cards; null for other values. */
+export function describeFormulaError(value: unknown): string | null {
+  return typeof value === "string" ? FORMULA_ERROR_HELP[value.toUpperCase()] ?? null : null;
+}
+
+// ---- Legacy (pre-dynamic-array) formulas --------------------------------------------------------
+
+type ArgumentPosition = "value" | "reference" | "array";
+
+/** Whether a node can stand for several cells (or an array) where a single value is wanted. */
+function mayBeMultiCellReference(node: FormulaNode): boolean {
+  switch (node.kind) {
+    case "range":
+    case "wholeRange":
+    case "rangeOp":
+    case "spill":
+    case "name":
+      return true;
+    case "structured":
+      return !/^\[\s*@/.test(node.specifier.trim()) && !/#this row/i.test(node.specifier);
+    case "call": {
+      const name = normalizedFunctionName(node.name);
+      if (name === "INDIRECT") return true;
+      const given = (argument?: FormulaNode) => Boolean(argument) && argument!.kind !== "omitted";
+      if (name === "OFFSET") {
+        // OFFSET(cell, rows, cols) without a height or width stays a single cell.
+        const [reference, , , height, width] = node.arguments;
+        const one = (argument?: FormulaNode) => !given(argument) || (argument!.kind === "literal" && argument!.value === 1);
+        return !(reference?.kind === "reference" && one(height) && one(width));
+      }
+      if (name === "INDEX") {
+        const [reference, row, column] = node.arguments;
+        const position = (argument?: FormulaNode) => given(argument) && !(argument!.kind === "literal" && Number(argument!.value) === 0);
+        if (!position(row)) return true;
+        if (node.arguments.length >= 3) return !position(column);
+        // A single position in one row or column of cells is one cell.
+        if (reference?.kind === "reference") return false;
+        if (reference?.kind === "range") {
+          return reference.start.address.row !== reference.end.address.row &&
+            reference.start.address.column !== reference.end.address.column;
+        }
+        if (reference?.kind === "wholeRange") return reference.start !== reference.end;
+        if (reference?.kind === "array") return reference.rowCount > 1 && reference.columnCount > 1;
+        return true;
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+function intersectsInLegacy(node: FormulaNode, position: ArgumentPosition, depth: number): boolean {
+  if (position === "array" || depth > 64) return false;
+  if (position === "value" && mayBeMultiCellReference(node)) return true;
+  switch (node.kind) {
+    case "unary":
+      if (node.operator === "@") return false;
+      return intersectsInLegacy(node.operand, node.operator === "+" ? position : "value", depth + 1);
+    case "binary":
+      return intersectsInLegacy(node.left, "value", depth + 1) || intersectsInLegacy(node.right, "value", depth + 1);
+    case "call": {
+      const name = normalizedFunctionName(node.name);
+      const spec = FUNCTION_REGISTRY[name];
+      const lazyValue = LAZY_VALUE_ARGUMENTS[name];
+      const count = node.arguments.length;
+      return node.arguments.some((argument, index) => {
+        let argumentPosition: ArgumentPosition;
+        if (takesLegacyArray(name, index)) argumentPosition = "array";
+        else if (lazyValue) argumentPosition = lazyValue(index, count) ? "value" : position;
+        else if (spec && shouldLift(spec, index)) argumentPosition = "value";
+        else argumentPosition = "reference";
+        return intersectsInLegacy(argument, argumentPosition, depth + 1);
+      });
+    }
+    case "invoke":
+      return node.arguments.some((argument) => intersectsInLegacy(argument, "reference", depth + 1));
+    default:
+      return false;
+  }
+}
+
+/**
+ * True when evaluating the formula as a legacy (pre-dynamic-array) formula would implicitly
+ * intersect a reference somewhere: the places Excel 365 marks with "@" when it opens an older
+ * formula. Such a formula means something different as a plain (legacy) formula and as a
+ * dynamic-array formula, so its kind must be kept when it is saved.
+ */
+export function formulaHasImplicitIntersection(formula: string): boolean {
+  const node = parseFormula(formula);
+  return typeof node !== "string" && intersectsInLegacy(node, "value", 0);
 }
 
 function evaluateFormulaValue(
@@ -5787,7 +6506,7 @@ function evaluateFormulaValue(
     return evaluationError("#CALC!");
   }
   const source = formulaBody(formula);
-  if (!source) return evaluationError("#PARSE!");
+  if (!source) return evaluationError("#NAME?");
   const node = cachedParse(source);
   if (typeof node === "string") return evaluationError(node);
 
@@ -5796,7 +6515,8 @@ function evaluateFormulaValue(
   const savedScope = context.scope;
   context.scope = null;
   try {
-    return evaluateNode(node, currentSheetId, context);
+    const value = evaluateNode(node, currentSheetId, context);
+    return context.legacy ? legacyResult(value, context) : value;
   } catch (error) {
     return evaluationError(error instanceof FormulaParseError ? error.formulaError : "#VALUE!");
   } finally {
@@ -5832,6 +6552,9 @@ function createContext(
     calculationDepth: 0,
     scope: null,
     formulaSheetId: currentSheetId,
+    legacy: Boolean(hooks?.implicitIntersection),
+    arrayContext: 0,
+    usedArrayEvaluation: false,
   };
 }
 
@@ -5852,7 +6575,7 @@ export function evaluateFormula(
   resolver: FormulaResolver,
   hooks?: FormulaEvaluationHooks,
 ): FormulaResult {
-  if (typeof formula !== "string" || typeof resolver !== "function") return "#PARSE!";
+  if (typeof formula !== "string" || typeof resolver !== "function") return "#VALUE!";
   const context = createContext(resolver, hooks, currentSheetId);
   return publicScalar(evaluateFormulaText(formula, currentSheetId, context));
 }
@@ -5869,6 +6592,12 @@ export interface DetailedFormulaResult {
   value: FormulaResult;
   /** Present when the formula returns more than one value and should spill. */
   array?: FormulaArrayResult;
+  /**
+   * True when a multi-cell reference was used where a legacy formula would implicitly
+   * intersect it (=SUM(A1:A3*2)). Saved as a plain formula, Excel would read it with legacy
+   * meaning, so such a formula is saved as an array formula.
+   */
+  arrayEvaluation?: boolean;
 }
 
 /** Evaluate a formula and return its full array result for dynamic-array spilling. */
@@ -5878,18 +6607,21 @@ export function evaluateFormulaDetailed(
   resolver: FormulaResolver,
   hooks?: FormulaEvaluationHooks,
 ): DetailedFormulaResult {
-  if (typeof formula !== "string" || typeof resolver !== "function") return { value: "#PARSE!" };
+  if (typeof formula !== "string" || typeof resolver !== "function") return { value: "#VALUE!" };
   const context = createContext(resolver, hooks, currentSheetId);
   const value = evaluateFormulaValue(formula, currentSheetId, context);
-  if (isLambdaValue(value)) return { value: "#CALC!" };
-  if (!isEvaluationRange(value)) return { value: publicScalar(value) };
-  if (value.sparse) return { value: "#VALUE!" };
-  if (value.values.length === 0) return { value: "#CALC!" };
+  const flags: Pick<DetailedFormulaResult, "arrayEvaluation"> =
+    context.usedArrayEvaluation && !context.legacy ? { arrayEvaluation: true } : {};
+  if (isLambdaValue(value)) return { value: "#CALC!", ...flags };
+  if (!isEvaluationRange(value)) return { value: publicScalar(value), ...flags };
+  if (value.sparse) return { value: "#VALUE!", ...flags };
+  if (value.values.length === 0) return { value: "#CALC!", ...flags };
   const values = value.values.map(publicScalar);
-  if (values.length === 1) return { value: values[0] };
+  if (values.length === 1) return { value: values[0], ...flags };
   return {
     value: values[0],
     array: { rowCount: value.rowCount, columnCount: value.columnCount, values },
+    ...flags,
   };
 }
 

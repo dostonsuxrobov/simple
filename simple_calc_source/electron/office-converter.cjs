@@ -4,7 +4,14 @@ const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const { spawn, execFile } = require('node:child_process')
 
+// SIMPLE_FORCE_NO_OFFICE=1 makes the app (and the QA suites) behave exactly as on a machine
+// without the optional document engine, so the native fallbacks can be tested anywhere.
+function officeEngineForcedOff() {
+  return /^(1|true|yes)$/i.test(String(process.env.SIMPLE_FORCE_NO_OFFICE || '').trim())
+}
+
 async function findOfficeConverter() {
+  if (officeEngineForcedOff()) return null
   const applicationRoots = [process.env.PORTABLE_EXECUTABLE_DIR, path.dirname(process.execPath), process.resourcesPath, path.resolve(__dirname, '..', '..')].filter(Boolean)
   const candidates = [
     process.env.SIMPLE_LIBREOFFICE_PATH,
@@ -46,7 +53,11 @@ function runOfficeConverter(executable, args, timeoutMs = 60_000) {
 
 async function convertOfficeBytes(input, options = {}) {
   const executable = options.executable || await findOfficeConverter()
-  if (!executable) throw new Error('The document conversion engine is unavailable. Install LibreOffice and try again.')
+  if (!executable) {
+    const error = new Error('The document conversion engine is unavailable. Install LibreOffice and try again.')
+    error.code = 'CONVERTER_MISSING'
+    throw error
+  }
   const inputExtension = String(input.inputExtension || '').replace(/^\./, '').toLowerCase()
   const outputExtension = String(input.outputExtension || '').replace(/^\./, '').toLowerCase()
   if (!['doc', 'docx', 'xls', 'xlsx', 'odt', 'ods', 'rtf', 'ppt', 'pptx'].includes(inputExtension)
@@ -83,4 +94,9 @@ async function convertOfficeBytes(input, options = {}) {
   }
 }
 
-module.exports = { findOfficeConverter, runOfficeConverter, convertOfficeBytes }
+/** Whether the local document engine (LibreOffice) can be used right now. Cheap: a few stat calls. */
+async function officeEngineAvailable() {
+  return Boolean(await findOfficeConverter())
+}
+
+module.exports = { findOfficeConverter, officeEngineAvailable, officeEngineForcedOff, runOfficeConverter, convertOfficeBytes }

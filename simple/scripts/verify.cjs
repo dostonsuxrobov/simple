@@ -13,6 +13,9 @@ const {
   modeForPath,
   supportedPaths,
 } = require('../electron/routing.cjs')
+const formats = require('../shared/electron/formats.cjs')
+const { syncShared } = require('./sync-shared.cjs')
+const { checkLocalOnly } = require('./local-only-guard.cjs')
 
 const ROOT = path.resolve(__dirname, '..')
 const WORKSPACE = path.resolve(ROOT, '..')
@@ -24,6 +27,16 @@ const SOURCE_BY_MODE = Object.freeze({
   video: 'simple_video_source',
 })
 const IGNORED_FOLDERS = new Set(['node_modules', 'dist', 'release', 'tmp', '.git'])
+
+// Vendored shared I/O copies must match simple/shared before anything else is
+// trusted; a shared change then shows up below as a stale module fingerprint.
+const sharedIo = syncShared({ check: true })
+assert.ok(sharedIo.ok, sharedIo.message)
+
+// Everything stays on this PC and documents open inside Simple: no network
+// modules or requests, no cloud service code, no hand-off to other programs.
+const localOnly = checkLocalOnly()
+assert.ok(localOnly.ok, localOnly.message)
 
 function filesUnder(directory, relative = '') {
   const output = []
@@ -85,20 +98,34 @@ const flattened = Object.values(EXTENSIONS_BY_MODE).flat()
 assert.equal(new Set(flattened).size, flattened.length, 'Extension ownership must be exclusive.')
 assert.deepEqual(new Set(flattened), new Set(SUPPORTED_EXTENSIONS))
 
-const imageSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.image, 'electron', 'image-files.cjs')).SUPPORTED_EXTENSIONS
-const videoSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.video, 'electron', 'routing.cjs')).SUPPORTED_EXTENSIONS
-const docsSourceExtensions = require(path.join(WORKSPACE, SOURCE_BY_MODE.docs, 'electron', 'document-files.cjs')).SUPPORTED_EXTENSIONS
-assert.deepEqual(new Set(imageSourceExtensions), new Set(EXTENSIONS_BY_MODE.image), 'Image routing must match the image source.')
-assert.deepEqual(new Set(videoSourceExtensions), new Set(EXTENSIONS_BY_MODE.video), 'Video routing must match the video source.')
-assert.deepEqual(new Set(docsSourceExtensions), new Set(EXTENSIONS_BY_MODE.docs), 'Docs routing must match the Docs source.')
-
-const pdfSourceExtensions = sourceExtensionSet(path.join(SOURCE_BY_MODE.pdf, 'electron', 'main.cjs'))
-const calcSourceExtensions = sourceExtensionSet(path.join(SOURCE_BY_MODE.calc, 'electron', 'workbooks.cjs'))
-for (const extension of EXTENSIONS_BY_MODE.pdf) {
-  assert.ok(pdfSourceExtensions.has(extension), `PDF routing sends ${extension} to a source that no longer accepts it.`)
+/** What each workspace's own source accepts on its command line and in Open. */
+const ACCEPTED_BY_MODE = Object.freeze({
+  image: new Set(require(path.join(WORKSPACE, SOURCE_BY_MODE.image, 'electron', 'image-files.cjs')).SUPPORTED_EXTENSIONS),
+  video: new Set(require(path.join(WORKSPACE, SOURCE_BY_MODE.video, 'electron', 'routing.cjs')).SUPPORTED_EXTENSIONS),
+  docs: new Set(require(path.join(WORKSPACE, SOURCE_BY_MODE.docs, 'electron', 'document-files.cjs')).SUPPORTED_EXTENSIONS),
+  pdf: sourceExtensionSet(path.join(SOURCE_BY_MODE.pdf, 'electron', 'main.cjs')),
+  calc: sourceExtensionSet(path.join(SOURCE_BY_MODE.calc, 'electron', 'workbooks.cjs')),
+})
+assert.deepEqual(Object.keys(ACCEPTED_BY_MODE).sort(), [...MODES].sort())
+const WORKSPACE_NAMES = Object.freeze({ docs: 'Docs', calc: 'Calc', pdf: 'PDF', image: 'Image', video: 'Video' })
+// Routing may only send a file to a workspace that accepts it: its extension
+// route, and every workspace its content can route it to (a delimited .txt
+// goes to Calc), or that workspace drops the path and opens an empty window.
+// A workspace may accept more than the unified app routes to it yet: those
+// formats are switched on in simple/shared/electron/formats.json when the
+// workspace integrates them.
+for (const extension of SUPPORTED_EXTENSIONS) {
+  const candidates = formats.candidateModesForExtension(extension)
+  assert.ok(candidates.includes(modeForPath(`C:\\nowhere\\file${extension}`)), `${extension} routes outside its candidate workspaces.`)
+  for (const mode of candidates) {
+    const by = EXTENSIONS_BY_MODE[mode].includes(extension) ? 'routing' : 'content routing'
+    assert.ok(ACCEPTED_BY_MODE[mode].has(extension), `${WORKSPACE_NAMES[mode]} ${by} sends ${extension} to a source that no longer accepts it.`)
+  }
 }
-for (const extension of EXTENSIONS_BY_MODE.calc) {
-  assert.ok(calcSourceExtensions.has(extension), `Calc routing sends ${extension} to a source that no longer accepts it.`)
+const notRoutedYet = []
+for (const mode of ['image', 'video', 'docs']) {
+  const extra = [...ACCEPTED_BY_MODE[mode]].filter((extension) => !EXTENSIONS_BY_MODE[mode].includes(extension))
+  if (extra.length) notRoutedYet.push(`${mode}: ${extra.sort().join(' ')}`)
 }
 
 const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
@@ -121,10 +148,13 @@ for (const mode of MODES) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'modules', 'manifest.json'), 'utf8'))
-const combineSources = ['launcher/combine-worker.cjs', 'launcher/combine-service.cjs', 'launcher/legacy-sheet-preview.cjs', '../simple_doc_source/electron/office-converter.cjs', '../simple_pdf_source/electron/image-to-pdf.cjs']
-for (const source of combineSources) {
-  const hash = crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, source))).digest('hex')
-  assert.equal(manifest.shared?.combineSourceHashes?.[source], hash, `Combine is stale (${source}); run npm run sync.`)
+// The bundled Combine worker records every source esbuild read for it.
+const combineInputs = manifest.shared?.combineInputs
+assert.ok(combineInputs && Object.keys(combineInputs).length, 'The Combine worker was built by an older sync; run npm run sync.')
+for (const [source, recorded] of Object.entries(combineInputs)) {
+  let current = null
+  try { current = crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, source))).digest('hex') } catch {}
+  assert.equal(current, recorded, `Combine is stale (${source}); run npm run sync.`)
 }
 assert.equal(manifest.shared?.combineWorkerHash, crypto.createHash('sha256').update(fs.readFileSync(path.join(ROOT, 'modules', 'shared', 'combine-worker.cjs'))).digest('hex'), 'The bundled Combine worker differs from the manifest.')
 assert.deepEqual(Object.keys(manifest.modules).sort(), [...MODES].sort())
@@ -138,4 +168,5 @@ for (const mode of MODES) {
     `${mode} is stale; run npm run sync.`,
   )
 }
-console.log(`Verified ${SUPPORTED_EXTENSIONS.length} routes, five current source builds, and one shared icon.`)
+console.log(`Verified ${SUPPORTED_EXTENSIONS.length} routes, five current source builds, one shared icon, ${localOnly.files} local-only app files, and shared I/O code for ${sharedIo.workspaces.length ? sharedIo.workspaces.join(', ') : 'no enabled workspaces'}.`)
+if (notRoutedYet.length) console.log(`Accepted by a workspace but not routed by the unified app yet (switch them on in formats.json when integrated): ${notRoutedYet.join('; ')}.`)

@@ -334,17 +334,81 @@ function formatText(value: string, format: string, fallbackDisplay?: string): Fo
 }
 
 /**
+ * Decimal places a number section displays: digit placeholders after the decimal point, two
+ * more per `%`, three fewer per thousands-scaling comma after the last digit (`#,##0,`).
+ * Null for sections SSF must round itself (dates, fractions, scientific, General, text).
+ */
+function displayedDecimals(section: SectionInfo): number | null {
+  if (section.date || section.general) return null
+  let decimals = 0
+  let percents = 0
+  let scaling = 0
+  let afterPoint = false
+  let pendingCommas = 0
+  let sawDigit = false
+  for (const token of tokenizeFormat(section.body)) {
+    if (token.kind !== 'char') continue
+    const char = token.value
+    if (char === '/' || char === '@' || char === 'E' || char === 'e') return null
+    if (char === '0' || char === '#' || char === '?') {
+      if (afterPoint) decimals += 1
+      pendingCommas = 0
+      sawDigit = true
+    } else if (char === '.') {
+      afterPoint = true
+      scaling += pendingCommas
+      pendingCommas = 0
+    } else if (char === ',') {
+      if (sawDigit) pendingCommas += 1
+    } else {
+      if (char === '%') percents += 1
+      scaling += pendingCommas
+      pendingCommas = 0
+    }
+  }
+  scaling += pendingCommas
+  if (!sawDigit) return null
+  return decimals + 2 * percents - 3 * scaling
+}
+
+/**
+ * Round half away from zero on the value's 15-significant-digit decimal form, the way Excel
+ * rounds for display: 1.005 shows 1.01 at two places and -2.5 shows -3 at none (SSF rounds the
+ * binary value, and negative halves toward +infinity).
+ */
+function roundForDisplay(value: number, decimals: number): number {
+  if (!Number.isFinite(value) || value === 0 || Math.abs(decimals) > 300) return value
+  const magnitude = Number(Math.abs(value).toPrecision(15))
+  const shifted = shiftDecimal(magnitude, decimals)
+  if (!Number.isFinite(shifted) || shifted >= 2 ** 52) return value
+  const rounded = shiftDecimal(Math.round(shifted), -decimals)
+  // A value that rounds to zero keeps SSF's own handling (and section choice).
+  if (!Number.isFinite(rounded) || rounded === 0) return value
+  return value < 0 ? -rounded : rounded
+}
+
+function shiftDecimal(value: number, places: number) {
+  const [coefficient, exponent = '0'] = String(value).split(/[Ee]/)
+  return Number(`${coefficient}e${Number(exponent) + places}`)
+}
+
+/**
  * Formats a cell value like Excel: picks the positive/negative/zero/text section (honouring
  * `[>100]`-style conditions), applies the section's colour tag and returns the display text.
+ * A cell without a number format shows in Excel's General format (at most 11 characters, so no
+ * binary noise such as 0.30000000000000004), and logicals show as TRUE/FALSE.
  */
 export function formatScalarDetailed(value: CellScalar | undefined, numFmt?: string, fallbackDisplay?: string): FormattedScalar {
   if (value === undefined || value === null) return { text: '' }
   // A structured value must never reach the grid as "[object Object]".
   if (typeof value === 'object') return { text: fallbackDisplay ?? '' }
-  const format = String(numFmt || '').trim()
-  if (typeof value === 'string') return formatText(value, format, fallbackDisplay)
+  const explicitFormat = String(numFmt || '').trim()
+  const format = explicitFormat || 'General'
+  if (typeof value === 'string') return formatText(value, explicitFormat, fallbackDisplay)
+  if (typeof value === 'boolean') return { text: fallbackDisplay ?? (value ? 'TRUE' : 'FALSE') }
   if (typeof value !== 'number') return { text: fallbackDisplay ?? String(value) }
-  if (!format) return { text: fallbackDisplay ?? String(value) }
+  // The file's own rendering of an unformatted number wins (imported cells).
+  if (!explicitFormat && fallbackDisplay !== undefined) return { text: fallbackDisplay }
 
   const info = formatInfo(format)
   const index = info ? numberSectionIndex(info, value) : -1
@@ -366,7 +430,11 @@ export function formatScalarDetailed(value: CellScalar | undefined, numFmt?: str
     }
   }
 
-  const formatted = ssfFormat(format, value)
+  // Pre-round to the displayed precision so SSF never has to round a half. Conditional
+  // sections are left alone: rounding must not move a value across a [>=100] threshold.
+  const decimals = section && info && !info.sections.some((entry) => entry.condition) ? displayedDecimals(section) : null
+  const shown = decimals === null ? value : roundForDisplay(value, decimals)
+  const formatted = ssfFormat(format, shown)
   if (formatted !== null) return output(formatted, color)
   // Keep the workbook usable when a vendor-specific format is not supported.
   return { text: fallbackDisplay ?? String(value) }

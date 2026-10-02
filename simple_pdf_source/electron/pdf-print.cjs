@@ -16,6 +16,7 @@ const {
   pushGraphicsState,
   rectangle,
 } = require('pdf-lib')
+const { readableCopy } = require('./pdf-unlock.cjs')
 
 const PAPER_SIZES = Object.freeze({
   Letter: Object.freeze({ width: 612, height: 792, label: 'Letter' }),
@@ -540,7 +541,11 @@ function printWebContentsSilently(webContents, options = {}, lifecycle = {}) {
 }
 
 async function preparePrintPdf(data, input = {}) {
-  const source = await PDFDocument.load(data, { ignoreEncryption: true, updateMetadata: false })
+  // Loading an encrypted file with ignoreEncryption copied still-encrypted
+  // streams into an unencrypted print file, which printed blank pages. An
+  // owner-locked file is decrypted to a temporary copy; a file that needs a
+  // password raises PASSWORD_REQUIRED.
+  const source = await PDFDocument.load(await readableCopy(data), { updateMetadata: false })
   const indices = normalizedIndices(input.pageIndices, source.getPageCount())
   const output = await PDFDocument.create()
   const copiedPages = await output.copyPages(source, indices)

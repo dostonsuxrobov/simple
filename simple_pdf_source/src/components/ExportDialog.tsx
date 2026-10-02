@@ -169,7 +169,7 @@ export function ExportDialog({ documentName, pageCount, currentPage, selectedPag
           </section>
 
           {(format === 'docx' || format === 'txt' || format === 'md' || format === 'html') && (
-            <p className="export-layout-note">Text exports recover readable content. Scans need OCR, and complex columns, forms, or precise page positioning may not carry over.</p>
+            <p className="export-layout-note">Text exports recover readable content. Scans need OCR, which is offered before the export starts. Complex columns, forms, or precise page positioning may not carry over.</p>
           )}
         </div>
 

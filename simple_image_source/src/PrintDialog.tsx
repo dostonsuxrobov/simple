@@ -36,6 +36,44 @@ function millimetres(value: number) {
   return `${value.toFixed(value < 10 ? 1 : 0)} mm`
 }
 
+
+interface DraftNumberProps {
+  value: number
+  min: number
+  max: number
+  step?: number
+  setting: string
+  onCommit: (value: number) => void
+}
+
+/** Typing is free (Backspace to empty, then a new number); the value is clamped only on blur or Enter. */
+function DraftNumber({ value, min, max, step, setting, onCommit }: DraftNumberProps) {
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = () => {
+    if (draft === null) return
+    const parsed = Number(draft)
+    onCommit(Number.isFinite(parsed) && draft.trim() !== '' ? Math.min(max, Math.max(min, parsed)) : value)
+    setDraft(null)
+  }
+  return (
+    <input
+      data-print-setting={setting}
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      value={draft ?? value}
+      onChange={(event) => {
+        setDraft(event.target.value)
+        const parsed = Number(event.target.value)
+        // In-range values update the preview right away; out-of-range ones wait for blur/Enter.
+        if (event.target.value.trim() !== '' && Number.isFinite(parsed) && parsed >= min && parsed <= max) onCommit(parsed)
+      }}
+      onBlur={commit}
+      onKeyDown={(event) => { if (event.key === 'Enter') commit() }}
+    />
+  )
+}
 export function PrintDialog({ imageUrl, imageName, imageWidth, imageHeight, busy, onPrint, onClose }: PrintDialogProps) {
   const [settings, setSettings] = useState<ImagePrintSettings>(readSettings)
   const [customMargin, setCustomMargin] = useState(![0, 6.35, 12.7, 25.4].includes(settings.marginMm))
@@ -174,7 +212,7 @@ export function PrintDialog({ imageUrl, imageName, imageWidth, imageHeight, busy
               {customMargin && (
                 <label>
                   <span>Margin on every side</span>
-                  <div className="print-number-unit"><input data-print-setting="margin" type="number" min="0" max="50" step="0.5" value={settings.marginMm} onChange={(event) => update({ marginMm: Number(event.target.value) })} /><span>mm</span></div>
+                  <div className="print-number-unit"><DraftNumber setting="margin" min={0} max={50} step={0.5} value={settings.marginMm} onCommit={(marginMm) => update({ marginMm })} /><span>mm</span></div>
                 </label>
               )}
             </div>
@@ -193,7 +231,7 @@ export function PrintDialog({ imageUrl, imageName, imageWidth, imageHeight, busy
               {settings.scaleMode === 'custom' && (
                 <label>
                   <span>Custom scale</span>
-                  <div className="print-number-unit"><input data-print-setting="scale-percent" type="number" min="10" max="400" step="5" value={settings.scalePercent} onChange={(event) => update({ scalePercent: Number(event.target.value) })} /><span>%</span></div>
+                  <div className="print-number-unit"><DraftNumber setting="scale-percent" min={10} max={400} step={5} value={settings.scalePercent} onCommit={(scalePercent) => update({ scalePercent })} /><span>%</span></div>
                 </label>
               )}
               <label>
@@ -225,7 +263,7 @@ export function PrintDialog({ imageUrl, imageName, imageWidth, imageHeight, busy
             <div className="print-control-section print-last-section">
               <label>
                 <span>Copies</span>
-                <input data-print-setting="copies" type="number" min="1" max="99" value={settings.copies} onChange={(event) => update({ copies: Number(event.target.value) })} />
+                <DraftNumber setting="copies" min={1} max={99} value={settings.copies} onCommit={(copies) => update({ copies })} />
               </label>
               <small>Simple sends this layout directly to your default Windows printer.</small>
             </div>

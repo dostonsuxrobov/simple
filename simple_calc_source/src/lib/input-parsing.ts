@@ -5,14 +5,15 @@
  * one, the number format the entry implies.
  */
 
+import { excelSerialFromUtcTime, parseFormula } from './formulas'
+import type { FormulaNode } from './formulas'
+
 export interface ParsedInput {
   value: string | number | boolean
   numFmt?: string
   type?: 'date' | 'error'
 }
 
-const MS_PER_DAY = 86_400_000
-const EPOCH = Date.UTC(1899, 11, 30)
 const ERROR_LITERALS = new Set(['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A', '#SPILL!', '#CALC!'])
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']
 const CURRENCY = '[$€£¥₹₩₽]'
@@ -30,10 +31,12 @@ function monthIndex(token: string): number | null {
 function serial(year: number, month: number, day: number): number | null {
   const fullYear = year < 100 ? (year < 30 ? 2000 + year : 1900 + year) : year
   if (fullYear < 1900 || fullYear > 9999 || month < 1 || month > 12 || day < 1 || day > 31) return null
+  // Excel's 1900 date system has a 1900-02-29 (serial 60); 1900-01-01 is serial 1.
+  if (fullYear === 1900 && month === 2 && day === 29) return 60
   const timestamp = Date.UTC(fullYear, month - 1, day)
   const date = new Date(timestamp)
   if (date.getUTCFullYear() !== fullYear || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null
-  return (timestamp - EPOCH) / MS_PER_DAY
+  return excelSerialFromUtcTime(timestamp)
 }
 
 function timeFraction(hours: number, minutes: number, seconds: number, meridiem?: string): number | null {
@@ -171,6 +174,49 @@ export function parseCellInput(raw: string, now = new Date()): ParsedInput | nul
     if (Number.isFinite(number)) return { value: number }
   }
   return null
+}
+
+function readsCells(node: FormulaNode): boolean {
+  switch (node.kind) {
+    case 'reference':
+    case 'range':
+    case 'wholeRange':
+    case 'spill':
+    case 'structured':
+    case 'rangeOp':
+    case 'call':
+    case 'invoke':
+      return true
+    case 'unary':
+      return readsCells(node.operand)
+    case 'binary':
+      return readsCells(node.left) || readsCells(node.right)
+    default:
+      return false
+  }
+}
+
+/**
+ * The formula an entry typed with a leading "+" or "-" stands for, as in Excel's numeric-keypad
+ * and Lotus-style entry: "+B1+C1" is =+B1+C1 and "-A1*2" is =-A1*2. Only entries that read a
+ * cell or call a function become formulas, so "- item" and "+1-555-0100" stay text. Returns the
+ * formula without "=", or null.
+ */
+export function formulaFromSignedEntry(raw: string): string | null {
+  const text = raw.trim()
+  if (!/^[+-]/.test(text) || parseCellInput(text) !== null) return null
+  const node = parseFormula(text)
+  return typeof node !== 'string' && readsCells(node) ? text : null
+}
+
+/**
+ * Whether stored text would turn into something else (a number, date, logical, error, or
+ * formula) if it were typed again as shown, so the editor must show it with Excel's leading
+ * apostrophe to keep it text.
+ */
+export function textNeedsQuotePrefix(text: string): boolean {
+  if (text.startsWith("'") || text.startsWith('=')) return true
+  return parseCellInput(text) !== null || formulaFromSignedEntry(text) !== null
 }
 
 const DATE_FUNCTIONS: Record<string, string> = {

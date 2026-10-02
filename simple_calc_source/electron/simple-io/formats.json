@@ -1,0 +1,2732 @@
+{
+  "schemaVersion": 1,
+  "about": "Single source of truth for every file format Simple opens, saves or exports. formats.cjs reads it; routing, file associations, Open filters, sniffing and Export lists are derived from it. An operation is live only when its status is active (the default). Planned operations stay inert until a workspace integrator marks them active.",
+  "routeModes": [
+    "docs",
+    "pdf",
+    "image",
+    "video",
+    "calc"
+  ],
+  "workspaces": {
+    "docs": {
+      "label": "Simple Documents",
+      "kind": "documents"
+    },
+    "pdf": {
+      "label": "Simple PDF",
+      "kind": "files"
+    },
+    "image": {
+      "label": "Simple Images",
+      "kind": "images"
+    },
+    "video": {
+      "label": "Simple Video",
+      "kind": "videos"
+    },
+    "calc": {
+      "label": "Simple Spreadsheets",
+      "kind": "spreadsheets"
+    },
+    "combine": {
+      "label": "Combine into PDF",
+      "kind": "files",
+      "routed": false
+    }
+  },
+  "associations": {
+    "icon": "build/icon.ico",
+    "groups": {
+      "docs": {
+        "name": "simple document",
+        "description": "Document opened by simple",
+        "role": "Editor"
+      },
+      "pdf": {
+        "name": "simple readable file",
+        "description": "Readable file opened by simple",
+        "role": "Editor"
+      },
+      "image": {
+        "name": "simple image",
+        "description": "Image opened by simple",
+        "role": "Editor"
+      },
+      "video": {
+        "name": "simple video",
+        "description": "Video opened by simple",
+        "role": "Viewer"
+      },
+      "calc": {
+        "name": "simple spreadsheet",
+        "description": "Spreadsheet opened by simple",
+        "role": "Editor"
+      }
+    }
+  },
+  "dialogs": {
+    "docs": {
+      "all": "All documents",
+      "groups": [
+        {
+          "name": "Word documents",
+          "formats": [
+            "docx",
+            "docm",
+            "dotx",
+            "dotm",
+            "doc"
+          ]
+        },
+        {
+          "name": "Rich Text and OpenDocument",
+          "formats": [
+            "rtf",
+            "odt"
+          ]
+        },
+        {
+          "name": "Text and Markdown",
+          "formats": [
+            "txt",
+            "md"
+          ]
+        },
+        {
+          "name": "Web pages",
+          "formats": [
+            "html"
+          ]
+        },
+        {
+          "name": "Word 2003 XML",
+          "formats": [
+            "xml"
+          ]
+        }
+      ]
+    },
+    "pdf": {
+      "all": "All supported files",
+      "groups": [
+        {
+          "name": "PDF files",
+          "formats": [
+            "pdf"
+          ]
+        },
+        {
+          "name": "Images",
+          "families": [
+            "image"
+          ]
+        },
+        {
+          "name": "Word and text documents",
+          "families": [
+            "document"
+          ]
+        },
+        {
+          "name": "Spreadsheets",
+          "families": [
+            "spreadsheet"
+          ]
+        },
+        {
+          "name": "Presentations",
+          "families": [
+            "presentation"
+          ]
+        },
+        {
+          "name": "Text files",
+          "families": [
+            "text"
+          ]
+        },
+        {
+          "name": "Web pages",
+          "families": [
+            "web"
+          ]
+        }
+      ]
+    },
+    "image": {
+      "all": "All images",
+      "groups": "per-format"
+    },
+    "video": {
+      "all": "All videos",
+      "groups": "per-format"
+    },
+    "calc": {
+      "all": "All spreadsheets",
+      "groups": [
+        {
+          "name": "Excel workbooks",
+          "formats": [
+            "xlsx",
+            "xlsm",
+            "xlsb",
+            "xls",
+            "xltx",
+            "xltm",
+            "xlt",
+            "xlam",
+            "xla"
+          ]
+        },
+        {
+          "name": "OpenDocument spreadsheets",
+          "formats": [
+            "ods",
+            "fods"
+          ]
+        },
+        {
+          "name": "Delimited text",
+          "families": [
+            "text"
+          ]
+        },
+        {
+          "name": "Other spreadsheets",
+          "formats": [
+            "numbers",
+            "sylk",
+            "dif",
+            "dbf",
+            "lotus",
+            "quattro-dos",
+            "quattro-win",
+            "lotus-123",
+            "quattro-pro",
+            "xml",
+            "html",
+            "json"
+          ]
+        }
+      ]
+    },
+    "launcher": {
+      "all": "All supported files",
+      "groups": [
+        {
+          "name": "Documents",
+          "routes": [
+            "docs"
+          ]
+        },
+        {
+          "name": "Spreadsheets",
+          "routes": [
+            "calc"
+          ]
+        },
+        {
+          "name": "PDF and text",
+          "routes": [
+            "pdf"
+          ]
+        },
+        {
+          "name": "Images",
+          "routes": [
+            "image"
+          ]
+        },
+        {
+          "name": "Videos",
+          "routes": [
+            "video"
+          ]
+        }
+      ]
+    },
+    "combine": {
+      "all": "All supported files",
+      "groups": [
+        {
+          "name": "PDF files",
+          "formats": [
+            "pdf"
+          ]
+        },
+        {
+          "name": "Word documents",
+          "families": [
+            "document"
+          ]
+        },
+        {
+          "name": "Spreadsheets",
+          "formats": [
+            "xlsx",
+            "xls",
+            "ods",
+            "csv"
+          ]
+        },
+        {
+          "name": "Images",
+          "families": [
+            "image"
+          ]
+        }
+      ]
+    }
+  },
+  "contentKinds": [
+    {
+      "id": "delimited-text",
+      "label": "Delimited text",
+      "family": "text",
+      "format": "csv",
+      "route": [
+        "calc"
+      ]
+    },
+    {
+      "id": "excel-html",
+      "label": "Excel web page",
+      "family": "web",
+      "format": "html",
+      "route": [
+        "calc"
+      ]
+    },
+    {
+      "id": "html-table",
+      "label": "Web page table",
+      "family": "web",
+      "format": "html",
+      "route": [
+        "calc"
+      ]
+    },
+    {
+      "id": "spreadsheetml-2003",
+      "label": "XML Spreadsheet 2003",
+      "family": "spreadsheet",
+      "format": "xml",
+      "route": [
+        "calc"
+      ]
+    },
+    {
+      "id": "wordml-2003",
+      "label": "Word 2003 XML document",
+      "family": "document",
+      "format": "xml",
+      "route": [
+        "docs"
+      ]
+    },
+    {
+      "id": "ooxml-encrypted",
+      "label": "Password-protected Office file",
+      "family": "encrypted",
+      "format": null,
+      "route": [],
+      "encrypted": true
+    },
+    {
+      "id": "psb",
+      "label": "Photoshop large document",
+      "family": "image",
+      "format": null,
+      "route": []
+    },
+    {
+      "id": "odf",
+      "label": "OpenDocument file",
+      "family": "archive",
+      "format": null,
+      "route": []
+    },
+    {
+      "id": "cfb",
+      "label": "Microsoft compound file",
+      "family": "binary",
+      "format": null,
+      "route": []
+    },
+    {
+      "id": "zip",
+      "label": "ZIP archive",
+      "family": "archive",
+      "format": null,
+      "route": []
+    },
+    {
+      "id": "gzip",
+      "label": "Gzip archive",
+      "family": "archive",
+      "format": null,
+      "route": []
+    },
+    {
+      "id": "binary",
+      "label": "Unknown binary file",
+      "family": "binary",
+      "format": null,
+      "route": []
+    },
+    {
+      "id": "empty",
+      "label": "Empty file",
+      "family": "empty",
+      "format": null,
+      "route": []
+    }
+  ],
+  "formats": [
+    {
+      "id": "docx",
+      "label": "Word document",
+      "family": "document",
+      "status": "active",
+      "extensions": [
+        ".docx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "route": [
+        "docs"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-word",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "[Content_Types].xml + word/"
+        }
+      ],
+      "matches": [
+        "docx",
+        "docm",
+        "dotx",
+        "dotm"
+      ],
+      "description": "Editable in Word and most word processors.",
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "engine": "upgrade",
+            "withEngine": "original-layout preview"
+          },
+          "save": "in-place",
+          "export": "native"
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "engine": "required",
+            "note": "mammoth import (PDF-SIE-12) will make the engine an upgrade"
+          },
+          "save": "sibling:pdf",
+          "export": "native"
+        },
+        "combine": {
+          "open": {
+            "mode": "convert",
+            "engine": "upgrade",
+            "withoutEngine": "laid out by Simple",
+            "withEngine": "original layout"
+          }
+        }
+      }
+    },
+    {
+      "id": "docm",
+      "label": "Word macro-enabled document",
+      "family": "document",
+      "status": "planned",
+      "extensions": [
+        ".docm"
+      ],
+      "mime": "application/vnd.ms-word.document.macroEnabled.12",
+      "route": [
+        "docs"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-word",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "word/ + word/vbaProject.bin"
+        }
+      ],
+      "matches": [
+        "docm",
+        "docx"
+      ],
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned",
+            "note": "macros are not run or kept"
+          },
+          "save": "sibling:docx"
+        }
+      }
+    },
+    {
+      "id": "dotx",
+      "label": "Word template",
+      "family": "document",
+      "status": "planned",
+      "extensions": [
+        ".dotx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+      "route": [
+        "docs"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-word",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "word/ + wordprocessingml.template content type"
+        }
+      ],
+      "matches": [
+        "dotx",
+        "docx",
+        "dotm",
+        "docm"
+      ],
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned",
+            "note": "opens as an untitled document"
+          },
+          "save": "sibling:docx"
+        }
+      }
+    },
+    {
+      "id": "dotm",
+      "label": "Word macro-enabled template",
+      "family": "document",
+      "status": "planned",
+      "extensions": [
+        ".dotm"
+      ],
+      "mime": "application/vnd.ms-word.template.macroEnabled.12",
+      "route": [
+        "docs"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-word",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "word/ + macro-enabled template content type"
+        }
+      ],
+      "matches": [
+        "dotm",
+        "dotx",
+        "docm",
+        "docx"
+      ],
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned",
+            "note": "opens as an untitled document; macros are not run or kept"
+          },
+          "save": "sibling:docx"
+        }
+      }
+    },
+    {
+      "id": "doc",
+      "label": "Word 97–2003 document",
+      "family": "document",
+      "status": "active",
+      "extensions": [
+        ".doc"
+      ],
+      "mime": "application/msword",
+      "route": [
+        "docs"
+      ],
+      "routeBy": "extension",
+      "validator": "cfb",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "d0cf11e0a1b11ae1",
+          "cfb": "WordDocument"
+        }
+      ],
+      "description": "For very old versions of Word.",
+      "lossy": {
+        "keeps": "text and basic formatting",
+        "loses": [
+          "layout fidelity"
+        ]
+      },
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "text-only",
+            "engine": "upgrade",
+            "withoutEngine": "text only, with a visible warning",
+            "withEngine": "full formatting"
+          },
+          "save": {
+            "mode": "engine",
+            "fallback": "sibling:docx"
+          },
+          "export": {
+            "mode": "engine",
+            "engine": "required",
+            "status": "planned"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "engine": "required",
+            "note": "word-extractor text import will make the engine an upgrade"
+          },
+          "save": "sibling:pdf"
+        },
+        "combine": {
+          "open": {
+            "mode": "convert",
+            "engine": "required"
+          }
+        }
+      }
+    },
+    {
+      "id": "rtf",
+      "label": "Rich Text document",
+      "family": "document",
+      "status": "planned",
+      "extensions": [
+        ".rtf"
+      ],
+      "mime": "application/rtf",
+      "route": [
+        "docs"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "{\\rtf"
+        }
+      ],
+      "description": "For WordPad and older word processors.",
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned",
+            "engine": "upgrade"
+          },
+          "save": "sibling:docx",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "upgrade"
+          },
+          "save": "sibling:pdf"
+        }
+      }
+    },
+    {
+      "id": "odt",
+      "label": "OpenDocument text",
+      "family": "document",
+      "status": "planned",
+      "extensions": [
+        ".odt"
+      ],
+      "mime": "application/vnd.oasis.opendocument.text",
+      "route": [
+        "docs"
+      ],
+      "routeBy": "extension",
+      "validator": "odf",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "mimetype": "application/vnd.oasis.opendocument.text"
+        }
+      ],
+      "description": "For LibreOffice and other OpenDocument apps.",
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned",
+            "engine": "upgrade"
+          },
+          "save": "sibling:docx",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "upgrade"
+          },
+          "save": "sibling:pdf"
+        }
+      }
+    },
+    {
+      "id": "pdf",
+      "label": "PDF document",
+      "family": "pdf",
+      "status": "active",
+      "extensions": [
+        ".pdf"
+      ],
+      "mime": "application/pdf",
+      "route": [
+        "pdf"
+      ],
+      "routeBy": "extension",
+      "validator": "pdf",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "%PDF-",
+          "within": 1024
+        }
+      ],
+      "description": "Looks the same everywhere, for sharing and printing.",
+      "workspaces": {
+        "pdf": {
+          "open": "native",
+          "save": "in-place",
+          "export": "native"
+        },
+        "docs": {
+          "export": "native"
+        },
+        "calc": {
+          "export": "native"
+        },
+        "image": {
+          "export": "native"
+        },
+        "combine": {
+          "open": "native"
+        }
+      }
+    },
+    {
+      "id": "txt",
+      "label": "Plain text",
+      "family": "text",
+      "status": "active",
+      "extensions": [
+        ".txt"
+      ],
+      "mime": "text/plain",
+      "route": [
+        "docs",
+        "pdf"
+      ],
+      "routeBy": "content",
+      "contentRoutes": {
+        "delimited-text": [
+          "calc"
+        ]
+      },
+      "validator": "text",
+      "matches": [
+        "txt",
+        "md",
+        "delimited-text"
+      ],
+      "description": "Text only, no formatting.",
+      "lossy": {
+        "keeps": "text",
+        "loses": [
+          "formatting",
+          "images",
+          "tables"
+        ]
+      },
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned"
+          },
+          "save": {
+            "mode": "in-place",
+            "status": "planned"
+          },
+          "export": "native"
+        },
+        "pdf": {
+          "open": "convert",
+          "save": "sibling:pdf",
+          "export": "native"
+        },
+        "calc": {
+          "open": {
+            "mode": "native",
+            "note": "delimited text import"
+          },
+          "save": {
+            "mode": "in-place",
+            "status": "planned",
+            "fallback": "sibling:xlsx"
+          }
+        }
+      }
+    },
+    {
+      "id": "md",
+      "label": "Markdown document",
+      "family": "text",
+      "status": "active",
+      "extensions": [
+        ".md"
+      ],
+      "mime": "text/markdown",
+      "route": [
+        "docs",
+        "pdf"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "matches": [
+        "md",
+        "txt",
+        "delimited-text"
+      ],
+      "description": "Plain text with headings and lists.",
+      "lossy": {
+        "keeps": "text, headings, lists and simple tables",
+        "loses": [
+          "fonts",
+          "colors",
+          "layout"
+        ]
+      },
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned"
+          },
+          "save": {
+            "mode": "in-place",
+            "status": "planned"
+          },
+          "export": "native"
+        },
+        "pdf": {
+          "open": "convert",
+          "save": "sibling:pdf",
+          "export": "native"
+        },
+        "calc": {
+          "export": {
+            "mode": "native",
+            "status": "planned",
+            "label": "Markdown table"
+          }
+        }
+      }
+    },
+    {
+      "id": "png",
+      "label": "PNG image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".png"
+      ],
+      "mime": "image/png",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "png",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "89504e470d0a1a0a"
+        }
+      ],
+      "matches": [
+        "png",
+        "apng"
+      ],
+      "description": "Lossless, keeps transparency.",
+      "workspaces": {
+        "image": {
+          "open": "native",
+          "save": "in-place",
+          "export": "native"
+        },
+        "pdf": {
+          "open": "convert",
+          "save": "sibling:pdf",
+          "export": "native"
+        },
+        "video": {
+          "export": {
+            "mode": "native",
+            "label": "Frame as PNG"
+          }
+        },
+        "combine": {
+          "open": "convert"
+        }
+      }
+    },
+    {
+      "id": "jpeg",
+      "label": "JPEG image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".jpg",
+        ".jpeg"
+      ],
+      "mime": "image/jpeg",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "jpeg",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "ffd8ff"
+        }
+      ],
+      "description": "Small files for photos, no transparency.",
+      "lossy": {
+        "keeps": "pixels",
+        "loses": [
+          "transparency",
+          "exact colors"
+        ]
+      },
+      "workspaces": {
+        "image": {
+          "open": "native",
+          "save": "in-place",
+          "export": "native"
+        },
+        "pdf": {
+          "open": "convert",
+          "save": "sibling:pdf",
+          "export": "native"
+        },
+        "video": {
+          "export": {
+            "mode": "native",
+            "label": "Frame as JPEG"
+          }
+        },
+        "combine": {
+          "open": "convert"
+        }
+      }
+    },
+    {
+      "id": "jfif",
+      "label": "JPEG image (JFIF)",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".jfif",
+        ".jpe",
+        ".jif"
+      ],
+      "mime": "image/jpeg",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "jpeg",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "ffd8ff"
+        }
+      ],
+      "matches": [
+        "jpeg"
+      ],
+      "workspaces": {
+        "image": {
+          "open": {
+            "mode": "native",
+            "status": "active"
+          },
+          "save": {
+            "mode": "in-place",
+            "status": "active"
+          }
+        }
+      }
+    },
+    {
+      "id": "webp",
+      "label": "WebP image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".webp"
+      ],
+      "mime": "image/webp",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "webp",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "RIFF"
+        },
+        {
+          "offset": 8,
+          "ascii": "WEBP"
+        }
+      ],
+      "description": "Small files with transparency, for modern browsers.",
+      "workspaces": {
+        "image": {
+          "open": "native",
+          "save": "in-place",
+          "export": "native"
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned"
+          },
+          "save": "sibling:pdf",
+          "export": "native"
+        }
+      }
+    },
+    {
+      "id": "gif",
+      "label": "GIF image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".gif"
+      ],
+      "mime": "image/gif",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "gif",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "GIF8"
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": "native",
+          "save": "sibling:png",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned"
+          },
+          "save": "sibling:pdf"
+        }
+      }
+    },
+    {
+      "id": "apng",
+      "label": "Animated PNG image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".apng"
+      ],
+      "mime": "image/apng",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "png",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "89504e470d0a1a0a",
+          "chunk": "acTL before IDAT"
+        }
+      ],
+      "matches": [
+        "apng",
+        "png"
+      ],
+      "workspaces": {
+        "image": {
+          "open": {
+            "mode": "native",
+            "status": "active"
+          },
+          "save": "sibling:png"
+        }
+      }
+    },
+    {
+      "id": "bmp",
+      "label": "Bitmap image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".bmp"
+      ],
+      "mime": "image/bmp",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "bmp",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "BM"
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": "native",
+          "save": "sibling:png",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned"
+          },
+          "save": "sibling:pdf"
+        }
+      }
+    },
+    {
+      "id": "svg",
+      "label": "SVG image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".svg"
+      ],
+      "mime": "image/svg+xml",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "magic": [
+        {
+          "offset": 0,
+          "text": "<svg"
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": "native",
+          "save": "sibling:png"
+        }
+      }
+    },
+    {
+      "id": "svgz",
+      "label": "Compressed SVG image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".svgz"
+      ],
+      "mime": "image/svg+xml",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "1f8b",
+          "gunzip": "<svg"
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": {
+            "mode": "native",
+            "status": "active"
+          },
+          "save": "sibling:png"
+        }
+      }
+    },
+    {
+      "id": "avif",
+      "label": "AVIF image",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".avif"
+      ],
+      "mime": "image/avif",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 4,
+          "ascii": "ftyp",
+          "brands": [
+            "avif",
+            "avis"
+          ]
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": "native",
+          "save": "sibling:png"
+        }
+      }
+    },
+    {
+      "id": "ico",
+      "label": "Windows icon",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".ico"
+      ],
+      "mime": "image/vnd.microsoft.icon",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "ico",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "00000100"
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": {
+            "mode": "native",
+            "status": "active"
+          },
+          "save": "sibling:png",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        }
+      }
+    },
+    {
+      "id": "tiff",
+      "label": "TIFF image",
+      "family": "image",
+      "status": "planned",
+      "extensions": [
+        ".tif",
+        ".tiff"
+      ],
+      "mime": "image/tiff",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "tiff",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "49492a00"
+        },
+        {
+          "offset": 0,
+          "hex": "4d4d002a"
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": {
+            "mode": "native",
+            "status": "planned"
+          },
+          "save": "sibling:png",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned"
+          },
+          "save": "sibling:pdf",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        }
+      }
+    },
+    {
+      "id": "heic",
+      "label": "HEIC photo",
+      "family": "image",
+      "status": "planned",
+      "extensions": [
+        ".heic",
+        ".heif"
+      ],
+      "mime": "image/heic",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 4,
+          "ascii": "ftyp",
+          "brands": [
+            "heic",
+            "heix",
+            "hevc",
+            "hevx",
+            "heim",
+            "heis",
+            "mif1",
+            "msf1"
+          ]
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": {
+            "mode": "native",
+            "status": "planned"
+          },
+          "save": "sibling:png"
+        }
+      }
+    },
+    {
+      "id": "psd",
+      "label": "Photoshop document",
+      "family": "image",
+      "status": "active",
+      "extensions": [
+        ".psd"
+      ],
+      "mime": "image/vnd.adobe.photoshop",
+      "route": [
+        "image"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "8BPS"
+        },
+        {
+          "offset": 4,
+          "hex": "0001"
+        }
+      ],
+      "workspaces": {
+        "image": {
+          "open": {
+            "mode": "native",
+            "status": "active",
+            "note": "opens with its layers in Advanced mode"
+          },
+          "save": {
+            "mode": "in-place",
+            "status": "active",
+            "note": "layered PSD from Advanced mode"
+          }
+        }
+      }
+    },
+    {
+      "id": "mp4",
+      "label": "MP4 video",
+      "family": "video",
+      "status": "active",
+      "extensions": [
+        ".mp4",
+        ".m4v"
+      ],
+      "mime": "video/mp4",
+      "route": [
+        "video"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 4,
+          "ascii": "ftyp",
+          "brands": [
+            "isom",
+            "iso2",
+            "mp41",
+            "mp42",
+            "avc1",
+            "M4V "
+          ]
+        }
+      ],
+      "matches": [
+        "mp4",
+        "mov"
+      ],
+      "workspaces": {
+        "video": {
+          "open": "view",
+          "export": {
+            "mode": "native",
+            "label": "Copy of the original"
+          }
+        }
+      }
+    },
+    {
+      "id": "webm",
+      "label": "WebM video",
+      "family": "video",
+      "status": "active",
+      "extensions": [
+        ".webm"
+      ],
+      "mime": "video/webm",
+      "route": [
+        "video"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "1a45dfa3",
+          "docType": "webm"
+        }
+      ],
+      "matches": [
+        "webm",
+        "mkv"
+      ],
+      "workspaces": {
+        "video": {
+          "open": "view",
+          "export": {
+            "mode": "native",
+            "label": "Copy of the original"
+          }
+        }
+      }
+    },
+    {
+      "id": "ogv",
+      "label": "Ogg video",
+      "family": "video",
+      "status": "active",
+      "extensions": [
+        ".ogv"
+      ],
+      "mime": "video/ogg",
+      "route": [
+        "video"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "OggS"
+        }
+      ],
+      "workspaces": {
+        "video": {
+          "open": "view",
+          "export": {
+            "mode": "native",
+            "label": "Copy of the original"
+          }
+        }
+      }
+    },
+    {
+      "id": "mov",
+      "label": "QuickTime video",
+      "family": "video",
+      "status": "active",
+      "extensions": [
+        ".mov"
+      ],
+      "mime": "video/quicktime",
+      "route": [
+        "video"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 4,
+          "ascii": "ftyp",
+          "brands": [
+            "qt  "
+          ]
+        }
+      ],
+      "matches": [
+        "mov",
+        "mp4"
+      ],
+      "workspaces": {
+        "video": {
+          "open": "view",
+          "export": {
+            "mode": "native",
+            "label": "Copy of the original"
+          }
+        }
+      }
+    },
+    {
+      "id": "mkv",
+      "label": "Matroska video",
+      "family": "video",
+      "status": "active",
+      "extensions": [
+        ".mkv"
+      ],
+      "mime": "video/x-matroska",
+      "route": [
+        "video"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "1a45dfa3",
+          "docType": "matroska"
+        }
+      ],
+      "matches": [
+        "mkv",
+        "webm"
+      ],
+      "workspaces": {
+        "video": {
+          "open": "view",
+          "export": {
+            "mode": "native",
+            "label": "Copy of the original"
+          }
+        }
+      }
+    },
+    {
+      "id": "xlsx",
+      "label": "Excel workbook",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xlsx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-excel",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "[Content_Types].xml + xl/"
+        }
+      ],
+      "matches": [
+        "xlsx",
+        "xlsm",
+        "xltx",
+        "xltm",
+        "xlam"
+      ],
+      "description": "Keeps formulas, formatting and every sheet.",
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "in-place",
+          "export": "native"
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "upgrade"
+          },
+          "save": "sibling:pdf",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        },
+        "combine": {
+          "open": {
+            "mode": "convert",
+            "engine": "upgrade",
+            "withoutEngine": "laid out by Simple",
+            "withEngine": "original layout"
+          }
+        }
+      }
+    },
+    {
+      "id": "xlsm",
+      "label": "Excel macro-enabled workbook",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xlsm"
+      ],
+      "mime": "application/vnd.ms-excel.sheet.macroEnabled.12",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-excel",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "xl/ + xl/vbaProject.bin"
+        }
+      ],
+      "matches": [
+        "xlsm",
+        "xlsx"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": {
+            "mode": "in-place",
+            "status": "planned",
+            "fallback": "sibling:xlsx"
+          }
+        }
+      }
+    },
+    {
+      "id": "xlsb",
+      "label": "Excel binary workbook",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xlsb"
+      ],
+      "mime": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "zip",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "xl/workbook.bin"
+        }
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "xls",
+      "label": "Excel 97–2003 workbook",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xls"
+      ],
+      "mime": "application/vnd.ms-excel",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "cfb",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "d0cf11e0a1b11ae1",
+          "cfb": "Workbook|Book"
+        }
+      ],
+      "description": "For very old Excel.",
+      "lossy": {
+        "keeps": "values",
+        "loses": [
+          "formulas",
+          "formatting",
+          "charts",
+          "images"
+        ]
+      },
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": {
+            "mode": "engine",
+            "fallback": "sibling:xlsx"
+          },
+          "export": {
+            "mode": "values-only",
+            "engine": "upgrade",
+            "withEngine": "full fidelity"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "upgrade"
+          },
+          "save": "sibling:pdf"
+        },
+        "combine": {
+          "open": {
+            "mode": "convert",
+            "engine": "required"
+          }
+        }
+      }
+    },
+    {
+      "id": "xltx",
+      "label": "Excel template",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xltx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-excel",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "xl/ + spreadsheetml.template content type"
+        }
+      ],
+      "matches": [
+        "xltx",
+        "xlsx",
+        "xltm",
+        "xlsm"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "xltm",
+      "label": "Excel macro-enabled template",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xltm"
+      ],
+      "mime": "application/vnd.ms-excel.template.macroEnabled.12",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-excel",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "xl/ + macro-enabled template content type"
+        }
+      ],
+      "matches": [
+        "xltm",
+        "xltx",
+        "xlsm",
+        "xlsx"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "xlt",
+      "label": "Excel 97–2003 template",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xlt"
+      ],
+      "mime": "application/vnd.ms-excel",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "cfb",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "d0cf11e0a1b11ae1",
+          "cfb": "Workbook|Book"
+        }
+      ],
+      "matches": [
+        "xls"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "xlam",
+      "label": "Excel add-in",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xlam"
+      ],
+      "mime": "application/vnd.ms-excel.addin.macroEnabled.12",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "ooxml-excel",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "xl/ + add-in content type"
+        }
+      ],
+      "matches": [
+        "xlam",
+        "xlsm",
+        "xlsx"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": {
+            "mode": "in-place",
+            "status": "planned",
+            "fallback": "sibling:xlsx"
+          }
+        }
+      }
+    },
+    {
+      "id": "xla",
+      "label": "Excel 97–2003 add-in",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xla"
+      ],
+      "mime": "application/vnd.ms-excel",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "cfb",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "d0cf11e0a1b11ae1",
+          "cfb": "Workbook|Book"
+        }
+      ],
+      "matches": [
+        "xls"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "xml",
+      "label": "XML file",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".xml"
+      ],
+      "mime": "application/xml",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "content",
+      "contentRoutes": {
+        "wordml-2003": [
+          "docs"
+        ]
+      },
+      "validator": "text",
+      "matches": [
+        "xml",
+        "spreadsheetml-2003",
+        "wordml-2003",
+        "fods",
+        "svg",
+        "html"
+      ],
+      "description": "XML Spreadsheet 2003, for older Excel and data tools.",
+      "workspaces": {
+        "calc": {
+          "open": {
+            "mode": "native",
+            "note": "XML Spreadsheet 2003 and XML data"
+          },
+          "save": "sibling:xlsx",
+          "export": {
+            "mode": "native",
+            "status": "planned",
+            "label": "XML Spreadsheet 2003"
+          }
+        },
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned",
+            "note": "Word 2003 XML"
+          },
+          "save": "sibling:docx"
+        }
+      }
+    },
+    {
+      "id": "ods",
+      "label": "OpenDocument spreadsheet",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".ods"
+      ],
+      "mime": "application/vnd.oasis.opendocument.spreadsheet",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "odf",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "mimetype": "application/vnd.oasis.opendocument.spreadsheet"
+        }
+      ],
+      "description": "For LibreOffice.",
+      "lossy": {
+        "keeps": "values, formulas and basic formatting",
+        "loses": [
+          "charts",
+          "conditional formatting",
+          "data validation"
+        ]
+      },
+      "workspaces": {
+        "calc": {
+          "open": {
+            "mode": "native",
+            "engine": "upgrade"
+          },
+          "save": {
+            "mode": "engine",
+            "fallback": "sibling:xlsx"
+          },
+          "export": {
+            "mode": "basic",
+            "engine": "upgrade",
+            "withEngine": "full fidelity"
+          }
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "upgrade"
+          },
+          "save": "sibling:pdf"
+        },
+        "combine": {
+          "open": {
+            "mode": "convert",
+            "engine": "upgrade",
+            "withoutEngine": "laid out by Simple",
+            "withEngine": "original layout"
+          }
+        }
+      }
+    },
+    {
+      "id": "fods",
+      "label": "Flat OpenDocument spreadsheet",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".fods"
+      ],
+      "mime": "application/vnd.oasis.opendocument.spreadsheet",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "magic": [
+        {
+          "offset": 0,
+          "text": "<office:document"
+        }
+      ],
+      "matches": [
+        "fods",
+        "xml"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "csv",
+      "label": "Comma-separated values",
+      "family": "text",
+      "status": "active",
+      "extensions": [
+        ".csv"
+      ],
+      "mime": "text/csv",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "matches": [
+        "csv",
+        "delimited-text",
+        "txt",
+        "md"
+      ],
+      "description": "Values from one sheet, for other apps.",
+      "lossy": {
+        "keeps": "values from one sheet",
+        "loses": [
+          "formulas",
+          "formatting",
+          "other sheets",
+          "charts",
+          "images"
+        ]
+      },
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "in-place",
+          "export": "native"
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned"
+          },
+          "save": "sibling:pdf",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        },
+        "combine": {
+          "open": "convert"
+        }
+      }
+    },
+    {
+      "id": "tsv",
+      "label": "Tab-separated values",
+      "family": "text",
+      "status": "active",
+      "extensions": [
+        ".tsv"
+      ],
+      "mime": "text/tab-separated-values",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "matches": [
+        "tsv",
+        "delimited-text",
+        "txt"
+      ],
+      "description": "Like CSV, separated by tabs.",
+      "lossy": {
+        "keeps": "values from one sheet",
+        "loses": [
+          "formulas",
+          "formatting",
+          "other sheets",
+          "charts",
+          "images"
+        ]
+      },
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "in-place",
+          "export": "native"
+        }
+      }
+    },
+    {
+      "id": "tab",
+      "label": "Tab-delimited text",
+      "family": "text",
+      "status": "active",
+      "extensions": [
+        ".tab"
+      ],
+      "mime": "text/tab-separated-values",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "matches": [
+        "tab",
+        "delimited-text",
+        "txt"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": {
+            "mode": "in-place",
+            "status": "planned",
+            "fallback": "sibling:xlsx"
+          }
+        }
+      }
+    },
+    {
+      "id": "numbers",
+      "label": "Apple Numbers spreadsheet",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".numbers"
+      ],
+      "mime": "application/vnd.apple.numbers",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "zip",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "Index/Document.iwa"
+        }
+      ],
+      "matches": [
+        "numbers",
+        "zip"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "sylk",
+      "label": "SYLK spreadsheet",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".slk",
+        ".sylk"
+      ],
+      "mime": "application/x-sylk",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "ID;"
+        }
+      ],
+      "matches": [
+        "sylk",
+        "txt",
+        "delimited-text"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "dif",
+      "label": "Data Interchange Format",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".dif"
+      ],
+      "mime": "application/x-dif",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "magic": [
+        {
+          "offset": 0,
+          "ascii": "TABLE"
+        }
+      ],
+      "matches": [
+        "dif",
+        "txt",
+        "delimited-text"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "dbf",
+      "label": "dBASE table",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".dbf"
+      ],
+      "mime": "application/x-dbf",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "matches": [
+        "dbf",
+        "binary"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "prn",
+      "label": "Formatted text",
+      "family": "text",
+      "status": "active",
+      "extensions": [
+        ".prn"
+      ],
+      "mime": "text/plain",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "text",
+      "matches": [
+        "prn",
+        "txt",
+        "delimited-text"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "lotus",
+      "label": "Lotus 1-2-3 worksheet",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".wk1",
+        ".wk2",
+        ".wk3",
+        ".wk4",
+        ".wks"
+      ],
+      "mime": "application/vnd.lotus-1-2-3",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "matches": [
+        "lotus",
+        "binary"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "quattro-dos",
+      "label": "Quattro Pro for DOS worksheet",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".wq1",
+        ".wq2"
+      ],
+      "mime": "application/x-quattro-pro",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "matches": [
+        "quattro-dos",
+        "binary"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "quattro-win",
+      "label": "Quattro Pro notebook",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".wb1",
+        ".wb2",
+        ".wb3"
+      ],
+      "mime": "application/x-quattro-pro",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "matches": [
+        "quattro-win",
+        "binary",
+        "cfb"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "lotus-123",
+      "label": "Lotus 1-2-3 workbook",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".123"
+      ],
+      "mime": "application/vnd.lotus-1-2-3",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "matches": [
+        "lotus-123",
+        "binary"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "quattro-pro",
+      "label": "Quattro Pro workbook",
+      "family": "spreadsheet",
+      "status": "active",
+      "extensions": [
+        ".qpw"
+      ],
+      "mime": "application/x-quattro-pro",
+      "route": [
+        "calc"
+      ],
+      "routeBy": "extension",
+      "validator": "none",
+      "matches": [
+        "quattro-pro",
+        "binary",
+        "cfb"
+      ],
+      "workspaces": {
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx"
+        }
+      }
+    },
+    {
+      "id": "html",
+      "label": "Web page",
+      "family": "web",
+      "status": "active",
+      "extensions": [
+        ".html",
+        ".htm"
+      ],
+      "mime": "text/html",
+      "route": [
+        "docs",
+        "calc"
+      ],
+      "routeBy": "content",
+      "contentRoutes": {
+        "excel-html": [
+          "calc"
+        ],
+        "html-table": [
+          "calc"
+        ]
+      },
+      "validator": "text",
+      "matches": [
+        "html",
+        "excel-html",
+        "html-table",
+        "xml",
+        "txt"
+      ],
+      "description": "Opens in any browser.",
+      "workspaces": {
+        "docs": {
+          "open": {
+            "mode": "native",
+            "status": "planned",
+            "note": "sanitized import"
+          },
+          "save": "sibling:docx",
+          "export": "native"
+        },
+        "calc": {
+          "open": "native",
+          "save": "sibling:xlsx",
+          "export": "native"
+        },
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned"
+          },
+          "save": "sibling:pdf",
+          "export": "native"
+        }
+      }
+    },
+    {
+      "id": "json",
+      "label": "JSON data",
+      "family": "data",
+      "status": "planned",
+      "extensions": [
+        ".json"
+      ],
+      "mime": "application/json",
+      "route": [],
+      "routeBy": "extension",
+      "validator": "json",
+      "description": "Rows as records, for developers.",
+      "workspaces": {
+        "calc": {
+          "open": {
+            "mode": "native",
+            "status": "planned"
+          },
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        }
+      }
+    },
+    {
+      "id": "pptx",
+      "label": "PowerPoint presentation",
+      "family": "presentation",
+      "status": "planned",
+      "extensions": [
+        ".pptx"
+      ],
+      "mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "route": [],
+      "routeBy": "extension",
+      "validator": "ooxml-powerpoint",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "zip": "[Content_Types].xml + ppt/"
+        }
+      ],
+      "workspaces": {
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "required"
+          },
+          "save": "sibling:pdf",
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        }
+      }
+    },
+    {
+      "id": "ppt",
+      "label": "PowerPoint 97–2003 presentation",
+      "family": "presentation",
+      "status": "planned",
+      "extensions": [
+        ".ppt"
+      ],
+      "mime": "application/vnd.ms-powerpoint",
+      "route": [],
+      "routeBy": "extension",
+      "validator": "cfb",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "d0cf11e0a1b11ae1",
+          "cfb": "PowerPoint Document"
+        }
+      ],
+      "workspaces": {
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "required"
+          },
+          "save": "sibling:pdf"
+        }
+      }
+    },
+    {
+      "id": "odp",
+      "label": "OpenDocument presentation",
+      "family": "presentation",
+      "status": "planned",
+      "extensions": [
+        ".odp"
+      ],
+      "mime": "application/vnd.oasis.opendocument.presentation",
+      "route": [],
+      "routeBy": "extension",
+      "validator": "odf",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "mimetype": "application/vnd.oasis.opendocument.presentation"
+        }
+      ],
+      "workspaces": {
+        "pdf": {
+          "open": {
+            "mode": "convert",
+            "status": "planned",
+            "engine": "required"
+          },
+          "save": "sibling:pdf"
+        }
+      }
+    },
+    {
+      "id": "epub",
+      "label": "EPUB e-book",
+      "family": "ebook",
+      "status": "planned",
+      "extensions": [
+        ".epub"
+      ],
+      "mime": "application/epub+zip",
+      "route": [],
+      "routeBy": "extension",
+      "validator": "zip",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304",
+          "mimetype": "application/epub+zip"
+        }
+      ],
+      "description": "For e-book readers.",
+      "workspaces": {
+        "docs": {
+          "export": {
+            "mode": "native",
+            "status": "planned"
+          }
+        }
+      }
+    },
+    {
+      "id": "zip-export",
+      "label": "ZIP archive",
+      "family": "archive",
+      "status": "planned",
+      "extensions": [
+        ".zip"
+      ],
+      "mime": "application/zip",
+      "route": [],
+      "routeBy": "extension",
+      "validator": "zip",
+      "magic": [
+        {
+          "offset": 0,
+          "hex": "504b0304"
+        }
+      ],
+      "matches": [
+        "zip"
+      ],
+      "description": "Every sheet or page as a separate file.",
+      "workspaces": {
+        "calc": {
+          "export": {
+            "mode": "native",
+            "status": "planned",
+            "label": "Every sheet as CSV (.zip)"
+          }
+        },
+        "pdf": {
+          "export": {
+            "mode": "native",
+            "status": "planned",
+            "label": "Pages as images (.zip)"
+          }
+        }
+      }
+    }
+  ]
+}

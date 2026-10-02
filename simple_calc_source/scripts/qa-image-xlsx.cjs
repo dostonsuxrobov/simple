@@ -11,7 +11,7 @@ const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFklEQVR42mP8z8Dwn4G
 
 async function media(bytes) {
   const zip = await JSZip.loadAsync(bytes)
-  return { zip, media: Object.keys(zip.files).filter((name) => name.startsWith('xl/media/')) }
+  return { zip, media: Object.keys(zip.files).filter((name) => name.startsWith('xl/media/') && !zip.files[name].dir) }
 }
 
 async function main() {
@@ -56,7 +56,49 @@ async function main() {
   assert.equal(reread.workbook.sheets[0].images[0].anchor.from.col, 4)
   const secondDrawing = await (await JSZip.loadAsync(second)).file(Object.keys((await JSZip.loadAsync(second)).files).find((name) => /^xl\/drawings\/drawing\d+\.xml$/.test(name))).async('string')
   assert.equal((secondDrawing.match(/<xdr:pic>/g) || []).length, 1)
-  process.stdout.write('Image XLSX QA passed: inserted pictures, anchors, reload, move/delete edits, and source media reuse.\n')
+  await deletedAndRepeatedPictures()
+  process.stdout.write('Image XLSX QA passed: inserted pictures, anchors, reload, move/delete edits, source media reuse, deleted pictures removed from the package, and no growth on repeated saves.\n')
+}
+
+const RED = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
+const BLUE = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+
+/**
+ * calc-file-io-objects-9: a deleted picture is not left inside the saved file (privacy), and an
+ * inserted picture is embedded once, however often the workbook is saved.
+ */
+async function deletedAndRepeatedPictures() {
+  const anchor = (row) => ({ from: { row, col: 1 }, to: { row: row + 2, col: 3 } })
+  const model = {
+    version: 1, name: 'two.xlsx', activeSheetId: 's1', metadata: {},
+    sheets: [{ id: 's1', name: 'Sheet1', rowCount: 30, colCount: 10, merges: [], colWidths: {}, rowHeights: {}, cells: { A1: { value: 1 } },
+      images: [
+        { id: 'red', src: `data:image/png;base64,${RED}`, anchor: anchor(1) },
+        { id: 'blue', src: `data:image/png;base64,${BLUE}`, anchor: anchor(5) },
+      ] }],
+  }
+  const original = await serializeWorkbook(model, 'xlsx')
+  assert.equal((await media(original)).media.length, 2)
+  const opened = (await workbookPayloadFromBytes('two.xlsx', original)).workbook
+  const blueBytes = Buffer.from(BLUE, 'base64')
+  // The user deletes the blue picture and saves over the source package.
+  opened.sheets[0].images = opened.sheets[0].images.filter((image) => !image.src.includes(BLUE))
+  const withoutBlue = await serializeWorkbook(opened, 'xlsx', { baseBytes: original })
+  const { zip, media: remaining } = await media(withoutBlue)
+  assert.equal(remaining.length, 1, 'only the shown picture stays in xl/media')
+  for (const name of remaining) assert.ok(!(await zip.file(name).async('nodebuffer')).equals(blueBytes), 'the deleted picture is gone from the package')
+  // A picture inserted in the editor, saved three times (each time over the previous file).
+  opened.sheets[0].images.push({ id: 'new', src: `data:image/png;base64,${BLUE}`, anchor: anchor(10) })
+  let base = original
+  const sizes = []
+  for (let save = 0; save < 3; save += 1) {
+    base = await serializeWorkbook(opened, 'xlsx', { baseBytes: base })
+    sizes.push((await media(base)).media.length)
+  }
+  assert.deepEqual(sizes, [2, 2, 2], 'no orphaned copy is added per save')
+  // The same picture inserted twice is stored once.
+  opened.sheets[0].images.push({ id: 'again', src: `data:image/png;base64,${BLUE}`, anchor: anchor(15) })
+  assert.equal((await media(await serializeWorkbook(opened, 'xlsx', { baseBytes: original }))).media.length, 2)
 }
 
 main().catch((error) => {

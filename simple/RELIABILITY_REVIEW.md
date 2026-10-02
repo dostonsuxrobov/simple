@@ -102,6 +102,4 @@ This computer has a private, administrative extraction of LibreOffice 26.2.6 at 
 
 `f9877032fd908beb9c0ddf06df4af5c2e85f419c42e14876c4cce5aae5fb2660`
 
-The companion engine is separate from the small portable executables. On another computer, use [setup-office-runtime.ps1](scripts/setup-office-runtime.ps1), a normal LibreOffice installation, or a companion `tools/libreoffice/program/soffice.exe` folder next to the executable. `SIMPLE_LIBREOFFICE_PATH` is also supported for managed deployments. Preserve LibreOffice's included license files when distributing a companion copy.
-
-The release process should own updates to this engine: a pinned version, trusted download, checksum and publisher verification, and compatibility regression tests before changing the pin. First-time Office conversion can take several seconds; repeated document conversions and unchanged document PDFs are cached with bounded memory.
+The engine is separate from the portable executable and is never required: Simple does not fetch, set up or update it, and every format offered in a picker works without it (see the README's "Optional office engine"). When a normal LibreOffice installation, a companion `tools/libreoffice/program/soffice.exe` folder next to the executable, `SIMPLE_LIBREOFFICE_PATH` or the folder above is present, Simple uses it. `scripts/setup-office-runtime.ps1` remains a developer tool for test PCs only. First-time Office conversion can take several seconds; repeated document conversions and unchanged document PDFs are cached with bounded memory.

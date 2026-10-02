@@ -2,6 +2,7 @@ import type {
   CellData,
   DefinedName,
   SheetData,
+  SheetFilterState,
   WorkbookModel,
 } from '../spreadsheet-types'
 import {
@@ -9,8 +10,14 @@ import {
   columnNumberToLabel,
   formatA1Address,
   parseA1Address,
+  shiftFormulaReferences,
 } from './formulas'
-import { transformTablesForStructure } from './tables'
+import { renameChartSheetReferences } from './charts'
+import { adjustFilterForStructure, adjustRowNumbersForStructure, filterIsActive } from './filter'
+import { moveReferencesInFormula, renameSheetInFormula, tokenizeFormulaText } from './formula-editing'
+import { renameTablesInCopiedSheet, tableRegions, transformTablesForStructure } from './tables'
+import { withValidation } from './validation'
+import type { DataValidationModel } from './validation'
 
 export const MAX_SHEET_ROWS = 1_048_576
 export const MAX_SHEET_COLUMNS = 16_384
@@ -834,17 +841,151 @@ function transformAutoFilter(sheet: SheetData, operation: SheetStructureOperatio
   filter.to = transformedEndpoint(filter.to, match[2])
 }
 
+/** The sheet AutoFilter's live state, or one built from an imported range string. */
+function sheetFilterState(sheet: SheetData): SheetFilterState | null {
+  if (sheet.filter && parseRange(sheet.filter.ref)) return sheet.filter
+  return typeof sheet.autoFilter === 'string' && parseRange(sheet.autoFilter) ? { ref: sheet.autoFilter, columns: {} } : null
+}
+
+/** 1-based data rows (header excluded) of every filter with criteria: the sheet's and the tables'. */
+function activeFilterRows(sheet: SheetData): Interval[] {
+  const intervals: Interval[] = []
+  if (sheet.filter && filterIsActive(sheet.filter)) {
+    const bounds = parseRange(sheet.filter.ref)
+    if (bounds) intervals.push({ start: bounds.top + 1, end: bounds.bottom })
+  }
+  for (const table of sheet.tables || []) {
+    const regions = tableRegions(table)
+    if (!regions || regions.header === null || !filterIsActive(table.filter)) continue
+    intervals.push({ start: regions.dataTop + 1, end: regions.dataBottom + 1 })
+  }
+  return intervals
+}
+
+/**
+ * Rows a filter hid come back when no filter owns them any more (the header row or the filtered
+ * columns were deleted), as in Excel; without this they would stay hidden as if hidden by hand.
+ */
+function releaseOrphanedFilteredRows(sheet: SheetData): void {
+  if (!sheet.filteredRows?.length) return
+  const owned = activeFilterRows(sheet)
+  const released = new Set(sheet.filteredRows.filter((row) => !owned.some((interval) => row >= interval.start && row <= interval.end)))
+  if (!released.size) return
+  sheet.filteredRows = sheet.filteredRows.filter((row) => !released.has(row))
+  sheet.hiddenRows = (sheet.hiddenRows || []).filter((row) => !released.has(row))
+  if (!sheet.filteredRows.length) delete sheet.filteredRows
+}
+
+/**
+ * Keep the AutoFilter in step with inserted or deleted rows and columns: its range and column
+ * criteria move (filter.ts adjustFilterForStructure) and the rows it hides shift with the grid,
+ * so the header row is never treated as data and removing the filter shows every row again.
+ * Deleting the header row (or every filter column) removes the filter, as in Excel.
+ */
+function transformSheetFilter(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (operation.axis === 'row' && sheet.filteredRows) sheet.filteredRows = adjustRowNumbersForStructure(sheet.filteredRows, operation)
+  const state = sheetFilterState(sheet)
+  if (!state) {
+    transformAutoFilter(sheet, operation)
+    return
+  }
+  const next = adjustFilterForStructure(state, operation)
+  if (next) {
+    if (sheet.filter) sheet.filter = next
+    if (typeof sheet.autoFilter === 'string') sheet.autoFilter = next.ref
+    else transformAutoFilter(sheet, operation)
+    return
+  }
+  delete sheet.filter
+  delete sheet.autoFilter
+}
+
+/**
+ * Shifting cells (Insert/Delete cells) moves the AutoFilter only when the shifted band spans all
+ * of its columns (or rows); a partial band leaves it where it is. Filtered lists refuse the
+ * shift beforehand (see preflightFilteredShift).
+ */
+function transformShiftedFilter(sheet: SheetData, operation: SheetStructureOperation): void {
+  const state = sheetFilterState(sheet)
+  const bounds = state ? parseRange(state.ref) : null
+  if (!state || !bounds) return
+  const low = operation.axis === 'row' ? bounds.left : bounds.top
+  const high = operation.axis === 'row' ? bounds.right : bounds.bottom
+  if (outsideSpan(operation, low, high)) return
+  const next = adjustFilterForStructure(state, { ...operation, span: undefined })
+  if (next) {
+    if (sheet.filter) sheet.filter = next
+    if (typeof sheet.autoFilter === 'string') sheet.autoFilter = next.ref
+    return
+  }
+  delete sheet.filter
+  delete sheet.autoFilter
+}
+
+/**
+ * Excel refuses to shift cells inside a filtered list ("This operation is not allowed"): the
+ * hidden rows would no longer line up with the data. Whole-row and whole-column edits work.
+ */
+function preflightFilteredShift(sheet: SheetData, operation: SheetStructureOperation): void {
+  if (!operation.span) return
+  const { start } = operationInterval(operation)
+  const ranges: Bounds[] = []
+  const state = sheetFilterState(sheet)
+  if (state && (filterIsActive(state) || Boolean(sheet.filteredRows?.length))) {
+    const bounds = parseRange(state.ref)
+    if (bounds) ranges.push(bounds)
+  }
+  for (const table of sheet.tables || []) {
+    if (!filterIsActive(table.filter)) continue
+    const bounds = parseRange(table.ref)
+    if (bounds) ranges.push(bounds)
+  }
+  for (const bounds of ranges) {
+    const along = operation.axis === 'row' ? bounds.bottom : bounds.right
+    if (along < start) continue
+    const low = operation.axis === 'row' ? bounds.left : bounds.top
+    const high = operation.axis === 'row' ? bounds.right : bounds.bottom
+    if (high >= operation.span.start + 1 && low <= operation.span.end + 1) {
+      throw new SheetStructureError('Cells in a filtered list cannot be shifted. Clear the filter first, or insert or delete entire rows or columns.', 'SHIFT_CONFLICT')
+    }
+  }
+}
+
 function transformPageSetup(sheet: SheetData, operation: SheetStructureOperation): void {
   if (!sheet.pageSetup) return
   for (const key of ['printArea', 'printTitlesRow', 'printTitlesColumn']) {
     const value = sheet.pageSetup[key]
     if (typeof value !== 'string') continue
-    const transformed = key === 'printArea'
-      ? splitFormulaAreas(value)
-        .map((area) => rewriteFormulaForSheetStructure(area, sheet.id, sheet, operation))
-        .filter((area) => !area.includes('#REF!'))
-        .join(',')
-      : transformLocalRangeText(value, operation)
+    if (key === 'printArea') {
+      // A whole-column ($A:$F) or whole-row ($1:$20) area is kept as a bounded range plus its
+      // original form (printAreaWhole, keyed by the range); the note moves with the range so the
+      // area still prints to the used extent and is saved in its original form.
+      const whole = sheet.pageSetup.printAreaWhole && typeof sheet.pageSetup.printAreaWhole === 'object'
+        ? sheet.pageSetup.printAreaWhole as Record<string, unknown>
+        : null
+      const nextWhole: Record<string, string> = {}
+      const areas: string[] = []
+      for (const area of splitFormulaAreas(value.replace(/&&/g, ','))) {
+        const moved = rewriteFormulaForSheetStructure(area, sheet.id, sheet, operation)
+        if (moved.includes('#REF!')) continue
+        areas.push(moved)
+        const original = whole?.[area.split('!').pop()!.replace(/'/g, '').trim()]
+        const bounds = typeof original === 'string' ? parseRange(moved.split('!').pop()!.replace(/'/g, '')) : null
+        if (!bounds || typeof original !== 'string') continue
+        const key = moved.split('!').pop()!.replace(/'/g, '').trim()
+        if (/^\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}$/.test(original)) {
+          nextWhole[key] = `$${columnNumberToLabel(bounds.left)}:$${columnNumberToLabel(bounds.right)}`
+        } else if (/^\$?\d{1,7}:\$?\d{1,7}$/.test(original)) {
+          nextWhole[key] = `$${bounds.top}:$${bounds.bottom}`
+        }
+      }
+      if (areas.length) sheet.pageSetup.printArea = areas.join(',')
+      else delete sheet.pageSetup.printArea
+      if (Object.keys(nextWhole).length) sheet.pageSetup.printAreaWhole = nextWhole
+      else delete sheet.pageSetup.printAreaWhole
+      continue
+    }
+    const transformed = transformLocalRangeText(value, operation)
     if (transformed) sheet.pageSetup[key] = transformed
     else delete sheet.pageSetup[key]
   }
@@ -888,6 +1029,7 @@ function transformShiftedCells(sheet: SheetData, operation: SheetStructureOperat
     return transformed ? [boundsToRange(transformed)] : []
   })
   transformTablesForStructure(sheet, operation)
+  transformShiftedFilter(sheet, operation)
   if (operation.kind === 'insert') {
     if (operation.axis === 'row') sheet.rowCount = Math.min(MAX_SHEET_ROWS, Math.max(1, Math.floor(Number(sheet.rowCount) || 1)) + operation.count)
     else sheet.colCount = Math.min(MAX_SHEET_COLUMNS, Math.max(1, Math.floor(Number(sheet.colCount) || 1)) + operation.count)
@@ -929,8 +1071,9 @@ function transformSheetStructure(sheet: SheetData, operation: SheetStructureOper
   }
 
   transformViewsAndFrozen(sheet, operation)
-  transformAutoFilter(sheet, operation)
+  transformSheetFilter(sheet, operation)
   transformTablesForStructure(sheet, operation)
+  releaseOrphanedFilteredRows(sheet)
   if (sheet.pivots?.length) {
     // Pivot blocks move with their anchor; one whose anchor row/column is deleted goes with it.
     sheet.pivots = sheet.pivots.flatMap((pivot) => {
@@ -1037,6 +1180,7 @@ export function applySheetStructureOperation(
   const sourceSheet = workbook.sheets.find((sheet) => sheet.id === sheetId)
   if (!sourceSheet) throw new SheetStructureError(`Worksheet ${sheetId} was not found.`, 'SHEET_NOT_FOUND')
   preflightShift(sourceSheet, operation)
+  preflightFilteredShift(sourceSheet, operation)
   preflightArrayRanges(sourceSheet, operation)
   preflightOverflow(sourceSheet, operation)
 
@@ -1154,6 +1298,185 @@ export function applySelectionStructureCommand(
   }
 }
 
+/**
+ * Apply a formula-text rewrite (a sheet rename or removal, say) to every formula-bearing part of
+ * the workbook: cell formulas, validation and conditional-format formulas, defined names and
+ * sparkline sources. Mutates `workbook` in place, so it can run on an immer draft.
+ */
+export function rewriteWorkbookFormulaText(workbook: WorkbookModel, rewrite: (formula: string) => string): void {
+  for (const sheet of workbook.sheets) {
+    for (const address in sheet.cells) {
+      const cell = sheet.cells[address]
+      if (!cell?.formula) continue
+      const next = rewrite(cell.formula)
+      if (next !== cell.formula) {
+        cell.formula = next
+        delete cell.result
+        delete cell.display
+      }
+    }
+    if (sheet.dataValidations) {
+      for (const validation of Object.values(sheet.dataValidations)) {
+        const formulae = (validation as { formulae?: unknown[] } | null)?.formulae
+        if (!Array.isArray(formulae)) continue
+        formulae.forEach((formula, index) => {
+          if (typeof formula === 'string' && !formula.startsWith('"')) formulae[index] = rewrite(formula.replace(/^=/, ''))
+        })
+      }
+    }
+    for (const block of (sheet.conditionalFormattings || []) as Array<{ rules?: Array<{ formulae?: unknown[] }> }>) {
+      for (const rule of block?.rules || []) {
+        if (!Array.isArray(rule.formulae)) continue
+        rule.formulae.forEach((formula, index) => {
+          if (typeof formula === 'string') rule.formulae![index] = rewrite(formula.replace(/^=/, ''))
+        })
+      }
+    }
+    // Sparkline sources ("Sheet1!B2:F2") read through the sheet name like any formula; a changed
+    // source also changes the group's signature, so the file writer regenerates its XML.
+    for (const group of sheet.sparklineGroups || []) {
+      for (const sparkline of group.sparklines) {
+        if (typeof sparkline.source !== 'string' || !sparkline.source) continue
+        const next = rewrite(sparkline.source.replace(/^=/, ''))
+        if (next !== sparkline.source) sparkline.source = next
+      }
+    }
+  }
+  for (const name of workbook.definedNames || []) {
+    if (Array.isArray(name.ranges)) name.ranges = name.ranges.map((range) => rewrite(range.replace(/^=/, '')))
+    if (typeof name.ref === 'string') name.ref = rewrite(name.ref.replace(/^=/, ''))
+  }
+  for (const name of workbook.metadata?.definedNames || []) {
+    if (typeof name.ranges === 'string') name.ranges = rewrite(name.ranges.replace(/^=/, ''))
+    if (typeof name.formula === 'string') name.formula = rewrite(name.formula.replace(/^=/, ''))
+  }
+}
+
+/** Shift sheet-scoped defined names (by sheet position) after sheets are inserted or removed. */
+function shiftSheetScopedNames(workbook: WorkbookModel, fromIndex: number, delta: number): void {
+  for (const definedName of workbook.definedNames || []) {
+    const extended = definedName as DefinedName & { localSheetRefId?: string }
+    if (extended.localSheetRefId) continue
+    if (Number.isInteger(definedName.localSheetIndex) && definedName.localSheetIndex! >= fromIndex) definedName.localSheetIndex! += delta
+    if (Number.isInteger(definedName.localSheetId) && definedName.localSheetId! >= fromIndex) definedName.localSheetId! += delta
+  }
+  for (const definedName of workbook.metadata?.definedNames || []) {
+    if (Number.isInteger(definedName.localSheetId) && definedName.localSheetId! >= fromIndex) definedName.localSheetId! += delta
+  }
+}
+
+/**
+ * Remove the sheet at `index` from the workbook's sheet-scoped names: names that belonged to it
+ * go, and names of the sheets after it keep pointing at their own sheet. Mutates `workbook`.
+ */
+export function removeSheetScopedNames(workbook: WorkbookModel, index: number): void {
+  const belongs = (value: number | undefined) => Number.isInteger(value) && value === index
+  if (workbook.definedNames) {
+    workbook.definedNames = workbook.definedNames.filter((name) => {
+      const extended = name as DefinedName & { localSheetRefId?: string }
+      return Boolean(extended.localSheetRefId) || !(belongs(name.localSheetIndex) || (name.localSheetIndex === undefined && belongs(name.localSheetId)))
+    })
+  }
+  if (workbook.metadata?.definedNames) workbook.metadata.definedNames = workbook.metadata.definedNames.filter((name) => !belongs(name.localSheetId))
+  shiftSheetScopedNames(workbook, index + 1, -1)
+}
+
+export interface SheetCopyOptions {
+  /** Id of the new sheet. */
+  id: string
+  /** Name of the copy; defaults to "<name> copy", "<name> copy 2", … */
+  name?: string
+  /** Ids for the copied tables, charts, pictures and pivot tables. */
+  makeId?: (prefix: string) => string
+}
+
+function defaultCopyName(workbook: WorkbookModel, sourceName: string): string {
+  const taken = new Set(workbook.sheets.map((sheet) => sheet.name.toLocaleLowerCase()))
+  for (let suffix = 1; suffix < 10_000; suffix += 1) {
+    const ending = suffix === 1 ? ' copy' : ` copy ${suffix}`
+    const name = `${sourceName.slice(0, 31 - ending.length)}${ending}`
+    if (!taken.has(name.toLocaleLowerCase())) return name
+  }
+  throw new SheetStructureError('No free sheet name was found for the copy.', 'INVALID_OPERATION')
+}
+
+/**
+ * Excel's Duplicate sheet, as a new sheet object (the workbook is not changed; place it with
+ * {@link insertSheetCopy}). The copy's own references to its source sheet (formulas,
+ * validation and conditional formats, sparklines, charts) point at the copy, as in Excel; its
+ * tables get workbook-unique names; and the import bookkeeping that ties a sheet, chart or
+ * table to parts of the original file is dropped, so saving writes the copy as a new sheet.
+ */
+export function createSheetCopy(workbook: WorkbookModel, sourceSheetId: string, options: SheetCopyOptions): SheetData {
+  const source = workbook.sheets.find((sheet) => sheet.id === sourceSheetId)
+  if (!source) throw new SheetStructureError(`Worksheet ${sourceSheetId} was not found.`, 'SHEET_NOT_FOUND')
+  const makeId = options.makeId ?? ((prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`)
+  const name = (options.name ?? defaultCopyName(workbook, source.name)).slice(0, 31)
+  if (!validSheetName(name) || workbook.sheets.some((sheet) => sheet.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+    throw new SheetStructureError(`The sheet name “${name}” is not available.`, 'INVALID_OPERATION')
+  }
+  const copy = clone(source)
+  copy.id = options.id
+  copy.name = name
+  copy.state = 'visible'
+  delete copy.sourceWorksheetId
+  delete copy.sourceSheetName
+  delete copy.sourceSheetIndex
+  const selfRename = (formula: string) => renameSheetInFormula(formula, source.name, name)
+  rewriteWorkbookFormulaText({ ...workbook, sheets: [copy], definedNames: [], metadata: {} }, selfRename)
+  renameTablesInCopiedSheet(workbook, copy, makeId)
+  if (copy.charts?.length) {
+    copy.charts = (renameChartSheetReferences(copy.charts, source.name, name) || []).map((chart) => {
+      const next = { ...chart, id: makeId('chart') }
+      delete next.sourcePart
+      delete next.sourceInfo
+      return next
+    })
+  }
+  if (copy.images?.length) copy.images = copy.images.map((image) => ({ ...image, id: makeId('image') }))
+  if (copy.pivots?.length) copy.pivots = copy.pivots.map((pivot) => ({ ...pivot, id: makeId('pivot') }))
+  return copy
+}
+
+/**
+ * Put a sheet made by {@link createSheetCopy} right after its source, keep sheet-scoped names
+ * on their own sheets, and give the copy its own copies of the source's sheet-scoped names (as
+ * Excel does). Mutates `workbook`, so it can run on an immer draft.
+ */
+export function insertSheetCopy(workbook: WorkbookModel, copy: SheetData, sourceSheetId: string): void {
+  const sourceIndex = workbook.sheets.findIndex((sheet) => sheet.id === sourceSheetId)
+  if (sourceIndex < 0) throw new SheetStructureError(`Worksheet ${sourceSheetId} was not found.`, 'SHEET_NOT_FOUND')
+  const sourceName = workbook.sheets[sourceIndex].name
+  const insertionIndex = sourceIndex + 1
+  workbook.sheets.splice(insertionIndex, 0, copy)
+  shiftSheetScopedNames(workbook, insertionIndex, 1)
+  const rename = (text: string) => renameSheetInFormula(text.replace(/^=/, ''), sourceName, copy.name)
+  if (workbook.definedNames) {
+    const local = workbook.definedNames.filter((name) => {
+      const extended = name as DefinedName & { localSheetRefId?: string }
+      return !extended.localSheetRefId && (name.localSheetIndex === sourceIndex || (name.localSheetIndex === undefined && name.localSheetId === sourceIndex))
+    })
+    for (const name of local) {
+      const copied: DefinedName = { ...name, ranges: (name.ranges || []).map(rename) }
+      if (typeof name.ref === 'string') copied.ref = rename(name.ref)
+      if (name.localSheetIndex !== undefined) copied.localSheetIndex = insertionIndex
+      if (name.localSheetId !== undefined) copied.localSheetId = insertionIndex
+      workbook.definedNames.push(copied)
+    }
+  }
+  const metadataNames = workbook.metadata?.definedNames
+  if (metadataNames) {
+    for (const name of metadataNames.filter((item) => item.localSheetId === sourceIndex)) {
+      metadataNames.push({
+        ...name,
+        ...(typeof name.ranges === 'string' ? { ranges: rename(name.ranges) } : {}),
+        ...(typeof name.formula === 'string' ? { formula: rename(name.formula) } : {}),
+        localSheetId: insertionIndex,
+      })
+    }
+  }
+}
+
 function validSheetName(name: string): boolean {
   return Boolean(name.trim()) && name.length <= 31 && !/[\\/?*:[\]]/.test(name)
 }
@@ -1228,4 +1551,292 @@ export function insertBlankSheet(
   }
   if (options.activate !== false) next.activeSheetId = id
   return { workbook: next, sheetId: id }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drag-and-drop: move or copy a block of cells (Excel's drag of the selection border)
+// ---------------------------------------------------------------------------------------------
+
+export type CellBlockTransferMode = 'move' | 'copy'
+
+export interface CellBlockTransfer {
+  sheetId: string
+  /** The dragged block, 0-based. */
+  source: Bounds
+  /** Where its top-left cell lands. */
+  destination: GridCoordinate
+  /** 'move' re-points references to the block (cut + paste); 'copy' shifts relative ones (copy + paste). */
+  mode: CellBlockTransferMode
+}
+
+export interface CellBlockTransferPlan {
+  /** Where the block lands, 0-based. */
+  target: Bounds
+  /** Why the drop cannot be done (Excel's wording); nothing is changed. */
+  error?: string
+  /** The landing area already holds data (other than the dragged cells): Excel asks first. */
+  overwrites: boolean
+  /** Dropped where it started: nothing to do. */
+  unchanged: boolean
+}
+
+const CELL_KEY = /^([A-Z]{1,3})([1-9]\d*)$/
+
+function cellKeyCoord(address: string): GridCoordinate | null {
+  const match = CELL_KEY.exec(address)
+  if (!match) return null
+  let col = 0
+  for (const character of match[1]) col = col * 26 + character.charCodeAt(0) - 64
+  return { row: Number(match[2]) - 1, col: col - 1 }
+}
+
+function blockCellKey(row: number, col: number): string {
+  return `${columnNumberToLabel(col + 1)}${row + 1}`
+}
+
+function blockLabel(bounds: Bounds): string {
+  const start = blockCellKey(bounds.top, bounds.left)
+  const end = blockCellKey(bounds.bottom, bounds.right)
+  return start === end ? start : `${start}:${end}`
+}
+
+function withinBlock(bounds: Bounds, row: number, col: number) {
+  return row >= bounds.top && row <= bounds.bottom && col >= bounds.left && col <= bounds.right
+}
+
+function blocksIntersect(a: Bounds, b: Bounds) {
+  return a.top <= b.bottom && a.bottom >= b.top && a.left <= b.right && a.right >= b.left
+}
+
+function blockContains(outer: Bounds, inner: Bounds) {
+  return inner.top >= outer.top && inner.bottom <= outer.bottom && inner.left >= outer.left && inner.right <= outer.right
+}
+
+/** Overlaps the area without lying inside it: the drop would split it. */
+function straddles(region: Bounds, area: Bounds) {
+  return blocksIntersect(region, area) && !blockContains(area, region)
+}
+
+function shiftBlock(bounds: Bounds, rowDelta: number, colDelta: number): Bounds {
+  return { top: bounds.top + rowDelta, bottom: bounds.bottom + rowDelta, left: bounds.left + colDelta, right: bounds.right + colDelta }
+}
+
+function hasBlockContent(cell: CellData | undefined) {
+  return Boolean(cell && (cell.formula || (cell.value !== undefined && cell.value !== null && cell.value !== '')))
+}
+
+function blockRange(range: string): Bounds | null {
+  const text = range.replace(/\$/g, '').toUpperCase().trim()
+  const columns = /^([A-Z]{1,3}):([A-Z]{1,3})$/.exec(text)
+  const [first, second = first] = (columns ? `${columns[1]}1:${columns[2]}${MAX_SHEET_ROWS}` : text).split(':')
+  const start = cellKeyCoord(first)
+  const end = cellKeyCoord(second)
+  if (!start || !end) return null
+  return { top: Math.min(start.row, end.row), bottom: Math.max(start.row, end.row), left: Math.min(start.col, end.col), right: Math.max(start.col, end.col) }
+}
+
+/** Array formula ranges and dynamic-array spills on a sheet, 0-based. */
+function arrayRegions(sheet: SheetData): Bounds[] {
+  const regions: Bounds[] = []
+  for (const [address, cell] of Object.entries(sheet.cells)) {
+    if (!cell) continue
+    if (cell.formulaRange) {
+      const range = blockRange(cell.formulaRange)
+      if (range) regions.push(range)
+    }
+    if (cell.arrayMember) {
+      const anchor = cellKeyCoord(cell.arrayMember.replace(/\$/g, '').toUpperCase())
+      const member = cellKeyCoord(address)
+      if (anchor && member) {
+        regions.push({ top: Math.min(anchor.row, member.row), bottom: Math.max(anchor.row, member.row), left: Math.min(anchor.col, member.col), right: Math.max(anchor.col, member.col) })
+      }
+    }
+  }
+  return regions
+}
+
+/** Where a drop lands and whether it can be done, without changing anything. */
+export function planCellBlockTransfer(workbook: WorkbookModel, transfer: CellBlockTransfer): CellBlockTransferPlan {
+  const { source, destination, mode } = transfer
+  const height = source.bottom - source.top + 1
+  const width = source.right - source.left + 1
+  const target: Bounds = { top: destination.row, left: destination.col, bottom: destination.row + height - 1, right: destination.col + width - 1 }
+  const plan: CellBlockTransferPlan = { target, overwrites: false, unchanged: target.top === source.top && target.left === source.left }
+  const sheet = workbook.sheets.find((item) => item.id === transfer.sheetId)
+  if (!sheet) return { ...plan, error: 'The worksheet was not found.' }
+  if (target.top < 0 || target.left < 0 || target.bottom >= MAX_SHEET_ROWS || target.right >= MAX_SHEET_COLUMNS) {
+    return { ...plan, error: 'The cells would land outside the sheet.' }
+  }
+  if (plan.unchanged) return plan
+  const areas = mode === 'move' ? [source, target] : [target]
+  for (const range of sheet.merges || []) {
+    const merged = blockRange(range)
+    if (merged && areas.some((area) => straddles(merged, area))) return { ...plan, error: "We can't do that to a merged cell. Include the whole merged cell, or unmerge it first." }
+  }
+  if (arrayRegions(sheet).some((region) => areas.some((area) => straddles(region, area)))) {
+    return { ...plan, error: "You can't change part of an array. Move or copy the whole array range." }
+  }
+  for (const pivot of sheet.pivots || []) {
+    if (!pivot.extent) continue
+    const block = { top: pivot.anchor.row, left: pivot.anchor.col, bottom: pivot.anchor.row + pivot.extent.rows - 1, right: pivot.anchor.col + pivot.extent.cols - 1 }
+    if (areas.some((area) => blocksIntersect(block, area))) return { ...plan, error: "Pivot table cells can't be moved or overwritten. Change the pivot table in its editor." }
+  }
+  for (const table of sheet.tables || []) {
+    const region = blockRange(table.ref)
+    if (!region || !table.headerRow) continue
+    const header = { ...region, bottom: region.top }
+    if (areas.some((area) => blocksIntersect(header, area))) return { ...plan, error: `This would change the header row of the table ${table.displayName || table.name}. Move cells below its headers instead.` }
+  }
+  for (const [address, cell] of Object.entries(sheet.cells)) {
+    const coord = cellKeyCoord(address)
+    if (!coord || !withinBlock(target, coord.row, coord.col) || !hasBlockContent(cell)) continue
+    if (mode === 'move' && withinBlock(source, coord.row, coord.col)) continue
+    plan.overwrites = true
+    break
+  }
+  return plan
+}
+
+/** References that lay wholly inside cells a move overwrote become #REF!, as in Excel. */
+function invalidateOverwritten(formula: string, formulaSheet: string, sheetName: string, overwritten: Bounds, source: Bounds): string {
+  const text = `=${formula}`
+  const wanted = sheetName.toLocaleLowerCase()
+  let output = ''
+  let last = 0
+  for (const token of tokenizeFormulaText(text)) {
+    const reference = token.reference
+    if (token.kind !== 'reference' || !reference) continue
+    if ((reference.sheet ?? formulaSheet).toLocaleLowerCase() !== wanted) continue
+    if (reference.bottom - reference.top >= MAX_SHEET_ROWS - 1 || reference.right - reference.left >= MAX_SHEET_COLUMNS - 1) continue
+    const bounds = { top: reference.top, bottom: reference.bottom, left: reference.left, right: reference.right }
+    if (!blockContains(overwritten, bounds) || blockContains(source, bounds)) continue
+    output += text.slice(last, token.start) + '#REF!'
+    last = token.end
+  }
+  if (!last) return formula
+  return (output + text.slice(last)).slice(1)
+}
+
+/** The validation rules over a block, cut into the pieces that lie inside it. */
+function validationPieces(validations: Record<string, unknown> | undefined, block: Bounds): Array<{ bounds: Bounds; rule: DataValidationModel }> {
+  const pieces: Array<{ bounds: Bounds; rule: DataValidationModel }> = []
+  for (const [key, rule] of Object.entries(validations || {})) {
+    if (!rule || typeof rule !== 'object') continue
+    for (const part of key.trim().split(/\s+/)) {
+      const bounds = blockRange(part)
+      if (!bounds || !blocksIntersect(bounds, block)) continue
+      pieces.push({
+        bounds: { top: Math.max(bounds.top, block.top), bottom: Math.min(bounds.bottom, block.bottom), left: Math.max(bounds.left, block.left), right: Math.min(bounds.right, block.right) },
+        rule: rule as DataValidationModel,
+      })
+    }
+  }
+  return pieces
+}
+
+/** A cell at its new place: array ranges and spill anchors follow; it leaves any shared formula group. */
+function relocatedBlockCell(cell: CellData, rowDelta: number, colDelta: number): CellData {
+  const next = { ...cell }
+  if (next.formulaRange) {
+    const range = blockRange(next.formulaRange)
+    if (range) next.formulaRange = blockLabel(shiftBlock(range, rowDelta, colDelta))
+  }
+  if (next.arrayMember) {
+    const anchor = cellKeyCoord(next.arrayMember.replace(/\$/g, '').toUpperCase())
+    if (anchor) next.arrayMember = blockCellKey(anchor.row + rowDelta, anchor.col + colDelta)
+  }
+  // A shared formula's clones each carry their own text; a moved cell leaves the group.
+  if (next.formulaType === 'shared') delete next.formulaType
+  delete (next as CellData & { sharedFormulaMaster?: string }).sharedFormulaMaster
+  return next
+}
+
+/**
+ * Drop a dragged block (on a draft, inside mutateWorkbook, so it is one undo step). A move works
+ * like cut + paste: the cells, merges and validation travel, every formula that pointed into the
+ * block follows it, and references to cells it overwrote become #REF!. A copy works like copy +
+ * paste: relative references shift by the distance moved. Returns the plan; when it has an
+ * error, or the block did not move, the workbook is left unchanged.
+ */
+export function transferCellBlock(workbook: WorkbookModel, transfer: CellBlockTransfer): CellBlockTransferPlan {
+  const plan = planCellBlockTransfer(workbook, transfer)
+  if (plan.error || plan.unchanged) return plan
+  const sheet = workbook.sheets.find((item) => item.id === transfer.sheetId)!
+  const { source, mode } = transfer
+  const { target } = plan
+  const rowDelta = target.top - source.top
+  const colDelta = target.left - source.left
+  const landed: Array<[string, CellData]> = []
+  for (const [address, cell] of Object.entries(sheet.cells)) {
+    const coord = cellKeyCoord(address)
+    if (!coord || !cell || !withinBlock(source, coord.row, coord.col)) continue
+    const key = blockCellKey(coord.row + rowDelta, coord.col + colDelta)
+    if (mode === 'move') {
+      landed.push([key, relocatedBlockCell(cell, rowDelta, colDelta)])
+      continue
+    }
+    // A new top-level cell sharing its unchanged parts (styles, notes), as copy + paste does;
+    // no structuredClone, since this runs on an immer draft.
+    const copy = relocatedBlockCell(cell, rowDelta, colDelta)
+    if (copy.formula) {
+      copy.formula = shiftFormulaReferences(copy.formula.replace(/^=/, ''), rowDelta, colDelta)
+      delete copy.result
+      delete copy.resultType
+      delete copy.display
+    }
+    landed.push([key, copy])
+  }
+  for (const address of Object.keys(sheet.cells)) {
+    const coord = cellKeyCoord(address)
+    if (coord && (withinBlock(target, coord.row, coord.col) || (mode === 'move' && withinBlock(source, coord.row, coord.col)))) delete sheet.cells[address]
+  }
+  for (const [address, cell] of landed) sheet.cells[address] = cell
+
+  if (mode === 'move') {
+    // Shared formulas elsewhere whose master moved keep their own text and leave the group.
+    for (const cell of Object.values(sheet.cells)) {
+      const extended = cell as CellData & { sharedFormulaMaster?: string }
+      if (!extended?.sharedFormulaMaster) continue
+      const master = cellKeyCoord(extended.sharedFormulaMaster.replace(/\$/g, '').toUpperCase())
+      if (master && withinBlock(source, master.row, master.col)) {
+        delete extended.sharedFormulaMaster
+        if (extended.formulaType === 'shared') delete extended.formulaType
+      }
+    }
+    for (const formulaSheet of workbook.sheets) {
+      for (const address of Object.keys(formulaSheet.cells)) {
+        const cell = formulaSheet.cells[address]
+        if (!cell?.formula) continue
+        const invalidated = invalidateOverwritten(cell.formula, formulaSheet.name, sheet.name, target, source)
+        const formula = moveReferencesInFormula(invalidated, { formulaSheet: formulaSheet.name, sourceSheet: sheet.name, rect: source, rowDelta, colDelta })
+        if (formula !== cell.formula) formulaSheet.cells[address] = { ...cell, formula }
+      }
+    }
+  }
+
+  // Merges travel with the block (or are copied); merges the block lands on give way.
+  const carried: string[] = []
+  const kept = (sheet.merges || []).filter((range) => {
+    const merged = blockRange(range)
+    if (!merged) return true
+    const inSource = blockContains(source, merged)
+    if (inSource) carried.push(blockLabel(shiftBlock(merged, rowDelta, colDelta)))
+    if (mode === 'move' && inSource) return false
+    return !blockContains(target, merged)
+  })
+  sheet.merges = [...kept, ...carried]
+
+  // Validation travels (or is copied) the way the cells do.
+  if (sheet.dataValidations && Object.keys(sheet.dataValidations).length) {
+    const pieces = validationPieces(sheet.dataValidations, source)
+    let validations: Record<string, unknown> = sheet.dataValidations
+    if (mode === 'move') validations = withValidation(validations, source, null)
+    validations = withValidation(validations, target, null)
+    for (const piece of pieces) validations = withValidation(validations, shiftBlock(piece.bounds, rowDelta, colDelta), piece.rule)
+    sheet.dataValidations = validations
+  }
+
+  sheet.rowCount = Math.max(sheet.rowCount, target.bottom + 1)
+  sheet.colCount = Math.max(sheet.colCount, target.right + 1)
+  return plan
 }

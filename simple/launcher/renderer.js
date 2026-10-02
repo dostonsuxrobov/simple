@@ -8,10 +8,41 @@ let dragDepth = 0
 const combineDialog = $('#combine-dialog')
 let combineEntries = []
 let combining = false
+let skippedPaths = []
+
+// Electron prefixes errors thrown by main ("Error invoking remote method '…': Error: "); show only the reason.
+function cleanMessage(error, fallback) {
+  const message = String(error?.message || '').replace(/^Error invoking remote method '[^']*': (?:[A-Za-z]*Error: )?/, '').trim()
+  return message || fallback
+}
 
 function combineMessage(message, kind = 'ok') {
   $('#combine-message').textContent = message
   $('#combine-message').dataset.kind = kind
+}
+
+function showSkipped(skipped) {
+  skippedPaths = skipped.map((item) => item.path).filter(Boolean)
+  const button = $('#combine-open-skipped')
+  button.hidden = skippedPaths.length === 0
+  button.textContent = skippedPaths.length > 1 ? `Open ${skippedPaths.length} files in Simple` : 'Open in Simple'
+  button.title = skippedPaths.length ? `Open ${skipped.map((item) => item.name).join(', ')} in Simple to save a modern copy` : ''
+}
+
+/** What the launcher says after files were handed to their workspaces. */
+function openedMessage(result, nothingMessage) {
+  if (!result) return nothingMessage
+  const parts = []
+  if (result.opened) parts.push(`Opened ${result.opened} file${result.opened === 1 ? '' : 's'}.`)
+  if (result.failed) parts.push(result.message || `${result.failed} file${result.failed === 1 ? '' : 's'} could not be opened.`)
+  if (result.unsupported) parts.push(`${result.unsupported} file${result.unsupported === 1 ? ' is' : 's are'} not a type Simple opens.`)
+  return parts.length ? parts.join(' ') : nothingMessage
+}
+
+function builtInNote(names) {
+  if (!Array.isArray(names) || !names.length) return ''
+  if (names.length === 1) return ` ${names[0]} was laid out by Simple, so its page breaks can differ from the original.`
+  return ` ${names.length} files were laid out by Simple, so their page breaks can differ from the originals.`
 }
 
 function renderCombine() {
@@ -68,16 +99,34 @@ function renderCombine() {
 async function addCombineFiles(paths) {
   if (combining) return
   try {
-    const entries = await window.simpleLauncher.combineAdd(paths)
+    const result = await window.simpleLauncher.combineAdd(paths)
+    if (result?.ok === false) throw new Error(result.message || 'Could not add these files.')
+    const entries = Array.isArray(result) ? result : (result?.entries || [])
+    const skipped = Array.isArray(result?.skipped) ? result.skipped : []
     if (combineEntries.length + entries.length > 100) throw new Error('Combine up to 100 files at a time.')
     combineEntries.push(...entries)
-    combineMessage('')
+    showSkipped(skipped)
+    if (skipped.length) {
+      const more = skipped.length > 1 ? ` (${skipped.length - 1} more file${skipped.length === 2 ? '' : 's'} like it)` : ''
+      combineMessage(`${skipped[0].name} wasn't added${more}. ${skipped[0].message}`, 'error')
+    } else combineMessage('')
     renderCombine()
-  } catch (error) { combineMessage(error.message || 'Could not add these files.', 'error') }
+  } catch (error) { combineMessage(cleanMessage(error, 'Could not add these files.'), 'error') }
 }
 
 $('#combine').addEventListener('click', () => { renderCombine(); combineDialog.showModal(); $('#combine-add').focus() })
 $('#combine-add').addEventListener('click', () => void addCombineFiles())
+$('#combine-open-skipped').addEventListener('click', () => {
+  const paths = skippedPaths
+  if (!paths.length) return
+  const formats = [...new Set(paths.map((filePath) => (/\.xls$/i.test(filePath) ? '.xlsx' : '.docx')))].join(' or ')
+  void run(() => window.simpleLauncher.launchPaths(paths)).then((result) => {
+    if (result?.opened) {
+      showSkipped([])
+      combineMessage(`Opened in Simple. Save ${paths.length === 1 ? 'it' : 'them'} as ${formats}, then add the new file${paths.length === 1 ? '' : 's'} here.`)
+    }
+  })
+})
 $('#combine-close').addEventListener('click', () => combineDialog.close())
 combineDialog.addEventListener('dragover', (event) => event.preventDefault())
 combineDialog.addEventListener('drop', (event) => {
@@ -93,14 +142,20 @@ $('#combine-save').addEventListener('click', async () => {
   try {
     const result = await window.simpleLauncher.combineSave(combineEntries)
     if (result.canceled) combineMessage('')
-    else {
-      const message = `Saved ${result.name} — ${result.pageCount} pages. Opened in PDF for review.`
+    else if (result.ok === false) {
+      const message = result.message || 'Could not combine these files.'
+      combineMessage(message, 'error')
+      if (!combineDialog.open) showStatus(message, 'error')
+    } else {
+      const review = result.opened === false ? ` ${result.openFailure || "Simple couldn't open it for review."}` : ' Opened in PDF for review.'
+      const message = `Saved ${result.name} — ${result.pageCount} pages.${review}${builtInNote(result.builtIn)}`
       combineMessage(message)
       if (!combineDialog.open) showStatus(message)
     }
   } catch (error) {
-    combineMessage(error.message || 'Could not combine these files.', 'error')
-    if (!combineDialog.open) showStatus(error.message || 'Could not combine these files.', 'error')
+    const message = cleanMessage(error, 'Could not combine these files.')
+    combineMessage(message, 'error')
+    if (!combineDialog.open) showStatus(message, 'error')
   }
   finally { combining = false; renderCombine() }
 })
@@ -120,14 +175,14 @@ async function run(action, successMessage) {
     if (successMessage) showStatus(typeof successMessage === 'function' ? successMessage(result) : successMessage)
     return result
   } catch (error) {
-    showStatus(error?.message || 'Something went wrong.', 'error')
+    showStatus(cleanMessage(error, 'Something went wrong.'), 'error')
     return null
   }
 }
 
 $('#open').addEventListener('click', () => run(
   () => window.simpleLauncher.open(),
-  (result) => result?.opened ? `Opened ${result.opened} file${result.opened === 1 ? '' : 's'}.` : 'No file selected.',
+  (result) => openedMessage(result, 'No file selected.'),
 ))
 
 document.querySelectorAll('[data-mode]').forEach((button) => {
@@ -177,7 +232,7 @@ dropTarget.addEventListener('drop', (event) => {
   const paths = Array.from(event.dataTransfer.files, (file) => window.simpleLauncher.pathForFile(file)).filter(Boolean)
   void run(
     () => window.simpleLauncher.launchPaths(paths),
-    (result) => result?.opened ? `Opened ${result.opened} file${result.opened === 1 ? '' : 's'}.` : 'That file type is not supported.',
+    (result) => openedMessage(result, 'That file type is not supported.'),
   )
 })
 

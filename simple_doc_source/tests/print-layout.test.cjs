@@ -7,6 +7,7 @@ const {
   nativePrintOptions,
   normalizePrintSettings,
   parsePageRange,
+  printPageGeometry,
   resolvePrinter,
   safeTextForFont,
   validatePdfBytes,
@@ -107,6 +108,48 @@ test('composition uses one model for range, paper, scale, and page marks', async
   assert.ok(Math.abs(page.getWidth() - 841.89) < 0.02)
   assert.ok(Math.abs(page.getHeight() - 595.28) < 0.02)
   assert.equal(composition.mixedPaperSizes, false)
+})
+
+// Text positions (x, y) of every `Tm` text matrix in a page's content streams.
+function textPositions(document, pageIndex) {
+  const { PDFArray, PDFRawStream, decodePDFRawStream } = require('pdf-lib')
+  const contents = document.getPage(pageIndex).node.Contents()
+  const streams = contents instanceof PDFArray ? contents.asArray().map((ref) => document.context.lookup(ref)) : [contents]
+  const text = streams.map((stream) => Buffer.from(stream instanceof PDFRawStream ? decodePDFRawStream(stream).decode() : stream.getContents()).toString('latin1')).join('\n')
+  return [...text.matchAll(/(-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+) Tm/g)].map((match) => ({ x: Number(match[5]), y: Number(match[6]) }))
+}
+
+test('page marks stay inside a printable inset and their bands with the None margin preset', async () => {
+  const composition = await composePrintPdf({
+    data: await fixturePdf(),
+    name: 'Margins none',
+    settings: { paper: 'Letter', orientation: 'portrait', margins: { preset: 'none' }, scaling: 'fit', printTitle: true, printPageNumbers: true },
+  })
+  const result = await PDFDocument.load(composition.data)
+  const height = result.getPage(0).getHeight()
+  const positions = textPositions(result, 0)
+  assert.equal(positions.length, 2, 'one title and one page number')
+  const [titleMark, numberMark] = [...positions].sort((left, right) => right.y - left.y)
+  const capHeight = 0.718 * 8
+  const descent = 0.207 * 8
+  // Typical printers cannot print within about 4–6 mm (12–17 pt) of the edge.
+  assert.ok(height - (titleMark.y + capHeight) >= 17, `title top ${height - (titleMark.y + capHeight)} pt from the top edge`)
+  assert.ok(titleMark.x >= 17, 'title starts inside the left printable edge')
+  assert.ok(numberMark.y - descent >= 17, `page-number descenders ${numberMark.y - descent} pt from the bottom edge`)
+
+  const geometry = printPageGeometry({ width: 612, height: 792 }, { top: 0, right: 0, bottom: 0, left: 0 }, { printTitle: true, printPageNumbers: true })
+  // The content box starts above the footer band and ends below the header band.
+  assert.ok(geometry.contentBottom >= geometry.pageNumberBaseline + 8)
+  assert.ok(geometry.contentBottom + geometry.availableHeight <= geometry.titleBaseline - descent)
+  assert.ok(geometry.titleBaseline + capHeight <= 792 - 17)
+  // Without marks the None preset still uses the full sheet.
+  const plain = printPageGeometry({ width: 612, height: 792 }, { top: 0, right: 0, bottom: 0, left: 0 }, {})
+  assert.deepEqual([plain.contentBottom, plain.availableHeight, plain.availableWidth], [0, 792, 612])
+  // Generous margins keep the marks inside the margin edge, as before.
+  const normal = printPageGeometry({ width: 612, height: 792 }, { top: 54, right: 54, bottom: 54, left: 54 }, { printTitle: true, printPageNumbers: true })
+  assert.ok(normal.titleBaseline + capHeight <= 792 - 54)
+  assert.ok(normal.pageNumberBaseline - descent >= 54)
+  assert.equal(normal.availableHeight, 792 - 108 - 36)
 })
 
 test('Unicode document titles remain metadata-exact and use a safe printable fallback', async () => {

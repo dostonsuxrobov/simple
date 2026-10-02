@@ -71,3 +71,64 @@ test('soft masks, blend modes, transfer functions and transparent groups retain 
   assert.equal(resolve('body','grouped'),undefined)
   assert.deepEqual(resolve('other','fontFromState'),[64/255,128/255,192/255])
 })
+
+test('textPaintResolver marks render mode 3 and 7 text invisible, per font and in content order', async () => {
+  const { textPaintResolver, textColorResolver } = await import('../electron/text-appearance.mjs')
+  const { OPS } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const rows = [], add = (name, args) => rows.push([OPS[name], args])
+  const show = text => add('showText', [[...text].map(unicode => ({ unicode }))])
+  add('setFont', ['ocr', 12]); add('setTextRenderingMode', [3]); show('scanned words here'); show('second line')
+  add('setTextRenderingMode', [0]); add('setFont', ['body', 12]); add('setFillRGBColor', Uint8Array.of(0, 0, 0))
+  show('Visible heading')
+  add('setTextRenderingMode', [3]); show('hidden note')
+  add('setTextRenderingMode', [0]); show('Visible tail')
+  add('setTextRenderingMode', [7]); show('clip words')
+  add('setTextRenderingMode', [0]); add('save', null); add('setTextRenderingMode', [3]); add('restore', null); show('after restore')
+  add('setFont', ['mostly', 12]); add('setTextRenderingMode', [3]); show('i'.repeat(99)); add('setTextRenderingMode', [0]); show('x')
+  const list = { fnArray: rows.map(row => row[0]), argsArray: rows.map(row => row[1]) }
+  const paint = textPaintResolver(list, OPS)
+  assert.deepEqual(paint('ocr', 'scanned words here'), { invisible: true })
+  assert.deepEqual(paint('ocr', 'not in the paint list'), { invisible: true }, 'a whole OCR font is invisible')
+  assert.deepEqual(paint('ocr', ' '), { invisible: true })
+  assert.deepEqual(paint('body', 'Visible heading'), { color: [0, 0, 0], invisible: false })
+  assert.deepEqual(paint('body', 'hidden note'), { invisible: true })
+  assert.deepEqual(paint('body', 'Visible tail'), { color: [0, 0, 0], invisible: false })
+  assert.deepEqual(paint('body', 'clip words'), { invisible: true }, 'clip-only text paints nothing')
+  assert.deepEqual(paint('body', 'after restore'), { color: [0, 0, 0], invisible: false }, 'restore brings back the visible mode')
+  assert.deepEqual(paint('body', 'not drawn'), { invisible: false })
+  assert.deepEqual(paint('missing', 'text'), { invisible: false })
+  assert.deepEqual(paint('mostly', 'i'.repeat(99)), { invisible: true })
+  assert.deepEqual(paint('mostly', 'x'), { invisible: true }, 'a 99% invisible font is an OCR font as a whole')
+  // The color resolver keeps its meaning for the visible run of that font.
+  const color = textColorResolver(list, OPS)
+  assert.equal(color('mostly', 'i'.repeat(99)), undefined)
+  assert.deepEqual(color('mostly', 'x'), [0, 0, 0])
+})
+
+test('pdf.js items of an OCR layer are invisible while visible text keeps its paint color', async () => {
+  const { PDFDocument, StandardFonts, rgb, pushGraphicsState, popGraphicsState, beginText, endText, setFontAndSize, setTextMatrix, showText, setTextRenderingMode, TextRenderingMode } = require('pdf-lib')
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const { textPaintResolver } = await import('../electron/text-appearance.mjs')
+  const layer = require('../electron/ocr-text-layer.cjs')
+  const doc = await PDFDocument.create()
+  const page = doc.addPage([400, 300])
+  const helvetica = await doc.embedFont(StandardFonts.Helvetica)
+  const times = await doc.embedFont(StandardFonts.TimesRoman)
+  page.drawText('Printed heading', { x: 30, y: 260, size: 14, font: helvetica, color: rgb(0.2, 0.4, 0.6) })
+  const key = page.node.newFontDictionary('Old', times.ref)
+  page.pushOperators(pushGraphicsState(), beginText(), setTextRenderingMode(TextRenderingMode.Invisible), setFontAndSize(key, 11), setTextMatrix(1, 0, 0, 1, 30, 200), showText(times.encodeText('Older OCR words')), endText(), popGraphicsState())
+  layer.addOcrTextLayer(doc, 0, [{ fontSize: 11, words: [{ text: 'Recognized', x: 30, y: 150, dx: 1, dy: 0, width: 60, gap: 4 }, { text: 'line', x: 94, y: 150, dx: 1, dy: 0, width: 20, gap: 0 }] }], { fontRef: layer.addGlyphlessFont(doc) })
+  const pdf = await pdfjs.getDocument({ data: await doc.save(), isEvalSupported: false, verbosity: 0 }).promise
+  try {
+    const pdfPage = await pdf.getPage(1)
+    const content = await pdfPage.getTextContent()
+    const paint = textPaintResolver(await pdfPage.getOperatorList(), pdfjs.OPS)
+    const items = content.items.filter(item => item.str)
+    const result = Object.fromEntries(items.map(item => [item.str, paint(item.fontName, item.str)]))
+    assert.deepEqual(result, {
+      'Printed heading': { color: [51 / 255, 102 / 255, 153 / 255], invisible: false },
+      'Older OCR words': { invisible: true },
+      'Recognized line': { invisible: true },
+    })
+  } finally { await pdf.destroy() }
+})

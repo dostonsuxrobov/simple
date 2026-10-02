@@ -1,8 +1,11 @@
+/// <reference types="vite/client" />
+
 interface ImagePayload {
   data: Uint8Array
   name: string
   path: string | null
   size: number
+  /** Lower-case extension without the dot ('png', 'jpg', 'psd', ...). */
   format: string
   mime: string
   directSave: boolean
@@ -25,7 +28,8 @@ interface SaveImageInput {
   data: Uint8Array
   path: string | null
   name: string
-  format: 'png' | 'jpeg' | 'webp'
+  /** 'psd' is sent only from Advanced mode (layered documents). */
+  format: 'png' | 'jpeg' | 'webp' | 'psd'
   forceDialog: boolean
   purpose?: 'save' | 'export'
 }
@@ -53,6 +57,13 @@ interface SimpleImageBridge {
   convertToPdf(input: { data: Uint8Array; name: string }): Promise<ConvertedPdf | null>
   printImage(input: { data: Uint8Array; name: string; width: number; height: number; settings: ImagePrintSettings }): Promise<boolean>
   copyPng(data: Uint8Array): Promise<{ width: number; height: number }>
+  /**
+   * System clipboard image as validated PNG bytes, or null when the clipboard holds no image.
+   * Optional until the preload provides it ('clipboard:read-image'); callers must feature-check.
+   */
+  readClipboardImage?(): Promise<Uint8Array | null>
+  /** Whether the system clipboard currently offers an image. Optional like readClipboardImage. */
+  clipboardHasImage?(): Promise<boolean>
   getVersion(): Promise<string>
   pathForFile(file: File): string | null
   setTitle(title: string): void

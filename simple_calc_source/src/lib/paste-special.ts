@@ -53,6 +53,16 @@ export function resolvePasteSpecialOptions(options: Partial<PasteSpecialOptions>
   return { ...DEFAULT_PASTE_SPECIAL_OPTIONS, ...options }
 }
 
+/**
+ * Value resolver for Paste Values from the calculated values captured at copy time (a matrix
+ * laid out like the copied cells). Excel and Sheets paste that snapshot: the values of the
+ * copied cells themselves, wherever the block started, even if the sheet changed since.
+ */
+export function snapshotValueResolver(values: ReadonlyArray<ReadonlyArray<CellScalar | undefined> | undefined> | undefined): PasteSpecialInput['resolveValue'] {
+  if (!values) return undefined
+  return (_cell, sourceRow, sourceCol) => values[sourceRow]?.[sourceCol]
+}
+
 /** Paste types an arithmetic operation can combine with (Excel greys the others out). */
 export function pasteTypeSupportsOperation(paste: PasteSpecialPasteType): boolean {
   return paste === 'all' || paste === 'allExceptBorders' || paste === 'formulas' || paste === 'values'
@@ -135,7 +145,12 @@ export interface PasteSpecialInput {
   shiftFormula?: (formula: string, rowDelta: number, colDelta: number) => string
   /** Destination worksheet name; Paste Link omits the sheet prefix when it matches the source. */
   destinationSheetName?: string
-  /** Live value of a source formula cell (defaults to its cached `result`). */
+  /**
+   * Calculated value of a source formula cell (defaults to its cached `result`). `sourceRow`
+   * and `sourceCol` are 0-based inside the copied block (cells[sourceRow][sourceCol]), not
+   * sheet coordinates: add `source.origin` to reach the sheet cell. Prefer
+   * `snapshotValueResolver` over reading the live sheet, which may have changed since the copy.
+   */
   resolveValue?: (cell: CellData, sourceRow: number, sourceCol: number) => CellScalar | undefined
   maxCells?: number
   sheetLimits?: { rows: number; cols: number }

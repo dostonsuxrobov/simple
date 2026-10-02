@@ -10,8 +10,338 @@ const XLSX = require('xlsx')
 const {
   workbookPayloadFromPath,
   workbookPayloadFromBytes,
+  importWorkbookBytes,
   serializeWorkbook,
 } = require('../electron/workbooks.cjs')
+const { findOfficeConverter } = require('../electron/office-converter.cjs')
+
+const SAMPLES = path.resolve(__dirname, '..', '..', 'Simple test examples')
+const notes = []
+
+async function sheetXml(bytes, part = 'xl/worksheets/sheet1.xml') {
+  return (await JSZip.loadAsync(bytes)).file(part).async('string')
+}
+
+/** Rewrite one part of an OOXML package (used to build fixtures ExcelJS cannot write). */
+async function patchPart(bytes, part, change) {
+  const zip = await JSZip.loadAsync(bytes)
+  zip.file(part, change(await zip.file(part).async('string')))
+  return zip.generateAsync({ type: 'nodebuffer' })
+}
+
+async function sharedFormulas() {
+  // CALC-SIE-1: editing, clearing or retyping the first cell of a filled-down (shared)
+  // formula must never block the save or rewrite the other cells.
+  const workbook = new ExcelJS.Workbook()
+  const sheet = workbook.addWorksheet('Data')
+  for (let row = 2; row <= 6; row += 1) sheet.getCell(`A${row}`).value = row - 1
+  sheet.getCell('B2').value = { formula: 'A2*2', result: 2, shareType: 'shared', ref: 'B2:B6' }
+  for (let row = 3; row <= 6; row += 1) sheet.getCell(`B${row}`).value = { sharedFormula: 'B2', result: (row - 1) * 2 }
+  const base = Buffer.from(await workbook.xlsx.writeBuffer())
+  assert.match(await sheetXml(base), /t="shared"/, 'the fixture uses a shared formula')
+  const imported = (await workbookPayloadFromBytes('shared.xlsx', base)).workbook
+  const cells = imported.sheets[0].cells
+  assert.equal(cells.B3.formula, 'A3*2', 'each cell owns its translated formula')
+  assert.equal(cells.B6.formula, 'A6*2')
+  for (const cell of Object.values(cells)) {
+    assert.notEqual(cell.formulaType, 'shared')
+    assert.equal(cell.sharedFormulaMaster, undefined)
+  }
+  const edits = {
+    formula: (model) => { model.sheets[0].cells.B2 = { formula: 'A2*3' } },
+    number: (model) => { model.sheets[0].cells.B2 = { value: 5 } },
+    cleared: (model) => { delete model.sheets[0].cells.B2 },
+    // Row 2 deleted: every cell below moves up with its own (already shifted) formula.
+    rowDeleted: (model) => {
+      const next = {}
+      for (const [address, cell] of Object.entries(model.sheets[0].cells)) {
+        const match = /^([A-Z]+)(\d+)$/.exec(address)
+        const row = Number(match[2])
+        if (row === 2) continue
+        const moved = { ...cell }
+        if (moved.formula) moved.formula = moved.formula.replace(/A(\d+)/g, (_all, number) => `A${Number(number) - 1}`)
+        next[`${match[1]}${row > 2 ? row - 1 : row}`] = moved
+      }
+      model.sheets[0].cells = next
+    },
+  }
+  for (const [label, edit] of Object.entries(edits)) {
+    for (const baseBytes of [base, null]) {
+      const model = structuredClone(imported)
+      edit(model)
+      const saved = await serializeWorkbook(model, 'xlsx', { baseBytes })
+      assert.doesNotMatch(await sheetXml(saved), /t="shared"/, `${label}: no shared group is re-emitted`)
+      const back = (await workbookPayloadFromBytes('back.xlsx', saved)).workbook.sheets[0].cells
+      if (label === 'rowDeleted') {
+        assert.equal(back.B2.formula, 'A2*2')
+        assert.equal(back.B5.formula, 'A5*2')
+      } else {
+        assert.equal(back.B3.formula, 'A3*2', `${label}: the next cell keeps its formula`)
+        assert.equal(back.B6.formula, 'A6*2')
+      }
+      if (label === 'formula') assert.equal(back.B2.formula, 'A2*3')
+      if (label === 'number') assert.equal(back.B2.value, 5)
+    }
+  }
+  await sharedFormulaLiterals()
+}
+
+async function sharedFormulaLiterals() {
+  // Review F1: a filled-down formula is translated from its master without touching string
+  // literals, quoted sheet names or structured references ("Q1" never becomes "Q2").
+  const workbook = new ExcelJS.Workbook()
+  const sheet = workbook.addWorksheet('Data')
+  workbook.addWorksheet('Q1 Data')
+  const master = 'IF(A1="Q1",1,0)+COUNTIF(A1:A3,"SKU100")+SUM(T1[Q1])+SUM(Sales[[#This Row],[Q1]])+\'Q1 Data\'!B1+LOG10(10)+$A$1'
+  sheet.getCell('B1').value = { formula: master, result: 1, shareType: 'shared', ref: 'B1:B3' }
+  for (let row = 2; row <= 3; row += 1) sheet.getCell(`B${row}`).value = { sharedFormula: 'B1', result: 0 }
+  sheet.getCell('D1').value = { formula: 'SUM(IF(A1:A3>5,1,0))', result: 0 }
+  sheet.getCell('E1').value = { formula: 'SUM(IF(A1:A3>5,1,0))', result: 0, shareType: 'array', ref: 'E1' }
+  const base = Buffer.from(await workbook.xlsx.writeBuffer())
+  assert.match(await sheetXml(base), /t="shared"/, 'the literal fixture uses a shared formula')
+  const cells = (await workbookPayloadFromBytes('shared-literals.xlsx', base)).workbook.sheets[0].cells
+  assert.equal(cells.B1.formula, master)
+  // Review F10: a plain formula from a file calculates with implicit intersection (legacy), an
+  // array formula does not.
+  assert.equal(cells.D1.implicitIntersection, true, 'a plain opened formula is a legacy formula')
+  assert.equal(cells.B3.implicitIntersection, true)
+  assert.equal(cells.E1.implicitIntersection, undefined, 'an array formula is not')
+  assert.equal(
+
+    cells.B3.formula,
+    'IF(A3="Q1",1,0)+COUNTIF(A3:A5,"SKU100")+SUM(T1[Q1])+SUM(Sales[[#This Row],[Q1]])+\'Q1 Data\'!B3+LOG10(10)+$A$1',
+    'quoted text, table names and table columns keep their text in a filled cell',
+  )
+  const saved = await serializeWorkbook((await workbookPayloadFromBytes('shared-literals.xlsx', base)).workbook, 'xlsx', { baseBytes: base })
+  const back = (await workbookPayloadFromBytes('back.xlsx', saved)).workbook.sheets[0].cells
+  assert.equal(back.B2.formula, cells.B2.formula, 'the translated formula survives a save')
+  assert.match(back.B2.formula, /"Q1"/)
+}
+
+async function printAreas() {
+  // calc-file-io-objects-5: whole-column and whole-row print areas open, print a bounded
+  // range, and are written back in their original form; an unreadable area never blocks Save.
+  const build = async (reference) => {
+    const workbook = new ExcelJS.Workbook()
+    const sheet = workbook.addWorksheet('Sheet1')
+    for (let row = 1; row <= 30; row += 1) sheet.getCell(`A${row}`).value = row
+    sheet.getCell('H1').value = 'edge'
+    sheet.pageSetup.printArea = 'A1:B2'
+    const bytes = Buffer.from(await workbook.xlsx.writeBuffer())
+    return patchPart(bytes, 'xl/workbook.xml', (xml) => xml.replace(/(<definedName name="_xlnm\.Print_Area"[^>]*>)[^<]*(<\/definedName>)/, (_all, open, close) => `${open}${reference}${close}`))
+  }
+  for (const [reference, bounded, written] of [
+    ["'Sheet1'!$A:$D", 'A1:D30', "'Sheet1'!$A:$D"],
+    ["'Sheet1'!$1:$20", 'A1:H20', "'Sheet1'!$1:$20"],
+    ["'Sheet1'!$A$1:$C$5,'Sheet1'!$E:$F", 'A1:C5&&E1:F30', "'Sheet1'!$A$1:$C$5,'Sheet1'!$E:$F"],
+  ]) {
+    const base = await build(reference)
+    const payload = await workbookPayloadFromBytes('print.xlsx', base)
+    const setup = payload.workbook.sheets[0].pageSetup
+    assert.equal(setup.printArea, bounded, `${reference} is bounded to the used size`)
+    assert.doesNotMatch(setup.printArea, /NaN/)
+    for (const baseBytes of [base, null]) {
+      const saved = await serializeWorkbook(payload.workbook, 'xlsx', { baseBytes })
+      const xml = await sheetXml(saved, 'xl/workbook.xml')
+      assert.ok(xml.includes(`>${written.replace(/'/g, '&apos;')}<`) || xml.includes(`>${written}<`), `${reference} is written back as ${written}: ${xml.match(/<definedNames>[\s\S]*?<\/definedNames>/)}`)
+    }
+  }
+  const unreadable = await build("'Sheet1'!#REF!")
+  const opened = await workbookPayloadFromBytes('print.xlsx', unreadable)
+  assert.equal(opened.workbook.sheets[0].pageSetup.printArea, undefined)
+  assert.ok(opened.warnings.some((warning) => /print area/.test(warning)))
+  await serializeWorkbook(opened.workbook, 'xlsx', { baseBytes: unreadable })
+  const invalid = structuredClone(opened.workbook)
+  invalid.sheets[0].pageSetup = { ...invalid.sheets[0].pageSetup, printArea: 'not a range' }
+  const warnings = []
+  await serializeWorkbook(invalid, 'xlsx', { warnings })
+  assert.ok(warnings.some((warning) => /not a cell range/.test(warning)), 'an invalid print area is skipped with a note')
+}
+
+async function hyperlinks() {
+  // calc-file-io-objects-8 and CALC-SIE-25: links to a place in the workbook, links on formula
+  // cells and links whose ref is a range survive open and save.
+  const workbook = new ExcelJS.Workbook()
+  const toc = workbook.addWorksheet('TOC')
+  workbook.addWorksheet('Data').getCell('B5').value = 5
+  toc.getCell('A1').value = { text: 'Go to data', hyperlink: 'https://placeholder.invalid/' }
+  toc.getCell('A2').value = { formula: '1+1', result: 2 }
+  toc.getCell('A3').value = 'range one'
+  toc.getCell('B3').value = 'range two'
+  let bytes = Buffer.from(await workbook.xlsx.writeBuffer())
+  bytes = await patchPart(bytes, 'xl/worksheets/sheet1.xml', (xml) => xml.replace(/<hyperlinks>[\s\S]*<\/hyperlinks>/, '<hyperlinks><hyperlink ref="A1" location="\'Data\'!B5" display="Go to data"/><hyperlink ref="A2" r:id="rIdX1" tooltip="Example"/><hyperlink ref="A3:B3" r:id="rIdX2"/></hyperlinks>'))
+  bytes = await patchPart(bytes, 'xl/worksheets/_rels/sheet1.xml.rels', () => '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdX1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/><Relationship Id="rIdX2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org/page" TargetMode="External"/></Relationships>')
+  const model = (await workbookPayloadFromBytes('links.xlsx', bytes)).workbook
+  const cells = model.sheets[0].cells
+  assert.equal(cells.A1.hyperlink, "#'Data'!B5")
+  assert.equal(cells.A2.formula, '1+1', 'a linked formula keeps its formula')
+  assert.equal(cells.A2.hyperlink, 'https://example.com/')
+  assert.equal(cells.A2.hyperlinkTooltip, 'Example')
+  assert.equal(cells.B3.hyperlink, 'https://example.org/page')
+  model.sheets[0].cells.C1 = { formula: 'Data!B5*2', result: 10, hyperlink: '#Data!B5' }
+  for (const baseBytes of [bytes, null]) {
+    const saved = await serializeWorkbook(model, 'xlsx', { baseBytes })
+    const xml = await sheetXml(saved)
+    assert.match(xml, /<hyperlink ref="A1" location="&apos;Data&apos;!B5"\/>/)
+    assert.doesNotMatch(xml, /<hyperlink ref="A1"[^>]*r:id=/, 'an in-workbook link needs no relationship')
+    const back = (await workbookPayloadFromBytes('back.xlsx', saved)).workbook.sheets[0].cells
+    assert.equal(back.A1.hyperlink, "#'Data'!B5")
+    assert.equal(back.A2.formula, '1+1')
+    assert.equal(back.A2.hyperlink, 'https://example.com/')
+    assert.equal(back.A2.hyperlinkTooltip, 'Example')
+    assert.equal(back.A3.hyperlink, 'https://example.org/page')
+    assert.equal(back.C1.formula, 'Data!B5*2')
+    assert.equal(back.C1.hyperlink, '#Data!B5')
+  }
+}
+
+async function checkboxes() {
+  // CALC-SIE-25: a checkbox reopens as a checkbox, not as a TRUE/FALSE dropdown.
+  const model = {
+    version: 1, name: 'checks', activeSheetId: 's1', metadata: {},
+    sheets: [{ id: 's1', name: 'Tasks', rowCount: 3, colCount: 2, merges: [], colWidths: {}, rowHeights: {},
+      cells: { A1: { value: true, type: 'checkbox' }, A2: { value: false, type: 'checkbox' }, B1: { value: 'Option 1', type: 'dropdown' } },
+      dataValidations: { 'A1:A2': { type: 'list', allowBlank: false, formulae: ['"TRUE,FALSE"'] }, B1: { type: 'list', allowBlank: true, formulae: ['"Option 1,Option 2"'] } } }],
+  }
+  const back = (await workbookPayloadFromBytes('checks.xlsx', await serializeWorkbook(model, 'xlsx'))).workbook.sheets[0]
+  assert.equal(back.cells.A1.type, 'checkbox')
+  assert.equal(back.cells.A1.value, true)
+  assert.equal(back.cells.A2.type, 'checkbox')
+  assert.notEqual(back.cells.B1.type, 'checkbox')
+}
+
+async function workbookProtection() {
+  // calc-file-io-objects-7: "Protect Workbook" and the file-sharing settings are written back
+  // in schema order, so very hidden sheets stay locked away after a save.
+  const workbook = new ExcelJS.Workbook()
+  workbook.addWorksheet('Visible').getCell('A1').value = 1
+  const secret = workbook.addWorksheet('Secret')
+  secret.state = 'veryHidden'
+  secret.getCell('A1').value = 'salary table'
+  let bytes = Buffer.from(await workbook.xlsx.writeBuffer())
+  bytes = await patchPart(bytes, 'xl/workbook.xml', (xml) => xml
+    .replace('<sheets>', '<workbookProtection workbookAlgorithmName="SHA-512" workbookHashValue="abc=" workbookSaltValue="def=" workbookSpinCount="100000" lockStructure="1"/><sheets>')
+    .replace('<workbookPr', '<fileSharing readOnlyRecommended="1" userName="Owner"/><workbookPr'))
+  const model = (await workbookPayloadFromBytes('locked.xlsx', bytes)).workbook
+  assert.equal(model.metadata.workbookProtection.lockStructure, '1')
+  for (const baseBytes of [bytes, null]) {
+    const xml = await sheetXml(await serializeWorkbook(model, 'xlsx', { baseBytes }), 'xl/workbook.xml')
+    assert.match(xml, /<workbookProtection [^>]*lockStructure="1"[^>]*workbookHashValue="abc="|<workbookProtection [^>]*workbookHashValue="abc="[^>]*lockStructure="1"/)
+    const order = xml.replace(/<definedNames>[\s\S]*<\/definedNames>/, '').match(/<(fileVersion|fileSharing|workbookPr|workbookProtection|bookViews|sheets)\b/g).map((tag) => tag.slice(1))
+    assert.deepEqual(order.filter((tag) => tag !== 'bookViews'), ['fileVersion', 'fileSharing', 'workbookPr', 'workbookProtection', 'sheets'])
+    assert.ok(order.indexOf('workbookProtection') < order.indexOf('sheets'))
+  }
+}
+
+async function contentSniffing() {
+  // CALC-SIE-20: the reader follows the bytes, not the extension, and never shows an empty
+  // workbook for a non-empty file. A mismatched name always needs Save As.
+  const legacy = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(legacy, XLSX.utils.aoa_to_sheet([['Item', 1]]), 'Legacy')
+  const xlsBytes = XLSX.write(legacy, { type: 'buffer', bookType: 'biff8' })
+  const xlsxBook = new ExcelJS.Workbook()
+  xlsxBook.addWorksheet('Modern').getCell('A1').value = 'ok'
+  const xlsxBytes = Buffer.from(await xlsxBook.xlsx.writeBuffer())
+  const odsBytes = XLSX.write(legacy, { type: 'buffer', bookType: 'ods' })
+  const cases = [
+    ['legacy.xlsx', xlsBytes, 'xls', 'Legacy'],
+    ['data.xlsx', Buffer.from('a,b\r\n1,2\r\n'), 'csv', 'Sheet1'],
+    ['modern.xls', xlsxBytes, 'xlsx', 'Modern'],
+    ['sheet.xlsx', odsBytes, 'ods', 'Legacy'],
+    ['page.xls', Buffer.from('<html><body><table><tr><td>1</td><td>2</td></tr></table></body></html>'), 'html', null],
+  ]
+  for (const [name, bytes, format, firstSheet] of cases) {
+    const payload = await workbookPayloadFromBytes(name, bytes, { officeEngine: false })
+    assert.equal(payload.sourceFormat, format, `${name} is read as ${format}`)
+    assert.equal(payload.requiresSaveAs, true, `${name} must not be overwritten in place`)
+    assert.match(payload.warnings[0], /actually/)
+    if (firstSheet) assert.equal(payload.workbook.sheets[0].name, firstSheet)
+  }
+  assert.equal((await workbookPayloadFromBytes('modern.xls', xlsxBytes)).workbook.metadata.importedWith, 'exceljs')
+  const noExtension = await workbookPayloadFromBytes('export', Buffer.from('a\tb\r\n1\t2\r\n'))
+  assert.equal(noExtension.sourceFormat, 'tsv')
+  assert.equal(noExtension.workbook.sheets[0].cells.B2.value, 2)
+  const emptyZip = await new JSZip().file('readme.txt', 'x').generateAsync({ type: 'nodebuffer' })
+  await assert.rejects(workbookPayloadFromBytes('broken.xlsx', emptyZip), /not a valid XLSX package/)
+  const docx = await new JSZip().file('word/document.xml', '<w:document/>').generateAsync({ type: 'nodebuffer' })
+  await assert.rejects(workbookPayloadFromBytes('letter.xlsx', docx), /Word document/)
+  // A package without worksheets (or without a workbook part) is never used as a save base.
+  const noSheets = await new JSZip().file('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>').file('xl/workbook.xml', '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets/></workbook>').generateAsync({ type: 'nodebuffer' })
+  const model = { version: 1, name: 'x', activeSheetId: 's', metadata: {}, sheets: [{ id: 's', name: 'S', rowCount: 1, colCount: 1, merges: [], cells: { A1: { value: 1 } } }] }
+  for (const baseBytes of [noSheets, emptyZip]) {
+    const saved = await serializeWorkbook(model, 'xlsx', { baseBytes })
+    assert.equal((await workbookPayloadFromBytes('x.xlsx', saved)).workbook.sheets[0].cells.A1.value, 1)
+  }
+}
+
+async function nativeOpenDocument() {
+  // CALC-SIE-13: .ods opens without the document engine, with real sheet names, A1 formulas,
+  // hidden sheets and column widths. Compared with the XLSX version of the same sample.
+  const odsPath = path.join(SAMPLES, 'Complex workbook.ods')
+  const xlsxPath = path.join(SAMPLES, 'Complex workbook.xlsx')
+  let odsBytes
+  let xlsxBytes
+  try {
+    odsBytes = await fs.readFile(odsPath)
+    xlsxBytes = await fs.readFile(xlsxPath)
+  } catch {
+    notes.push('native ODS sample comparison skipped (Simple test examples not found)')
+    return
+  }
+  const ods = await workbookPayloadFromBytes('Complex workbook.ods', odsBytes, { officeEngine: false })
+  const xlsx = await workbookPayloadFromBytes('Complex workbook.xlsx', xlsxBytes, { officeEngine: false })
+  assert.equal(ods.workbook.metadata.importedWith, 'sheetjs-ods')
+  assert.equal(ods.requiresSaveAs, true)
+  assert.match(ods.warnings.join(' '), /without the document engine/)
+  assert.deepEqual(ods.workbook.sheets.map((sheet) => sheet.name), xlsx.workbook.sheets.map((sheet) => sheet.name))
+  assert.ok(ods.workbook.sheets.some((sheet) => sheet.name === 'Inputs & notes'), 'entities in sheet names are decoded')
+  assert.deepEqual(ods.workbook.sheets.map((sheet) => sheet.state), xlsx.workbook.sheets.map((sheet) => sheet.state), 'hidden sheets stay hidden')
+  const summary = ods.workbook.sheets.find((sheet) => sheet.name === 'Summary')
+  assert.equal(summary.cells.B5.formula, 'SUM(Transactions!F4:F203)')
+  assert.equal(summary.cells.B11.formula, "IFERROR('Inputs & notes'!B12,0)")
+  assert.ok(Object.keys(summary.colWidths).length >= 3, 'column widths are read')
+  let formulas = 0
+  ods.workbook.sheets.forEach((sheet, index) => {
+    const other = xlsx.workbook.sheets[index]
+    for (const [address, cell] of Object.entries(other.cells)) {
+      if (!cell.formula) continue
+      formulas += 1
+      assert.equal(sheet.cells[address] && sheet.cells[address].formula, cell.formula, `${sheet.name}!${address}`)
+    }
+    for (const [address, cell] of Object.entries(other.cells)) {
+      if (cell.formula || cell.value == null || cell.value === '' || typeof cell.value === 'boolean' || cell.type === 'error' || (sheet.cells[address] && sheet.cells[address].formula)) continue
+      if (sheet.name === 'Inputs & notes' && address === 'B3') continue // the two sample files use different tax rates
+      const mine = sheet.cells[address] && sheet.cells[address].value
+      if (typeof cell.value === 'number') assert.ok(Math.abs(mine - cell.value) < 1e-9, `${sheet.name}!${address}: ${mine} vs ${cell.value}`)
+      else assert.equal(mine, cell.value, `${sheet.name}!${address}`)
+    }
+  })
+  assert.ok(formulas > 500, `every formula is compared (${formulas})`)
+  // Flat ODS with an entity-escaped name and OpenFormula references.
+  const fods = `<?xml version="1.0" encoding="UTF-8"?><office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.spreadsheet"><office:automatic-styles><style:style style:name="taH" style:family="table"><style:table-properties table:display="false"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="R&amp;D"><table:table-row><table:table-cell office:value-type="float" office:value="2"><text:p>2</text:p></table:table-cell><table:table-cell table:formula="of:=[.A1]*[&apos;Other sheet&apos;.$A$1]" office:value-type="float" office:value="6"><text:p>6</text:p></table:table-cell></table:table-row></table:table><table:table table:name="Other sheet" table:style-name="taH"><table:table-row><table:table-cell office:value-type="float" office:value="3"><text:p>3</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document>`
+  const flat = await workbookPayloadFromBytes('flat.fods', Buffer.from(fods, 'utf8'))
+  assert.equal(flat.workbook.sheets[0].name, 'R&D')
+  assert.equal(flat.workbook.sheets[0].cells.B1.formula, "A1*'Other sheet'!$A$1")
+  assert.equal(flat.workbook.sheets[1].state, 'hidden')
+}
+
+async function legacyWithoutEngine(officeEngine) {
+  // CALC-SIE-2 (open side): without the engine an .xls/.ods says that Save writes an .xlsx copy.
+  const legacy = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(legacy, XLSX.utils.aoa_to_sheet([['a', 1]]), 'Legacy')
+  const bytes = XLSX.write(legacy, { type: 'buffer', bookType: 'biff8' })
+  const without = await workbookPayloadFromBytes('legacy.xls', bytes, { officeEngine: false })
+  assert.equal(without.requiresSaveAs, true)
+  assert.equal(without.saveAsFormat, 'xlsx')
+  assert.match(without.warnings.join(' '), /creates an \.xlsx copy next to the original/)
+  assert.doesNotMatch(without.warnings.join(' '), /Save keeps \.xls/)
+  const imported = await importWorkbookBytes('legacy.xls', bytes, { officeEngine: false })
+  assert.equal(imported.mergeBase, null, 'an XLS model has no OOXML merge base')
+  if (officeEngine) {
+    const withEngine = await workbookPayloadFromBytes('legacy.xls', bytes, { officeEngine: true })
+    assert.equal(withEngine.requiresSaveAs, false)
+  }
+}
 
 async function createRichFixture(filePath) {
   const workbook = new ExcelJS.Workbook()
@@ -45,6 +375,10 @@ async function createRichFixture(filePath) {
 }
 
 async function main() {
+  // The suite runs on machines with and without the optional document engine (LibreOffice):
+  // XLS/ODS go through the engine when present and through the native fallbacks otherwise.
+  const officeEngine = Boolean(await findOfficeConverter())
+  if (!officeEngine) notes.push('LibreOffice not found: XLS/ODS checks ran against the native (no-engine) readers and writers')
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-calc-qa-'))
   try {
     const richPath = path.join(directory, 'rich.xlsx')
@@ -112,7 +446,7 @@ async function main() {
     XLSX.utils.book_append_sheet(legacyWorkbook, legacySheet, 'Legacy')
     const xlsBytes = XLSX.write(legacyWorkbook, { type: 'buffer', bookType: 'biff8' })
     const xlsOpened = await workbookPayloadFromBytes('legacy.xls', xlsBytes)
-    assert.equal(xlsOpened.requiresSaveAs, false)
+    assert.equal(xlsOpened.requiresSaveAs, !officeEngine, 'without the engine an edited .xls is saved as an .xlsx copy')
     // SheetJS' legacy BIFF writer does not emit formula records; real XLS
     // formula imports are covered by the decoder, while this generated fixture
     // still exercises values, text types, merges, and XLS-to-XLSX conversion.
@@ -260,7 +594,17 @@ async function main() {
       await assert.rejects(workbookPayloadFromBytes(name, encrypted), /password-protected/)
     }
 
-    process.stdout.write(`Workbook QA passed: ${opened.stats.cells} cells, ${opened.stats.formulas} formulas, XLSX/XLS/ODS/CSV/TSV.\n`)
+    await sharedFormulas()
+    await printAreas()
+    await hyperlinks()
+    await checkboxes()
+    await workbookProtection()
+    await contentSniffing()
+    await nativeOpenDocument()
+    await legacyWithoutEngine(officeEngine)
+
+    for (const note of notes) process.stdout.write(`Note: ${note}.\n`)
+    process.stdout.write(`Workbook QA passed: ${opened.stats.cells} cells, ${opened.stats.formulas} formulas, XLSX/XLS/ODS/CSV/TSV (${officeEngine ? 'document engine' : 'native fallbacks'}), shared formulas, print areas, links, checkboxes, workbook protection, content sniffing.\n`)
   } finally {
     await fs.rm(directory, { recursive: true, force: true })
   }

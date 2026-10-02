@@ -338,3 +338,167 @@ export function textCaretAtPoint(
   })
   return caretAt(pool[0].span, pool[0].rect)
 }
+
+/**
+ * One run of text headed for the clipboard. Position fields share one unit
+ * system (text-layer CSS pixels or PDF points); `line` is a visual line id.
+ */
+export interface PlainTextRun {
+  text: string
+  line?: number
+  /** Start of the run along its reading axis. */
+  read?: number
+  /** Length of the run along its reading axis. */
+  advance?: number
+  fontHeight?: number
+  /** PDF.js reported a line end straight after this run. */
+  eol?: boolean
+}
+
+function plainTextSeparator(previous: PlainTextRun, next: PlainTextRun) {
+  if (previous.line !== undefined && next.line !== undefined && previous.line !== next.line) return '\n'
+  if (/\s$/u.test(previous.text) || /^\s/u.test(next.text)) return ''
+  // Same visual line (or no line data): an end-of-line marker inside a line
+  // still separates two words, and without line data it is a real break.
+  if (previous.eol) return previous.line === undefined || next.line === undefined ? '\n' : ' '
+  const gap = Number(next.read) - (Number(previous.read) + Number(previous.advance))
+  const height = Math.max(Number(previous.fontHeight) || 0, Number(next.fontHeight) || 0)
+  return Number.isFinite(gap) && height > 0 && gap > height * 0.15 ? ' ' : ''
+}
+
+/**
+ * Join text runs the way Acrobat copies them: a newline between visual lines,
+ * a space between runs on one line separated by a visible gap, and nothing
+ * between runs that already touch or carry their own whitespace.
+ */
+export function joinPlainTextRuns(runs: PlainTextRun[]) {
+  let output = ''
+  let previous: PlainTextRun | null = null
+  for (const run of runs) {
+    if (!run.text) continue
+    if (previous) output += plainTextSeparator(previous, run)
+    output += run.text
+    previous = run
+  }
+  return output
+}
+
+export interface PdfTextContentItemLike {
+  str?: string
+  transform?: number[]
+  width?: number
+  height?: number
+  hasEOL?: boolean
+}
+
+/**
+ * Plain text for a whole page from PDF.js getTextContent() items, used when a
+ * page's text layer is not in the DOM (virtualised pages, Select All). Lines
+ * break at PDF.js end-of-line markers and wherever the baseline jumps.
+ */
+export function plainTextFromTextContentItems(items: PdfTextContentItemLike[]) {
+  const runs: PlainTextRun[] = []
+  let line = 0
+  let previousFlow = Number.NaN
+  let previousHeight = 0
+  for (const item of items) {
+    const text = typeof item.str === 'string' ? item.str : ''
+    if (!text) {
+      const last = runs.at(-1)
+      if (item.hasEOL && last) last.eol = true
+      continue
+    }
+    const [a = 1, b = 0, c = 0, d = 1, e = 0, f = 0] = Array.isArray(item.transform) ? item.transform : []
+    const angle = Math.atan2(b, a)
+    const fontHeight = Math.hypot(c, d) || Number(item.height) || 0
+    const read = e * Math.cos(angle) + f * Math.sin(angle)
+    const flow = -e * Math.sin(angle) + f * Math.cos(angle)
+    const last = runs.at(-1)
+    if (last && (last.eol
+      || (Number.isFinite(previousFlow) && Math.abs(flow - previousFlow) > Math.max(1, Math.max(fontHeight, previousHeight) * 0.5)))) {
+      line += 1
+    }
+    runs.push({ text, line, read, advance: Number(item.width) || 0, fontHeight, eol: Boolean(item.hasEOL) })
+    previousFlow = flow
+    previousHeight = fontHeight
+  }
+  return joinPlainTextRuns(runs)
+}
+
+export interface SelectedPageText {
+  pageIndex: number
+  /** Null when the page is selected but its text layer is not in the DOM. */
+  text: string | null
+}
+
+function plainTextRunForSpan(span: HTMLSpanElement, text: string): PlainTextRun {
+  const angle = Number(span.dataset.textAngle) || 0
+  const baselineX = Number(span.dataset.textBaselineX)
+  const baselineY = Number(span.dataset.textBaselineY)
+  const line = Number(span.dataset.textLine)
+  return {
+    text,
+    line: Number.isInteger(line) ? line : undefined,
+    read: baselineX * Math.cos(angle) + baselineY * Math.sin(angle),
+    advance: Number(span.dataset.textAdvance) || 0,
+    fontHeight: Number.parseFloat(span.style.fontSize) || 0,
+    eol: span.dataset.textEol === 'true',
+  }
+}
+
+/**
+ * Collect the PDF text a Range covers, page by page in document order. Each
+ * text item is clipped to the range's offsets and runs are joined with real
+ * line breaks and word spaces (absolutely positioned spans have none in the
+ * DOM). Pages that are fully covered but not rendered come back as null so the
+ * caller can fill them from getTextContent(). Returns null when the range
+ * touches no PDF page at all.
+ */
+export function collectSelectedPdfText(root: HTMLElement, range: Range): SelectedPageText[] | null {
+  const pages: SelectedPageText[] = []
+  for (const slot of root.querySelectorAll<HTMLElement>('.continuous-page-slot[data-page-index]')) {
+    let intersects = false
+    try {
+      intersects = range.intersectsNode(slot)
+    } catch {
+      intersects = false
+    }
+    if (!intersects) continue
+    const pageIndex = Number(slot.dataset.pageIndex)
+    if (!Number.isInteger(pageIndex)) continue
+    const spans = Array.from(slot.querySelectorAll<HTMLSpanElement>('.text-layer [data-text-item="true"]'))
+    if (!spans.length) {
+      const holdsBoundary = slot.contains(range.startContainer) || slot.contains(range.endContainer)
+      pages.push({ pageIndex, text: holdsBoundary ? '' : null })
+      continue
+    }
+    const runs: PlainTextRun[] = []
+    for (const span of spans) {
+      if (span.dataset.editCovered === 'true') continue
+      const node = span.firstChild
+      if (!(node instanceof Text) || !node.length) continue
+      let covered = false
+      try {
+        covered = range.intersectsNode(node)
+      } catch {
+        covered = false
+      }
+      if (!covered) continue
+      let start = 0
+      let end = node.length
+      if (range.startContainer === node) start = range.startOffset
+      else if (range.startContainer === span && range.startOffset > 0) start = node.length
+      if (range.endContainer === node) end = range.endOffset
+      else if (range.endContainer === span && range.endOffset === 0) end = 0
+      if (end <= start) continue
+      runs.push(plainTextRunForSpan(span, node.data.slice(start, end)))
+    }
+    pages.push({ pageIndex, text: joinPlainTextRuns(runs) })
+  }
+  return pages.length ? pages : null
+}
+
+/** Join per-page text with one newline, skipping pages without text. */
+export function joinSelectedPageTexts(texts: Array<string | null>) {
+  return texts.filter((text): text is string => Boolean(text)).join('\n')
+}

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { inferFormulaNumberFormat, parseCellInput } from '../src/lib/input-parsing'
+import { formulaFromSignedEntry, inferFormulaNumberFormat, parseCellInput, textNeedsQuotePrefix } from '../src/lib/input-parsing'
 
 const now = new Date(2026, 8, 28)
 const p = (text: string) => parseCellInput(text, now)
@@ -46,4 +46,33 @@ assert.equal(inferFormulaNumberFormat('=COUNT(B2:B9)', formatOf), undefined)
 assert.equal(inferFormulaNumberFormat('=B2*C3', formatOf), undefined)
 assert.equal(inferFormulaNumberFormat('=A1>5', formatOf), undefined)
 assert.equal(inferFormulaNumberFormat('=C3+1', formatOf), undefined)
-console.log('Input parsing QA passed: numbers, currency, percentages, fractions, dates, times, and inferred formula formats.')
+
+// calc-formula-engine-12: typed dates follow Excel's 1900 date system (serial 60 is 1900-02-29).
+assert.deepEqual(p('1/1/1900'), { value: 1, numFmt: 'm/d/yyyy', type: 'date' })
+assert.deepEqual(p('2/28/1900'), { value: 59, numFmt: 'm/d/yyyy', type: 'date' })
+assert.deepEqual(p('2/29/1900'), { value: 60, numFmt: 'm/d/yyyy', type: 'date' })
+assert.deepEqual(p('3/1/1900'), { value: 61, numFmt: 'm/d/yyyy', type: 'date' })
+assert.deepEqual(p('1900-01-02'), { value: 2, numFmt: 'yyyy-mm-dd', type: 'date' })
+assert.equal(p('2/29/1901'), null)
+assert.equal(p('12/31/1899'), null)
+
+// calc-formula-engine-10: text that would be read back as something else keeps its apostrophe
+// in the editor, so editing it again keeps it text.
+for (const text of ['12345678901234567890', '3/4', 'TRUE', '=A1', "'quoted", '15%', '#N/A', '+B1+C1', '-A1', '1,000']) {
+  assert.equal(textNeedsQuotePrefix(text), true, `"${text}" needs an apostrophe`)
+}
+for (const text of ['hello', '- item', 'Mayday', '+1-555-0100', 'A1', '007', '']) {
+  assert.equal(textNeedsQuotePrefix(text), false, `"${text}" stays as typed`)
+}
+
+// calc-formula-engine-7: "+B1+C1" and "-A1" typed without "=" are formulas, as in Excel.
+assert.equal(formulaFromSignedEntry('+B1+C1'), '+B1+C1')
+assert.equal(formulaFromSignedEntry('-A1*2'), '-A1*2')
+assert.equal(formulaFromSignedEntry('+SUM(A1:A3)'), '+SUM(A1:A3)')
+assert.equal(formulaFromSignedEntry('-5'), null, 'numbers stay numbers')
+assert.equal(formulaFromSignedEntry('- item'), null)
+assert.equal(formulaFromSignedEntry('+1-555-0100'), null)
+assert.equal(formulaFromSignedEntry('-total'), null)
+assert.equal(formulaFromSignedEntry('A1+1'), null)
+assert.equal(formulaFromSignedEntry('+SUM('), null)
+console.log('Input parsing QA passed: numbers, currency, percentages, fractions, dates, times, inferred formula formats, 1900 dates, apostrophe text, and +/- formula entry.')

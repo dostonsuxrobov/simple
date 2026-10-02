@@ -160,6 +160,26 @@ export default function run(h: Harness): void {
   h.eq('DSTDEV(A1:E7,"Yield",H1:J2)', '#DIV/0!', db)
   h.eq('DSUM(A1:E7,"profit",H4:H6)', h.value('DSUM(A1:E7,"Profit",H4:H6)', db), db)
 
+  // calc-formula-engine-1: database criteria read dates, percentages, currency, and
+  // thousands like typed input, and "<"/">" with text only compare text.
+  const dated: Cells = {
+    A1: 'Day', B1: 'Amount', C1: 'Rate',
+    A2: 45000, B2: 1000, C2: 0.25,
+    A3: 45292, B3: 2000, C3: 0.5,
+    A4: 45400, B4: 3000, C4: 0.75,
+    A5: 'pending', B5: 4000, C5: 1,
+    E1: 'Day', E2: '>=1/1/2024',
+    F1: 'Day', F2: '1/1/2024',
+    G1: 'Rate', G2: '>50%',
+    H1: 'Amount', H2: '>$1,500',
+    I1: 'Day', I2: '<q',
+  }
+  h.eq('DSUM(A1:C5,"Amount",E1:E2)', 5000, dated)
+  h.eq('DSUM(A1:C5,"Amount",F1:F2)', 2000, dated)
+  h.eq('DCOUNT(A1:C5,"Rate",G1:G2)', 2, dated)
+  h.eq('DSUM(A1:C5,"Amount",H1:H2)', 9000, dated)
+  h.eq('DSUM(A1:C5,"Amount",I1:I2)', 4000, dated)
+
   {
     // 20,000-row database with a two-row OR criteria range stays fast.
     const big: Cells = { A1: 'Key', B1: 'Amount', D1: 'Key', D2: 'k1', D3: 'k7' }

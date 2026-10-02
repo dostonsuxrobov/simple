@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { produce } from 'immer'
-import { CalculationEngine, markArrayMembers } from '../src/lib/calc-engine'
+import { CalculationEngine, calculationOptionsOf, markArrayMembers, withCalculationOptions } from '../src/lib/calc-engine'
+import { diagnoseFormula } from '../src/lib/formulas'
 import type { CellData, SheetData, WorkbookModel } from '../src/spreadsheet-types'
 
 function sheet(id: string, name: string, cells: Record<string, CellData>, extra: Partial<SheetData> = {}): SheetData {
@@ -188,4 +189,175 @@ assert.ok(incremental < 400, `incremental recalculation took ${incremental} ms`)
   assert.equal(rules.evaluateAt('v1', 'LEN(A5)<3', 4, 0, { row: 4, col: 0, value: 'abcd' }), false)
 }
 
-console.log('Calculation engine QA passed: incremental recalculation, spills, saved arrays, tables, visibility, scaling, and validation candidates.')
+// ---- Regression cases: calc-formula-engine-2/3/4/5 ------------------------------------------
+{
+  // Whole-column and whole-row references reach spilled array members (calc-formula-engine-2).
+  let spillBook = workbook(
+    sheet('w1', 'Sheet1', { A1: f('SEQUENCE(5)'), C1: f('SUM(A:A)'), C2: f('COUNT(A:A)'), E1: f('MAX(A:A)'), D1: f('SUM(A1:A10)'), G2: f('COUNTA(1:1)') }),
+    sheet('w2', 'Other', { A1: f('SUM(Sheet1!A:A)'), A2: f('MATCH(5,Sheet1!A:A,0)') }),
+  )
+  const spills = new CalculationEngine(spillBook)
+  assert.deepEqual(['C1', 'C2', 'E1', 'D1'].map((address) => spills.getValue('w1', address)), [15, 5, 5, 15])
+  assert.deepEqual(['A1', 'A2'].map((address) => spills.getValue('w2', address)), [15, 5])
+  spillBook = produce(spillBook, (draft) => { draft.sheets[0].cells.A1 = f('SEQUENCE(8)') })
+  spills.update(spillBook)
+  assert.equal(spills.getValue('w1', 'C1'), 36, 'a growing spill widens whole-column readers')
+  assert.equal(spills.getValue('w2', 'A1'), 36)
+  spillBook = produce(spillBook, (draft) => { draft.sheets[0].cells.J1 = f('SEQUENCE(1,4)') })
+  spills.update(spillBook)
+  assert.equal(spills.getValue('w1', 'G2'), 8, 'whole-row references reach a row spill')
+  // Sparse (very large) whole-column ranges visit spilled members too.
+  const sparseBook = workbook(sheet('w3', 'Big', { A1: f('SEQUENCE(4)'), A200000: v(10), C1: f('SUM(A:B)') }))
+  assert.equal(new CalculationEngine(sparseBook).getValue('w3', 'C1'), 20)
+
+  // Text that starts with "=" stays text (calc-formula-engine-3).
+  const textBook = workbook(sheet('x1', 'Sheet1', {
+    A1: v('=== Q1 ==='), A2: v(10), A3: v(20), B1: f('SUM(A1:A3)'), B2: f('A1&" total"'),
+    C1: f('SUM(D1:D2)'), D1: v(3), D2: v(4), E1: f('FORMULATEXT(C1)'), E2: f('E1'), E3: f('LEN(E1)'),
+    G1: v('=1+1'), G2: f('ISTEXT(G1)'), G3: f('G1'),
+  }))
+  const text = new CalculationEngine(textBook)
+  assert.deepEqual(['B1', 'B2', 'E1', 'E2', 'E3', 'G2', 'G3'].map((address) => text.getValue('x1', address)),
+    [30, '=== Q1 === total', '=SUM(D1:D2)', '=SUM(D1:D2)', 11, true, '=1+1'])
+
+  // SUBTOTAL/AGGREGATE on another sheet follow hidden rows; ISFORMULA tracks its target
+  // (calc-formula-engine-4).
+  let visibilityBook = workbook(
+    sheet('y1', 'Data', { A1: v(1), A2: v(2), A3: v(3), B1: f('SUBTOTAL(109,A1:A3)'), D1: v(5), C1: f('ISFORMULA(D1)') }),
+    sheet('y2', 'Summary', { A1: f('SUBTOTAL(109,Data!A1:A3)'), A2: f('AGGREGATE(9,5,Data!A1:A3)'), A3: f('A1*10') }),
+  )
+  const visibility = new CalculationEngine(visibilityBook)
+  assert.deepEqual(['A1', 'A2', 'A3'].map((address) => visibility.getValue('y2', address)), [6, 6, 60])
+  assert.equal(visibility.getValue('y1', 'C1'), false)
+  visibilityBook = produce(visibilityBook, (draft) => { draft.sheets[0].hiddenRows = [2] })
+  visibility.update(visibilityBook)
+  assert.equal(visibility.getValue('y1', 'B1'), 4)
+  assert.deepEqual(['A1', 'A2', 'A3'].map((address) => visibility.getValue('y2', address)), [4, 4, 40])
+  visibilityBook = produce(visibilityBook, (draft) => { draft.sheets[0].hiddenRows = []; draft.sheets[0].filteredRows = [3] })
+  visibility.update(visibilityBook)
+  assert.deepEqual(['A1', 'A2'].map((address) => visibility.getValue('y2', address)), [3, 3])
+  visibilityBook = produce(visibilityBook, (draft) => { draft.sheets[0].cells.D1 = f('1+1') })
+  visibility.update(visibilityBook)
+  assert.equal(visibility.getValue('y1', 'C1'), true)
+  assert.equal(new CalculationEngine(visibilityBook).getValue('y2', 'A3'), visibility.getValue('y2', 'A3'))
+
+  // Legacy formulas from workbook files intersect instead of spilling, and keep their kind on
+  // save; formulas typed here keep dynamic-array meaning (calc-formula-engine-5).
+  const legacy = (formula: string): CellData => ({ formula, implicitIntersection: true } as CellData)
+  const legacyBook: WorkbookModel = {
+    ...workbook(sheet('z1', 'Sheet1', {
+      A1: v(10), A2: v(20), A3: v(30),
+      B2: legacy('A1:A3*2'), B3: legacy('A1:A3*2'), C2: legacy('Price'), D2: legacy('SUMPRODUCT(A1:A3*2)'), D3: legacy('SUM(A1:A3*2)'),
+      E2: f('A1:A3*2'), F1: f('SUM(A1:A3*2)'), G1: f('SUM(A1:A3)'), H1: { formula: 'A1:A3*2', formulaType: 'array', formulaRange: 'H1:H3' } as CellData,
+    })),
+    definedNames: [{ name: 'Price', ranges: ['Sheet1!$A$1:$A$3'] }],
+  }
+  const legacyEngine = new CalculationEngine(legacyBook)
+  assert.deepEqual(['B2', 'B3', 'B4', 'C2', 'C3', 'D2', 'D3'].map((address) => legacyEngine.getValue('z1', address)), [40, 60, null, 20, null, 120, 60])
+  assert.deepEqual(['E2', 'E3', 'E4', 'F1', 'H1', 'H3'].map((address) => legacyEngine.getValue('z1', address)), [20, 40, 60, 120, 20, 60])
+  const savedCells = legacyEngine.withResults().sheets[0].cells
+  assert.equal(savedCells.B3.formulaType, undefined, 'a legacy formula is not turned into an array formula')
+  assert.equal(savedCells.B3.formulaRange, undefined)
+  assert.equal(savedCells.B3.result, 60)
+  assert.equal(savedCells.C2.dynamicFormula, undefined)
+  assert.equal(savedCells.E2.formulaRange, 'E2:E4')
+  assert.equal(savedCells.F1.formulaType, 'array', 'a typed SUM(A1:A3*2) keeps its array meaning in Excel')
+  assert.equal(savedCells.F1.formulaRange, 'F1')
+  assert.equal(savedCells.G1.formulaType, undefined)
+}
+
+// ---- CALC-027: calculation options, F9, circular references, iteration --------------------------
+{
+  // Circular references are reported with their cells.
+  let circularBook = workbook(sheet('c1', 'Sheet1', { A1: f('B1+1'), B1: f('A1+1'), C1: f('A1*2'), D1: v(1), E1: f('E1+D1') }))
+  const circular = new CalculationEngine(circularBook)
+  assert.equal(circular.getValue('c1', 'C1'), '#CIRC!')
+  assert.deepEqual(circular.circularReferences(), [{ sheetId: 'c1', address: 'A1' }, { sheetId: 'c1', address: 'B1' }])
+  assert.equal(circular.getValue('c1', 'E1'), '#CIRC!')
+  assert.equal(circular.circularReferences().length, 3)
+  circularBook = produce(circularBook, (draft) => { draft.sheets[0].cells.B1 = v(4) })
+  circular.update(circularBook)
+  assert.equal(circular.getValue('c1', 'C1'), 10)
+  assert.deepEqual(circular.circularReferences().map((cell) => cell.address), ['E1'])
+
+  // Iterative calculation (Excel defaults: 100 iterations, 0.001 maximum change).
+  circularBook = withCalculationOptions(circularBook, { iterate: true })
+  assert.deepEqual(calculationOptionsOf(circularBook), { mode: 'automatic', iterate: true, maxIterations: 100, maxChange: 0.001 })
+  circular.update(circularBook)
+  assert.equal(circular.getValue('c1', 'E1'), 100, 'E1=E1+1 runs 100 iterations')
+  let iterationBook = withCalculationOptions(workbook(sheet('i1', 'Sheet1', {
+    A1: f('0.5*A1+1'), B1: f('A1*10'), C1: v(1000), D1: f('C1*0.1+E1'), E1: f('D1*0.05'),
+  })), { iterate: true, maxIterations: 100, maxChange: 0.001 })
+  const iteration = new CalculationEngine(iterationBook)
+  const converged = iteration.getValue('i1', 'A1') as number
+  assert.ok(Math.abs(converged - 2) <= 0.001, `0.5*A1+1 converges to 2 (got ${converged})`)
+  assert.ok(Math.abs((iteration.getValue('i1', 'B1') as number) - converged * 10) < 1e-9)
+  assert.ok(Math.abs((iteration.getValue('i1', 'D1') as number) - 100 / 0.95) < 0.01, 'interest-style circularity converges')
+  iterationBook = produce(iterationBook, (draft) => { draft.sheets[0].cells.C1 = v(2000) })
+  iteration.update(iterationBook)
+  assert.ok(Math.abs((iteration.getValue('i1', 'D1') as number) - 200 / 0.95) < 0.01, 'iteration continues after an edit')
+  iterationBook = withCalculationOptions(iterationBook, { iterate: false })
+  iteration.update(iterationBook)
+  assert.equal(iteration.getValue('i1', 'A1'), '#CIRC!')
+
+  // Manual calculation: edits wait for recalculate() (F9); entered formulas calculate at once.
+  let manualBook = withCalculationOptions(workbook(sheet('m1', 'Sheet1', { A1: v(1), B1: f('A1*10'), C1: f('B1+1') })), { mode: 'manual' })
+  const manual = new CalculationEngine(manualBook)
+  assert.equal(manual.calculationOptions.mode, 'manual')
+  assert.equal(manual.getValue('m1', 'C1'), 11)
+  assert.equal(manual.needsRecalculation, false)
+  manualBook = produce(manualBook, (draft) => { draft.sheets[0].cells.A1 = v(5) })
+  manual.update(manualBook)
+  assert.equal(manual.getValue('m1', 'B1'), 10, 'dependents keep their value in manual mode')
+  assert.equal(manual.needsRecalculation, true)
+  manualBook = produce(manualBook, (draft) => { draft.sheets[0].cells.D1 = f('A1+100') })
+  manual.update(manualBook)
+  assert.equal(manual.getValue('m1', 'D1'), 105, 'an entered formula calculates')
+  manual.recalculate()
+  assert.deepEqual([manual.getValue('m1', 'B1'), manual.getValue('m1', 'C1'), manual.needsRecalculation], [50, 51, false])
+  manualBook = produce(manualBook, (draft) => { draft.sheets[0].cells.A1 = v(7) })
+  manual.update(manualBook)
+  manual.recalculateSheet('m1')
+  assert.equal(manual.getValue('m1', 'C1'), 71, 'Shift+F9 calculates the sheet')
+  manualBook = produce(manualBook, (draft) => { draft.sheets[0].cells.A1 = v(2) })
+  manual.update(manualBook)
+  manualBook = withCalculationOptions(manualBook, { mode: 'automatic' })
+  manual.update(manualBook)
+  assert.deepEqual([manual.getValue('m1', 'B1'), manual.getValue('m1', 'C1'), manual.needsRecalculation], [20, 21, false], 'switching to automatic applies held-back changes')
+  const before = manual.version
+  manual.recalculateAll()
+  assert.ok(manual.version > before)
+  assert.equal(manual.getValue('m1', 'C1'), 21)
+
+  // Review F4: saving / exporting a manual-mode workbook recalculates first (Excel's
+  // "Recalculate workbook before saving"), unless the file turned that option off.
+  let saveBook = withCalculationOptions(workbook(sheet('s1', 'Sheet1', { A1: v(5), B1: f('A1*2') })), { mode: 'manual' })
+  const saveEngine = new CalculationEngine(saveBook)
+  assert.equal(saveEngine.getValue('s1', 'B1'), 10)
+  saveBook = produce(saveBook, (draft) => { draft.sheets[0].cells.A1 = v(50) })
+  saveEngine.update(saveBook)
+  assert.equal(saveEngine.needsRecalculation, true)
+  assert.equal(saveEngine.withResults({ forSave: false }).sheets[0].cells.B1.result, 10, 'printing shows the values on screen')
+  assert.equal(saveEngine.needsRecalculation, true)
+  assert.equal(saveEngine.withResults().sheets[0].cells.B1.result, 100, 'the saved result is recalculated')
+  assert.equal(saveEngine.needsRecalculation, false)
+  let noCalcOnSave = withCalculationOptions(workbook(sheet('s2', 'Sheet1', { A1: v(5), B1: f('A1*2') })), { mode: 'manual' })
+  noCalcOnSave = { ...noCalcOnSave, metadata: { ...noCalcOnSave.metadata, calcProperties: { ...noCalcOnSave.metadata!.calcProperties, calcOnSave: false } } }
+  const noCalcEngine = new CalculationEngine(noCalcOnSave)
+  noCalcEngine.getValue('s2', 'B1')
+  noCalcOnSave = produce(noCalcOnSave, (draft) => { draft.sheets[0].cells.A1 = v(50) })
+  noCalcEngine.update(noCalcOnSave)
+  assert.equal(noCalcEngine.withResults().sheets[0].cells.B1.result, 10, 'calcOnSave="0" keeps the last calculated value, as in Excel')
+
+  // CALC-007: engine diagnostics resolve workbook names.
+  const named: WorkbookModel = { ...workbook(sheet('n1', 'Sheet1', { A1: f('SUMM(1)'), A2: f('Rate*2'), A3: f('Missing*2'), A4: f('SUM(1') })), definedNames: [{ name: 'Rate', ranges: ['0.5'] }] }
+  const diagnostics = new CalculationEngine(named)
+  assert.equal(diagnostics.getValue('n1', 'A4'), '#NAME?')
+  assert.equal(diagnostics.diagnose('n1', 'A1')?.kind, 'unknown-function')
+  assert.equal(diagnostics.diagnose('n1', 'A2'), null)
+  assert.equal(diagnostics.diagnose('n1', 'A3')?.kind, 'unknown-name')
+  assert.equal(diagnostics.diagnose('n1', 'A4')?.suggestion, '=SUM(1)')
+  assert.deepEqual(diagnostics.diagnose('n1', 'B1', '=IF(A1,1'), diagnoseFormula('=IF(A1,1'))
+}
+
+console.log('Calculation engine QA passed: incremental recalculation, spills, saved arrays, tables, visibility, scaling, validation candidates, legacy formulas, calculation options, and circular references.')

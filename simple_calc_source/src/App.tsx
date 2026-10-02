@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, CSSProperties, DragEvent, KeyboardEvent, MouseEvent, MutableRefObject, PointerEvent as ReactPointerEvent, RefObject } from 'react'
+import type { ChangeEvent, CSSProperties, DragEvent, KeyboardEvent, MouseEvent, MutableRefObject, PointerEvent as ReactPointerEvent, RefObject, SyntheticEvent as ReactSyntheticEvent } from 'react'
 import { applyPatches, enablePatches, produceWithPatches, setAutoFreeze } from 'immer'
 import type { Patch } from 'immer'
 import type { ChartAnchor, PivotTableModel, SheetFilterState, SheetImage, SheetTable, SparklineGroup } from './spreadsheet-types'
@@ -50,6 +50,11 @@ import {
   Scissors,
   Search,
   BarChart3,
+  Calculator,
+  CircleHelp,
+  Keyboard,
+  SquareDashedMousePointer,
+  ZoomIn,
   Filter,
   FilterX,
   Highlighter,
@@ -97,10 +102,13 @@ import { FONT_FAMILIES, FONT_SIZES } from './lib/fonts'
 import type { NameDraft } from './components/NameManagerDialog'
 import type { AssistItem, FormulaAssistState } from './components/FormulaAssist'
 import { SpreadsheetPrintDialog } from './components/SpreadsheetPrintDialog'
-import { createAutofillPatch } from './lib/autofill'
-import { readRichClipboard, writeRichClipboard } from './lib/clipboard'
+import { AUTOFILL_MODE_LABELS, createAutofillPatch, fillHandleDoubleClickBottom } from './lib/autofill'
+import type { AutofillMode } from './lib/autofill'
+import { clipboardSourceIntact, readRichClipboard, relocateMovedFormula, writeRichClipboard } from './lib/clipboard'
 import { isClipboardTooLarge, parseClipboardPayload, serializeSelectionToClipboard } from './lib/clipboard-html'
-import { applyPasteSpecial, PASTE_SPECIAL_MENU, PASTE_SPECIAL_PRESETS } from './lib/paste-special'
+import { applyPasteSpecial, PASTE_SPECIAL_MENU, PASTE_SPECIAL_PRESETS, snapshotValueResolver } from './lib/paste-special'
+import { SHEET_LAST_COL, SHEET_LAST_ROW, continueTabRun, currentRegion, edgeJumpIndex, enterAfterTabRun, firstPositionAfter, indexFilledCells, lastPositionBefore, nextSelectionCorner, progressiveSelectAll, selectionExtension, stepWithinBounds, virtualExtent } from './lib/grid-navigation'
+import type { OrderedPosition, TabRun } from './lib/grid-navigation'
 import type { PasteSpecialOptions } from './lib/paste-special'
 import { PasteSpecialDialog } from './components/PasteSpecialDialog'
 import { ChartLayer } from './components/ChartLayer'
@@ -112,12 +120,27 @@ import { createChartFromRange, renameWorkbookChartReferences, resolveChartData, 
 import type { ChartGeometry, ChartWorkbookAccessor } from './lib/charts'
 import { buildPrintChartPayload } from './lib/chart-render'
 import { isFormulaError, shiftFormulaReferences } from './lib/formulas'
-import { CalculationEngine, markArrayMembers } from './lib/calc-engine'
+import { CalculationEngine, calculationOptionsOf, markArrayMembers, withCalculationOptions } from './lib/calc-engine'
+import type { CalculationOptions } from './lib/calc-engine'
+import { classifyLinkTarget, hyperlinkFormulaArgument, isCellReference, isNetworkPath, isSpreadsheetPath, linkDescription, quoteSheetName, resolveLinkedPath, splitLinkLocation } from './lib/hyperlinks'
+import { acceptedAutoComplete, autoCompleteDraft, autoCompleteMatch, columnTextEntries, pickListEntries } from './lib/autocomplete'
+import { formulaErrorHelp, formulaErrorTooltip } from './lib/error-help'
+import { usesExcelOnlySyntax } from './lib/formula-check'
+import { applyPageSetupPatch, pageSetupStateFor } from './lib/print-page-setup'
+import type { SpreadsheetPageSetupPatch } from './lib/print-page-setup'
+import { InsertLinkDialog } from './components/InsertLinkDialog'
+import type { InsertLinkResult } from './components/InsertLinkDialog'
+import { KeyboardShortcutsDialog } from './components/KeyboardShortcutsDialog'
+import { CalculationOptionsDialog } from './components/CalculationOptionsDialog'
+import { PickListPopover } from './components/PickListPopover'
+import { ValidationDropdown } from './components/ValidationDropdown'
+import type { SpreadsheetPreviewPage } from './components/SpreadsheetPrintDialog'
+import { previewPages } from './components/SpreadsheetPrintDialog'
 import { fromFileWorkbook, toFileWorkbook } from './lib/formula-file-format'
 import { callContextAt, canInsertReferenceAt, completionContextAt, formulaReferences, insertReference, moveReferencesInFormula, removeSheetFromFormula, renameSheetInFormula, tokenColor, tokenizeFormulaText, toggleAbsoluteReference } from './lib/formula-editing'
 import { functionSignature, getFunctionInfo, searchFunctions } from './lib/function-catalog'
 import './lib/formula-library'
-import { inferFormulaNumberFormat, parseCellInput } from './lib/input-parsing'
+import { formulaFromSignedEntry, inferFormulaNumberFormat, parseCellInput, textNeedsQuotePrefix } from './lib/input-parsing'
 import { fitNumericText, measureTextWidth } from './lib/cell-text-fit'
 import { tableAt, tableCellPaint } from './lib/table-styles'
 import { computeConditionalFormats, dataBarBackground } from './lib/conditional-format'
@@ -133,7 +156,7 @@ import { DataValidationDialog } from './components/DataValidationDialog'
 import { RemoveDuplicatesDialog, TextToColumnsDialog } from './components/DataCleanupDialogs'
 import { applyCellChanges, createSheetHost } from './lib/data-tools-core'
 import type { DataHost } from './lib/data-tools-core'
-import { applyFilterResult, clearFilterCriteria, computeFilteredRows, createFilterState, criteriaIsActive, distinctColumnValues, extendFilterRange, filterIsActive, filterRangeForSelection, hiddenRowsWithoutFilter, setColumnCriteria } from './lib/filter'
+import { applyFilterResult, clearFilterCriteria, computeFilteredRows, createFilterState, criteriaIsActive, distinctColumnValues, extendFilterRange, filterHiddenRowSet, filterIsActive, filterRangeForSelection, hiddenRowsWithoutFilter, setColumnCriteria } from './lib/filter'
 import { convertTableToRange, createTable, expandTableForEntry, fillCalculatedColumn, formatTableRef, parseTableRef, renameTable, resizeTable, setTotalsFunction, setTotalsRow, shiftCellsDown, syncTableHeaders, tableContaining, tableRegions, writeTotalsCells } from './lib/tables'
 import type { TotalFunctionId } from './lib/tables'
 import { CreateTableDialog, TableDesignPanel } from './components/TableTools'
@@ -157,14 +180,16 @@ import { changeOutline, clearOutline, maxOutlineLevel, outlineGroups, showOutlin
 import type { OutlineAxis, OutlineGroup } from './lib/outline'
 import type { ShiftCellsChoice } from './components/ShiftCellsDialog'
 import type { TableOption } from './components/TableTools'
-import { detectHeaderRow, sortKeyColors, sortKeyLabels, sortRange, sortSpecForFilter } from './lib/sort'
-import { findInvalidCells, findValidation, listOptionsForValidation, rangesWithSameValidation, validateValue, withValidation } from './lib/validation'
+import { detectHeaderRow, sortExpansionRegion, sortKeyColors, sortKeyLabels, sortRange, sortSpecForFilter } from './lib/sort'
+import { chipTextColor, dropdownOptionColor, dropdownPresentation, findInvalidCells, findValidation, joinMultipleSelection, listEntryForOption, listOptionsForValidation, rangesWithSameValidation, splitMultipleSelection, validateValue, withValidation } from './lib/validation'
+import type { DropdownPresentation } from './lib/validation'
 import { changeCase, fillBlanksFromAbove, removeDuplicates, splitSourceLines, splitTextToColumns, trimWhitespace } from './lib/data-cleanup'
 import { isDateTimeFormat } from './lib/format-codes'
 import type { ChangeHint } from './lib/calc-engine'
 import { accountingDisplayParts, formatColor, formatScalar, isAccountingNumberFormat } from './lib/number-format'
 import { registerRecoverySave } from './lib/recovery'
-import { applySelectionStructureCommand, shiftCells } from './lib/sheet-operations'
+import { getSimpleIO } from './simple-io/io-client'
+import { applySelectionStructureCommand, createSheetCopy, insertSheetCopy, planCellBlockTransfer, removeSheetScopedNames, rewriteWorkbookFormulaText, shiftCells, transferCellBlock } from './lib/sheet-operations'
 import type { SelectionStructureCommand } from './lib/sheet-operations'
 import type {
   CellBorder,
@@ -210,7 +235,13 @@ interface Coord {
 
 interface Selection {
   anchor: Coord
+  /** The active cell. */
   focus: Coord
+  /**
+   * The selected range when the active cell moved inside it (Enter/Tab in a block, Ctrl+.),
+   * so the range no longer spans anchor..focus. Any other selection change drops it.
+   */
+  range?: { top: number; bottom: number; left: number; right: number }
 }
 
 interface GridContextTarget {
@@ -287,6 +318,11 @@ interface InternalClipboard {
   text: string
   origin: Coord
   cells: CellData[][]
+  /** Calculated values at copy time, laid out like `cells` (Paste Values reads these). */
+  values: Array<Array<CellScalar | undefined>>
+  /** Document and cell map the block came from; a move is only valid while they are unchanged. */
+  documentId: string | null
+  sourceCells: SheetData['cells']
   sheetId: string
   sheetName: string
   /** Merges relative to the copied block ("A1" = first copied cell). */
@@ -295,12 +331,26 @@ interface InternalClipboard {
   validations?: Array<Array<Record<string, unknown> | undefined>>
   /** Ctrl+X: the next paste moves the block instead of copying it. */
   cut: boolean
+  /**
+   * A copy of a filtered range holds its visible rows only (Excel): the sheet row each copied
+   * row came from, so pasted formulas shift from where they really were.
+   */
+  sourceRows?: number[]
 }
 
 interface HistoryEntry {
   patches: Patch[]
   inversePatches: Patch[]
+  /** Active sheet and selection before the change: Undo returns there, as Excel and Sheets do. */
+  sheetId?: string
+  selectionBefore?: Selection
+  /** Where the user was when the change was undone: Redo returns there. */
+  sheetIdAfter?: string
+  selectionAfter?: Selection
 }
+
+/** The saved file matches a state that undo can no longer reach. */
+const UNREACHABLE_SAVE_POINT = 'unreachable'
 
 interface TextPromptRequest {
   title: string
@@ -348,6 +398,7 @@ function coordOf(address: string): Coord | null {
 }
 
 function selectionBounds(selection: Selection) {
+  if (selection.range) return { ...selection.range }
   return {
     top: Math.min(selection.anchor.row, selection.focus.row),
     bottom: Math.max(selection.anchor.row, selection.focus.row),
@@ -397,15 +448,42 @@ function fillSelectionForTarget(selection: Selection, target: Coord): Selection 
   }
 }
 
-function rangeAddresses(selection: Selection, limit = 100_000) {
+/** Number of cells in the selection. */
+function selectionArea(selection: Selection) {
   const bounds = selectionBounds(selection)
-  const total = (bounds.bottom - bounds.top + 1) * (bounds.right - bounds.left + 1)
-  if (total > limit) return []
+  return (bounds.bottom - bounds.top + 1) * (bounds.right - bounds.left + 1)
+}
+
+/**
+ * Every address in the selection, or [] when it has more than `limit` cells. Rows in
+ * `skipRows` (rows a filter hides) are left out: Excel's range commands act on the visible
+ * cells of a filtered list only.
+ */
+function rangeAddresses(selection: Selection, limit = 100_000, skipRows?: ReadonlySet<number>) {
+  const bounds = selectionBounds(selection)
+  if (selectionArea(selection) > limit) return []
   const addresses: string[] = []
   for (let row = bounds.top; row <= bounds.bottom; row += 1) {
+    if (skipRows?.has(row)) continue
     for (let col = bounds.left; col <= bounds.right; col += 1) addresses.push(addressOf({ row, col }))
   }
   return addresses
+}
+
+/** Rows (0-based) an active filter hides on the sheet: range commands skip them. */
+function filterSkippedRows(sheet: SheetData | null | undefined): Set<number> {
+  return sheet ? filterHiddenRowSet(sheet) : new Set<number>()
+}
+
+/** Drop the changes that land on rows a filter hides (fills act on visible cells only). */
+function visibleChanges<T>(changes: Record<string, T>, skipRows: ReadonlySet<number>): Record<string, T> {
+  if (!skipRows.size) return changes
+  const kept: Record<string, T> = {}
+  for (const [address, change] of Object.entries(changes)) {
+    const coord = coordOf(address)
+    if (!coord || !skipRows.has(coord.row)) kept[address] = change
+  }
+  return kept
 }
 
 function hiddenIndexSet(values?: number[]) {
@@ -425,54 +503,105 @@ function stepPastHidden(position: number, delta: number, max: number, hidden: Se
   return index
 }
 
+/** Excel's Ctrl+Arrow: to the edge of the data block, else the next value, else the sheet edge. */
 function edgeJumpCoord(sheet: SheetData, from: Coord, rowDelta: number, colDelta: number, hidden: Set<number>): Coord {
   const vertical = rowDelta !== 0
   const step = (vertical ? rowDelta : colDelta) > 0 ? 1 : -1
-  const position = vertical ? from.row : from.col
-  const filled = new Set<number>()
-  let farthest = Math.max(0, (vertical ? sheet.rowCount : sheet.colCount) - 1)
+  const filled: number[] = []
   for (const [address, cell] of Object.entries(sheet.cells)) {
     if (!cell.formula && (cell.value === undefined || cell.value === null || cell.value === '')) continue
     const coord = coordOf(address)
     if (!coord || (vertical ? coord.col !== from.col : coord.row !== from.row)) continue
-    const index = vertical ? coord.row : coord.col
-    farthest = Math.max(farthest, index)
-    if (!hidden.has(index)) filled.add(index)
+    filled.push(vertical ? coord.row : coord.col)
   }
-  const edge = step > 0 ? farthest : 0
-  let target = position
-  if (filled.has(position) && filled.has(position + step)) {
-    while (target !== edge && filled.has(target + step)) target += step
-  } else {
-    target = step > 0 ? Math.max(edge, position) : Math.min(edge, position)
-    for (let index = position + step; step > 0 ? index <= edge : index >= edge; index += step) {
-      if (filled.has(index)) { target = index; break }
-    }
-  }
-  while (hidden.has(target) && (step > 0 ? target > position : target < position)) target -= step
+  const target = edgeJumpIndex({ filled, hidden, last: vertical ? SHEET_LAST_ROW : SHEET_LAST_COL }, vertical ? from.row : from.col, step)
   return vertical ? { row: target, col: from.col } : { row: from.row, col: target }
 }
 
-function contiguousRegionBounds(sheet: SheetData, origin: Coord) {
+/** Excel's current region around a cell (Ctrl+Shift+8), or null on a blank, isolated cell. */
+function currentRegionOf(sheet: SheetData, origin: Coord) {
   const filled: Coord[] = []
   for (const [address, cell] of Object.entries(sheet.cells)) {
     if (!cell.formula && (cell.value === undefined || cell.value === null || cell.value === '')) continue
     const coord = coordOf(address)
     if (coord) filled.push(coord)
   }
-  const bounds = { top: origin.row, bottom: origin.row, left: origin.col, right: origin.col }
-  let grew = true
-  while (grew) {
-    grew = false
-    for (const coord of filled) {
-      if (coord.row < bounds.top - 1 || coord.row > bounds.bottom + 1 || coord.col < bounds.left - 1 || coord.col > bounds.right + 1) continue
-      if (coord.row < bounds.top) { bounds.top = coord.row; grew = true }
-      if (coord.row > bounds.bottom) { bounds.bottom = coord.row; grew = true }
-      if (coord.col < bounds.left) { bounds.left = coord.col; grew = true }
-      if (coord.col > bounds.right) { bounds.right = coord.col; grew = true }
+  return currentRegion(indexFilledCells(filled), origin)
+}
+
+/** Cut + paste: every formula in the workbook that pointed into the moved block follows it. */
+function repointMovedReferences(workbook: WorkbookModel, sourceSheet: string, destinationSheet: string, rect: OverlayBounds, rowDelta: number, colDelta: number) {
+  for (const sheet of workbook.sheets) {
+    for (const address in sheet.cells) {
+      const cell = sheet.cells[address]
+      if (!cell?.formula) continue
+      const formula = moveReferencesInFormula(cell.formula, { formulaSheet: sheet.name, sourceSheet, rect, rowDelta, colDelta, destinationSheet })
+      if (formula !== cell.formula) sheet.cells[address] = { ...cell, formula }
     }
   }
-  return bounds
+}
+
+/**
+ * A copy of the workbook whose sheet views carry each sheet's current active cell and, for
+ * sheets in `zooms`, its zoom (Excel's sheetView zoomScale), so the file reopens as it was left.
+ */
+function withActiveCells(workbook: WorkbookModel, selections: ReadonlyMap<string, Selection>, activeSelection: Selection, zooms?: ReadonlyMap<string, number>): WorkbookModel {
+  return {
+    ...workbook,
+    sheets: workbook.sheets.map((sheet) => {
+      const selection = sheet.id === workbook.activeSheetId ? activeSelection : selections.get(sheet.id)
+      const zoom = zooms?.get(sheet.id)
+      const zoomScale = zoom === undefined || !Number.isFinite(zoom) ? undefined : Math.round(clamp(zoom, 0.1, 4) * 100)
+      if (!selection && zoomScale === undefined) return sheet
+      const activeCell = selection ? addressOf(selection.focus) : undefined
+      const zoomView = zoomScale === undefined ? {} : { zoomScale, zoomScaleNormal: zoomScale }
+      const views = Array.isArray(sheet.views) && sheet.views.length
+        ? sheet.views.map((view, index) => ({ ...view, ...(index === 0 && activeCell ? { activeCell } : {}), ...zoomView }))
+        : [{ ...(activeCell ? { activeCell } : {}), ...zoomView }]
+      const frozenPane = sheet.frozen && (Number(sheet.frozen.rows) > 0 || Number(sheet.frozen.columns) > 0)
+      return frozenPane && activeCell ? { ...sheet, views, frozen: { ...sheet.frozen, activeCell } } : { ...sheet, views }
+    }),
+  }
+}
+
+/** The zoom a file saved for a sheet (sheetView zoomScale, 10–400%), as a factor. */
+function savedSheetZoom(sheet: SheetData | undefined): number | null {
+  const views = Array.isArray(sheet?.views) ? sheet!.views : []
+  for (const view of views) {
+    const scale = Number(view?.zoomScale)
+    if (Number.isFinite(scale) && scale >= 10 && scale <= 400) return Math.round(scale) / 100
+  }
+  return null
+}
+
+const AUTOCOMPLETE_KEY = 'simple-calc:autocomplete:v1'
+
+/** AutoComplete for cell values is on unless the user turned it off (Tools > Autocomplete). */
+function readAutoCompletePreference() {
+  try {
+    return localStorage.getItem(AUTOCOMPLETE_KEY) !== 'off'
+  } catch {
+    return true
+  }
+}
+
+/** The active cell a file saved for a sheet (sheet view), as the selection to open with. */
+function savedSheetSelection(sheet: SheetData | undefined): Selection | null {
+  if (!sheet) return null
+  const views = Array.isArray(sheet.views) ? sheet.views : []
+  for (const candidate of [sheet.frozen?.activeCell, ...views.map((view) => view?.activeCell)]) {
+    if (typeof candidate !== 'string') continue
+    const coord = coordOf(candidate.trim().split(/[\s:]/)[0] || '')
+    if (coord && coord.row <= SHEET_LAST_ROW && coord.col <= SHEET_LAST_COL) return { anchor: coord, focus: coord }
+  }
+  return null
+}
+
+/** Order-independent JSON of a cell, to tell a real change from an identical re-entry. */
+function stableCellJson(value: unknown) {
+  return JSON.stringify(value, (_key, item: unknown) => item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.entries(item as Record<string, unknown>).filter(([, entry]) => entry !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+    : item)
 }
 
 function compareCellScalars(a: CellScalar, b: CellScalar) {
@@ -532,6 +661,15 @@ function replaceAllOccurrences(source: string, query: string, replacement: strin
   return output + source.slice(position)
 }
 
+/**
+ * What Find compares for a cell's contents: the formula, or the entry without the display
+ * apostrophe rawCellValue adds to number-like text (Excel finds text "100" by 100).
+ */
+function searchableCellText(cell: CellData) {
+  if (!cell.formula && typeof cell.value === 'string') return cell.value
+  return rawCellValue(cell)
+}
+
 function replacementDraft(cell: CellData, query: string, replacement: string, options?: SearchOptions) {
   const matchCase = Boolean(options?.matchCase)
   if (cell.formula) {
@@ -540,9 +678,11 @@ function replacementDraft(cell: CellData, query: string, replacement: string, op
     return replaced === cell.formula ? null : `=${replaced}`
   }
   const source = cell.value === null || cell.value === undefined ? '' : String(cell.value)
-  if (options?.entireCell) return textMatches(source, query, options) ? replacement : null
+  // Text that shows an apostrophe ('100) stays text after Replace, as in Excel.
+  const keepText = typeof cell.value === 'string' && rawCellValue(cell).startsWith("'") ? "'" : ''
+  if (options?.entireCell) return textMatches(source, query, options) ? `${keepText}${replacement}` : null
   const replaced = replaceAllOccurrences(source, query, replacement, matchCase)
-  return replaced === source ? null : replaced
+  return replaced === source ? null : `${keepText}${replaced}`
 }
 
 function normalizeFormula(formula: string) {
@@ -569,6 +709,12 @@ function rawCellValue(cell?: CellData) {
   // Never stringify a structured value into "[object Object]" — fall back to the text the
   // file rendered.
   if (typeof cell.value === 'object') return cell.display ?? ''
+  // Text shows Excel's leading apostrophe when it was typed with one or would otherwise be read
+  // back as a number, date, logical, or formula, so editing it again keeps it text.
+  if (typeof cell.value === 'string') {
+    const textFormat = (cell.numFmt || cell.style?.numFmt) === '@'
+    if (textFormat ? cell.value.startsWith("'") : cell.style?.quotePrefix || textNeedsQuotePrefix(cell.value)) return `'${cell.value}`
+  }
   return String(cell.value)
 }
 
@@ -585,9 +731,20 @@ function parseDraft(draft: string, previous: CellData = {}): CellData {
   delete next.type
   delete next.richText
   delete next.arrayMember
+  // New content drops the legacy-formula marker and the apostrophe style of the old content.
+  delete (next as CellData & { implicitIntersection?: boolean }).implicitIntersection
+  if (next.style?.quotePrefix !== undefined) {
+    const style = { ...next.style }
+    delete style.quotePrefix
+    if (Object.keys(style).length) next.style = style
+    else delete next.style
+  }
 
-  if (draft.startsWith("'") || (previous.numFmt || previous.style?.numFmt) === '@') {
+  const textFormat = (previous.numFmt || previous.style?.numFmt) === '@'
+  if (draft.startsWith("'") || textFormat) {
     next.value = draft.startsWith("'") ? draft.slice(1) : draft
+    // Excel's quotePrefix style remembers the apostrophe, so the text stays text when edited.
+    if (draft.startsWith("'") && !textFormat) next.style = { ...next.style, quotePrefix: 1 }
     return next
   }
   if (draft.startsWith('=')) {
@@ -598,7 +755,10 @@ function parseDraft(draft: string, previous: CellData = {}): CellData {
   if (!draft.length) return next
   const parsed = parseCellInput(draft)
   if (!parsed) {
-    next.value = draft
+    // "+B1+C1" and "-A1*2" typed without "=" are formulas, as in Excel.
+    const formula = formulaFromSignedEntry(draft)
+    if (formula) next.formula = formula
+    else next.value = draft
     return next
   }
   next.value = parsed.value
@@ -1015,47 +1175,6 @@ function cellContentCss(cell: CellData | undefined, width?: number): CSSProperti
  * can skip diffing large sheets. A patch that replaces a whole sheet or cell map marks the
  * sheet 'all' (the engine then diffs it by identity).
  */
-/** Apply a formula rewrite to every formula-bearing part of the workbook (in an immer draft). */
-function rewriteWorkbookFormulas(workbook: WorkbookModel, rewrite: (formula: string) => string) {
-  for (const sheet of workbook.sheets) {
-    for (const address in sheet.cells) {
-      const cell = sheet.cells[address]
-      if (!cell?.formula) continue
-      const next = rewrite(cell.formula)
-      if (next !== cell.formula) {
-        cell.formula = next
-        delete cell.result
-        delete cell.display
-      }
-    }
-    if (sheet.dataValidations) {
-      for (const validation of Object.values(sheet.dataValidations)) {
-        const formulae = (validation as { formulae?: unknown[] } | null)?.formulae
-        if (!Array.isArray(formulae)) continue
-        formulae.forEach((formula, index) => {
-          if (typeof formula === 'string' && !formula.startsWith('"')) formulae[index] = rewrite(formula.replace(/^=/, ''))
-        })
-      }
-    }
-    for (const block of (sheet.conditionalFormattings || []) as Array<{ rules?: Array<{ formulae?: unknown[] }> }>) {
-      for (const rule of block?.rules || []) {
-        if (!Array.isArray(rule.formulae)) continue
-        rule.formulae.forEach((formula, index) => {
-          if (typeof formula === 'string') rule.formulae![index] = rewrite(formula.replace(/^=/, ''))
-        })
-      }
-    }
-  }
-  for (const name of workbook.definedNames || []) {
-    if (Array.isArray(name.ranges)) name.ranges = name.ranges.map((range) => rewrite(range.replace(/^=/, '')))
-    if (typeof name.ref === 'string') name.ref = rewrite(name.ref.replace(/^=/, ''))
-  }
-  for (const name of workbook.metadata?.definedNames || []) {
-    if (typeof name.ranges === 'string') name.ranges = rewrite(name.ranges.replace(/^=/, ''))
-    if (typeof name.formula === 'string') name.formula = rewrite(name.formula.replace(/^=/, ''))
-  }
-}
-
 const TAB_COLORS = ['C00000', 'FF0000', 'FFC000', 'FFFF00', '92D050', '00B050', '00B0F0', '0070C0', '002060', '7030A0', '4472C4', 'ED7D31', 'A5A5A5', '70AD47']
 
 function formulaHighlightParts(text: string): HighlightPart[] {
@@ -1142,6 +1261,33 @@ function modelColumnWidth(pixelWidth: number, zoom: number) {
 
 function modelRowHeight(pixelHeight: number, zoom: number) {
   return Math.round(clamp(pixelHeight / zoom * (3 / 4), 2, MAX_ROW_POINTS) * 100) / 100
+}
+
+/**
+ * Grow a row so a wrapped multi-line entry shows every line, as Excel auto-fits rows whose
+ * height was not set by hand. A row already taller than the default with no other multi-line
+ * wrapped cell was sized by hand, so it is left alone. Rows only grow here, never shrink.
+ */
+function growRowForLineBreaks(workbook: WorkbookModel, sheet: SheetData, address: string, row: number, cell: CellData) {
+  const lines = String(cell.value ?? '').split(/\r\n|\r|\n/).length
+  const normalFont = workbook.metadata?.normalFont as { size?: number } | undefined
+  const fontPixels = (Number(cell.style?.font?.size) || Number(normalFont?.size) || 11) * (4 / 3)
+  // The same line metrics the row header's double-click auto-fit uses.
+  const needed = Math.min(lines * fontPixels * 1.25 + 6, MAX_ROW_POINTS * (4 / 3))
+  const key = String(row + 1)
+  const sourceRowHeight = Number(sheet.properties?.defaultRowHeight)
+  const defaultPixels = Number.isFinite(sourceRowHeight) && sourceRowHeight > 0 ? rowPixelHeight(sourceRowHeight, 1) : IMPORTED_ROW_HEIGHT
+  const explicit = sheet.rowHeights[key]
+  const currentPixels = explicit !== undefined ? rowPixelHeight(explicit, 1) : defaultPixels
+  if (needed <= currentPixels + 0.5) return
+  if (explicit !== undefined && currentPixels > defaultPixels + 0.5) {
+    const grownForText = Object.entries(sheet.cells).some(([other, item]) => (
+      other !== address && /^[A-Z]+(\d+)$/.exec(other)?.[1] === key &&
+      Boolean(item.style?.alignment?.wrapText) && typeof item.value === 'string' && /[\r\n]/.test(item.value)
+    ))
+    if (!grownForText) return
+  }
+  sheet.rowHeights[key] = modelRowHeight(needed, 1)
 }
 
 interface DimensionResize {
@@ -1346,12 +1492,20 @@ interface GridProps {
   staleValue: (sheetId: string, address: string) => boolean
   onSelection: (selection: Selection) => void
   onBeginEdit: (draft?: string) => void
-  onDraft: (draft: string) => void
+  /** Typed text in the cell editor; `input` tells AutoComplete whether characters were added. */
+  onDraft: (draft: string, input?: EditorInputInfo) => void
   onCommitEdit: (direction?: 'up' | 'down' | 'left' | 'right') => void
   onCancelEdit: () => void
-  onFill: (target: Coord) => void
+  /** Fill handle drag ended on `target`; `toggle` when Ctrl was held (copy <-> series). */
+  onFill: (target: Coord, options?: { toggle?: boolean }) => void
+  /** Double-click on the fill handle: fill down beside the neighbouring data. */
+  onFillDoubleClick?: () => void
+  /** The range the last fill handle fill wrote: its Auto Fill Options button sits at the corner. */
+  autofillOptions?: OverlayBounds | null
+  onAutofillOptions?: (position: { x: number; y: number }) => void
   onCellValue: (address: string, value: CellData['value']) => void
-  onOpenHyperlink: (target: string) => void
+  /** Follow a link; `source` is the cell of a HYPERLINK() formula whose location is evaluated. */
+  onOpenHyperlink: (target: string, source?: { sheetId: string; address: string }) => void
   onColumnResize: (column: number, width: number) => void
   onRowResize: (row: number, height: number) => void
   onFreeze: (axis: 'rows' | 'columns', count: number) => void
@@ -1363,7 +1517,11 @@ interface GridProps {
   editorSelectionRequest: { start: number; end: number; id: number } | null
   /** Point mode: a click/drag on a cell while editing a formula inserts a reference. */
   onPointCell: (coord: Coord, phase: 'down' | 'drag', extend: boolean) => boolean
-  onEditorKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => boolean
+  /**
+   * App-level keys in the cell editor: true when handled; 'committed' when the key also
+   * committed or closed the edit, so the grid takes focus back without a second commit.
+   */
+  onEditorKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => boolean | 'committed'
   onEditorCaret: (start: number, end: number) => void
   onEditorFocusChange: (focused: boolean, element: HTMLTextAreaElement | null) => void
   /** Conditional formats for the cells in a window of the active sheet (0-based bounds). */
@@ -1374,16 +1532,67 @@ interface GridProps {
   onFilterButton: (key: string, col: number, anchor: { left: number; top: number; right: number; bottom: number }) => void
   inputMessage: { row: number; col: number; title: string; text: string } | null
   invalidCells: Coord[]
-  cutRange: OverlayBounds | null
+  /** Copied or cut range, outlined with the marching-ants marquee until Esc or an edit. */
+  clipboardRange: OverlayBounds | null
+  /** Scroll this cell into view (Ctrl+Backspace, pointing at a reference while editing). */
+  scrollRequest?: { row: number; col: number; id: number } | null
+  /** Last scroll position per sheet, so switching sheets returns to where each one was. */
+  scrollMemory?: Map<string, { scrollLeft: number; scrollTop: number; zoom: number }>
+  /** Changes with the open document, so a newly opened file starts at its own saved view. */
+  documentKey?: string
   /** Floating chart layer, drawn in canvas coordinates. */
   renderCharts?: (geometry: ChartGeometry, viewport: { left: number; top: number; width: number; height: number }, geometryVersion: unknown) => React.ReactNode
   listOptionsFor: (validation: Record<string, unknown> | undefined, address: string) => string[]
+  /** Open the list dropdown of a cell (its arrow, chip, or Alt+Down). */
+  onOpenDropdown?: (address: string) => void
+  /** The selection border was dragged: move the block to `destination` (its new top-left), or copy it with Ctrl. */
+  onMoveCells?: (source: OverlayBounds, destination: Coord, copy: boolean) => void
+  /** View > Page break preview: the printed pages of the active sheet, labelled. */
+  pagePreview?: PagePreviewOverlay | null
   /** Excel sparkline for a cell of the active sheet (only passed when the sheet has sparkline groups). */
   sparklineFor?: (address: string) => SparklineSpec | null
   /** Row/column groups (Excel's outline); the outline bars render beside the grid when present. */
   outline?: { rows: OutlineGroup[]; columns: OutlineGroup[]; rowDepth: number; columnDepth: number } | null
   onOutlineToggle?: (axis: OutlineAxis, group: OutlineGroup) => void
   onOutlineLevel?: (axis: OutlineAxis, level: number) => void
+  /** The selected cell holds an error value: a short explanation shown beside it. */
+  errorTip?: { row: number; col: number; code: string; title: string; text: string } | null
+  /** Why the formula being edited was not entered (shown under the cell editor). */
+  editorNote?: { title: string; text: string; hint?: string } | null
+  /** Page breaks drawn on the sheet after a print preview (Excel's dashed lines). */
+  pageBreaks?: PageBreakOverlay | null
+  /** Ctrl+mouse wheel asks for a new zoom (10%–400%); the grid keeps the cell under the pointer. */
+  onZoomRequest?: (zoom: number) => void
+}
+
+/**
+ * Whether a keyed entry's formula is checked before it is entered; `afterAccept` runs when a
+ * suggested correction is accepted (the move the Enter/Tab/arrow would have made).
+ */
+type FormulaCheck = boolean | { afterAccept?: () => void }
+
+/** What changed in the cell editor, for AutoComplete (characters typed vs deleted, IME). */
+interface EditorInputInfo {
+  inputType: string
+  caret: number
+  composing: boolean
+}
+
+/** Page break preview: each printed page's cells (0-based, inclusive), in print order. */
+interface PagePreviewOverlay {
+  pages: Array<{ pageNumber: number; top: number; bottom: number; left: number; right: number }>
+}
+
+/** Page breaks to draw: rows and columns (0-based) that start a new page, inside an area. */
+interface PageBreakOverlay {
+  rows: number[]
+  columns: number[]
+  /** Rows that start a page because of a manual break (drawn heavier, as in Excel). */
+  manualRows: number[]
+  top: number
+  bottom: number
+  left: number
+  right: number
 }
 
 interface GridCellViewProps {
@@ -1415,6 +1624,7 @@ interface GridCellViewProps {
   pointDraggingRef: MutableRefObject<boolean>
   conditional?: ConditionalCellFormat
   listOptionsFor: GridProps['listOptionsFor']
+  onOpenDropdown?: GridProps['onOpenDropdown']
   sparklineFor?: GridProps['sparklineFor']
 }
 
@@ -1476,6 +1686,7 @@ const GridCellView = memo(function GridCellView({
   pointDraggingRef,
   conditional,
   listOptionsFor,
+  onOpenDropdown,
   sparklineFor,
 }: GridCellViewProps) {
   const address = addressOf({ row, col })
@@ -1496,7 +1707,7 @@ const GridCellView = memo(function GridCellView({
   const paintedLeft = pixel(left), paintedTop = pixel(top)
   const tableEntry = sheet.tables?.length ? tableAt(sheet.tables, row, col) : null
   const validation = sheet.dataValidations ? validationForCell(sheet, address, { row, col }) : undefined
-  const handleMouseDown = (event: MouseEvent<HTMLDivElement>, isDropdown: boolean) => {
+  const handleMouseDown = (event: MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return
     if (onPointCell(merge ? { row: merge.top, col: merge.left } : { row, col }, 'down', event.shiftKey)) {
       // Keep focus in the formula being edited; the click inserted a reference.
@@ -1511,13 +1722,6 @@ const GridCellView = memo(function GridCellView({
     onSelection(event.shiftKey
       ? { anchor: selectionRef.current.anchor, focus: merge ? { row: merge.bottom, col: merge.right } : target }
       : { anchor, focus: target })
-    if (continuation && isDropdown) {
-      // Only the master participates in focus/validation. A clipped visual
-      // copy still opens that same native picker from the pointer gesture.
-      const master = document.getElementById(`cell-${sheet.id}-${address}`)?.querySelector<HTMLSelectElement>('.cell-dropdown')
-      master?.focus({ preventScroll: true })
-      try { master?.showPicker() } catch { /* Keyboard selection remains available on the focused master. */ }
-    }
   }
   const handleMouseEnter = (event: MouseEvent<HTMLDivElement>) => {
     if (pointDraggingRef.current) {
@@ -1541,7 +1745,7 @@ const GridCellView = memo(function GridCellView({
         role="gridcell"
         aria-rowindex={row + 1}
         aria-colindex={col + 1}
-        onMouseDown={(event) => handleMouseDown(event, false)}
+        onMouseDown={handleMouseDown}
         onMouseEnter={handleMouseEnter}
         onDoubleClick={() => onBeginEdit()}
       />
@@ -1614,15 +1818,39 @@ const GridCellView = memo(function GridCellView({
     )
     : formattedText
   const accounting = cellText === formattedText ? accountingDisplayParts(cellText, cellNumFmt) : null
-  const validationOptions = validation?.type === 'list' && validation.showDropDown !== true ? listOptionsFor(validation, address) : []
+  // Hover help only where it adds something, as in Excel: notes, links, error values and
+  // numbers too wide for their column ("####"), never a copy of an ordinary cell's text.
+  const errorHelp = formulaErrorHelp(rawValue)
+  const formulaLink = !cell?.hyperlink && cell?.formula ? /^\s*(?:_xlfn\.)?HYPERLINK\s*\(/i.test(cell.formula) : false
+  const hoverTitle = staleResult
+    ? 'Value from last file save — formula not recalculated'
+    : noteText(cell?.note)
+      || (cell?.hyperlink ? cell.hyperlinkTooltip || linkDescription(cell.hyperlink) : '')
+      || (errorHelp ? formulaErrorTooltip(errorHelp) : '')
+      || (typeof rawValue === 'number' && /^#+$/.test(cellText) && formattedText && !/^#+$/.test(formattedText) ? formattedText : '')
+      || undefined
+  const listValidation = validation?.type === 'list' && validation.showDropDown !== true ? validation : undefined
+  const validationOptions = listValidation ? listOptionsFor(listValidation, address) : []
   const isCheckbox = cell?.type === 'checkbox' || (
     typeof rawValue === 'boolean' && validationOptions.length === 2 &&
     validationOptions[0].toLocaleUpperCase() === 'TRUE' && validationOptions[1].toLocaleUpperCase() === 'FALSE'
   )
   const isDropdown = !isCheckbox && (cell?.type === 'dropdown' || validationOptions.length > 0)
+  // The value shows as text with its number format (Excel); the arrow appears on the active cell
+  // and on hover. A rule with Simple's Sheets-style settings draws chips, coloured per option;
+  // with the arrow style an option's colour tints the cell instead.
+  const dropdown = isDropdown ? dropdownPresentation(listValidation) : null
+  const chipped = Boolean(dropdown && dropdown.style === 'chip')
+  const dropdownPicks = dropdown && rawValue !== null && rawValue !== undefined && rawValue !== ''
+    ? (dropdown.multiple ? splitMultipleSelection(formattedText) : [formattedText || String(rawValue)])
+    : []
+  if (dropdown && !chipped && dropdownPicks.length === 1 && !cell?.style?.fill && !conditional?.fill && !conditional?.colorScale) {
+    const tint = dropdownOptionColor(dropdown, dropdownPicks[0])
+    if (tint) { paintedStyle.backgroundColor = tint; paintedStyle.color = chipTextColor(tint) }
+  }
   const horizontal = String(cell?.style?.alignment?.horizontal || '').toLocaleLowerCase()
   const canOverflow = Boolean(
-    cellText && !merge && !cell?.style?.alignment?.wrapText && !cell?.style?.alignment?.clipText && !isCheckbox && !isDropdown &&
+    cellText && !merge && !cell?.style?.alignment?.wrapText && !cell?.style?.alignment?.clipText && !isCheckbox && !chipped &&
     typeof rawValue !== 'number' && typeof rawValue !== 'boolean' && !isFormulaError(rawValue) &&
     !['right', 'center', 'centercontinuous', 'justify', 'distributed', 'fill'].includes(horizontal) &&
     !cell?.style?.alignment?.textRotation
@@ -1651,8 +1879,9 @@ const GridCellView = memo(function GridCellView({
       aria-colspan={merge && !continuation ? merge.right - merge.left + 1 : undefined}
       aria-rowindex={row + 1}
       aria-colindex={col + 1}
-      title={staleResult ? 'Value from last file save — formula not recalculated' : noteText(cell?.note) || cell?.hyperlinkTooltip || (cell?.formula ? `=${cell.formula}` : cellText || undefined)}
-      onMouseDown={(event) => handleMouseDown(event, isDropdown)}
+      title={hoverTitle}
+      data-cell-error={errorHelp ? errorHelp.code : undefined}
+      onMouseDown={handleMouseDown}
       onMouseEnter={handleMouseEnter}
       onDoubleClick={() => onBeginEdit()}
     >
@@ -1679,22 +1908,24 @@ const GridCellView = memo(function GridCellView({
           }}
           onChange={(event) => onCellValue(address, event.target.checked)}
         />
-      ) : isDropdown ? (
-        <select
-          className="cell-dropdown"
-          ref={(node) => { if (node) node.inert = continuation }}
-          tabIndex={continuation ? -1 : undefined}
-          aria-label={`${address} dropdown`}
-          value={rawValue == null ? '' : String(rawValue)}
-          onMouseDown={(event) => {
-            event.stopPropagation()
-            onSelection({ anchor: { row, col }, focus: { row, col } })
-          }}
-          onChange={(event) => onCellValue(address, event.target.value)}
+      ) : chipped && dropdown ? (
+        // Sheets' chips: a click opens the list (the press itself selects the cell).
+        <span
+          className="cell-content cell-chips"
+          data-dropdown-chips={address}
+          style={cellContentCss(cell)}
+          onClick={(event) => { event.stopPropagation(); onOpenDropdown?.(address) }}
         >
-          <option value="">Select…</option>
-          {validationOptions.map((option) => <option key={option} value={option}>{option}</option>)}
-        </select>
+          {(dropdownPicks.length ? dropdownPicks : ['']).map((pick, index, picks) => {
+            const tint = pick ? dropdownOptionColor(dropdown, pick) : undefined
+            return (
+              <span key={`${pick}-${index}`} className="validation-chip" style={tint ? { background: tint, color: chipTextColor(tint) } : undefined}>
+                {pick}
+                {index === picks.length - 1 && <ChevronDown size={Math.max(9, Math.round(11 * zoom))} aria-hidden="true" />}
+              </span>
+            )
+          })}
+        </span>
       ) : cell?.hyperlink ? (
         <button
           type="button"
@@ -1708,6 +1939,18 @@ const GridCellView = memo(function GridCellView({
           }}
           onClick={(event) => { event.stopPropagation(); onOpenHyperlink(cell.hyperlink!) }}
         >{cellText || cell.hyperlink}</button>
+      ) : formulaLink && !errorHelp ? (
+        // =HYPERLINK(location, name) shows its name as a link that follows the location.
+        <button
+          type="button"
+          className="cell-content cell-hyperlink"
+          tabIndex={continuation ? -1 : undefined}
+          style={{
+            ...cellContentCss(cell, canOverflow ? contentWidth : undefined),
+            ...(canOverflow && contentWidth > width ? { width: 'max-content', maxWidth: `${contentWidth}px` } : null),
+          }}
+          onClick={(event) => { event.stopPropagation(); onOpenHyperlink(`=${cell!.formula}`, { sheetId: sheet.id, address }) }}
+        >{cellText}</button>
       ) : isSparklineValue(rawValue) ? (
         <span
           className="cell-sparkline"
@@ -1724,6 +1967,14 @@ const GridCellView = memo(function GridCellView({
               : cellText}
           </span>
         </>
+      )}
+      {isDropdown && !chipped && (
+        // Hover shows where the list is; the active cell gets the full arrow button.
+        <span
+          className="cell-dropdown-hint"
+          aria-hidden="true"
+          onClick={(event) => { event.stopPropagation(); onOpenDropdown?.(address) }}
+        ><ChevronDown size={Math.max(9, Math.round(11 * zoom))} /></span>
       )}
     </div>
   )
@@ -1766,6 +2017,7 @@ function gridRowPropsEqual(previous: GridCellRowProps, next: GridCellRowProps) {
     previous.onCellValue !== next.onCellValue || previous.onOpenHyperlink !== next.onOpenHyperlink ||
     previous.onPointCell !== next.onPointCell || previous.pointDraggingRef !== next.pointDraggingRef ||
     previous.listOptionsFor !== next.listOptionsFor ||
+    previous.onOpenDropdown !== next.onOpenDropdown ||
     previous.sparklineFor !== next.sparklineFor ||
     previous.coordinates.length !== next.coordinates.length
   ) return false
@@ -1846,6 +2098,9 @@ function SpreadsheetGrid({
   onCommitEdit,
   onCancelEdit,
   onFill,
+  onFillDoubleClick,
+  autofillOptions,
+  onAutofillOptions,
   onCellValue,
   onOpenHyperlink,
   onColumnResize,
@@ -1866,13 +2121,23 @@ function SpreadsheetGrid({
   onFilterButton,
   inputMessage,
   invalidCells,
-  cutRange,
+  clipboardRange,
+  scrollRequest,
+  scrollMemory,
+  documentKey,
   renderCharts,
   listOptionsFor,
+  onOpenDropdown,
+  onMoveCells,
+  pagePreview,
   sparklineFor,
   outline,
   onOutlineToggle,
   onOutlineLevel,
+  errorTip,
+  editorNote,
+  pageBreaks,
+  onZoomRequest,
 }: GridProps) {
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const rowOutlineContentRef = useRef<HTMLDivElement>(null)
@@ -1886,6 +2151,7 @@ function SpreadsheetGrid({
   const fillTargetRef = useRef<Coord | null>(null)
   const fillPointerIdRef = useRef<number | null>(null)
   const fillPointerRef = useRef<{ x: number; y: number } | null>(null)
+  const fillStartRef = useRef<{ x: number; y: number } | null>(null)
   const fillFrameRef = useRef<number | null>(null)
   const updateFillFrameRef = useRef<() => void>(() => {})
   const resizeRef = useRef<DimensionResize | null>(null)
@@ -1897,10 +2163,35 @@ function SpreadsheetGrid({
   // Off-DOM mirror for draft width/height. Measuring on the live textarea (width → 0)
   // makes Chromium chase the caret and shove .sheet-viewport to the far edge of the grid.
   const editorMeasureRef = useRef<HTMLTextAreaElement | null>(null)
-  // Frozen while a cell edit is open so caret focus / selection-range cannot scroll the sheet.
+  // Held while a cell edit is open so caret focus / selection-range cannot scroll the sheet.
+  // Deliberate scrolls (wheel, scrollbar, pointing at a far cell) move the lock with them.
   const editScrollLockRef = useRef<{ scrollLeft: number; scrollTop: number } | null>(null)
+  const userScrollUntilRef = useRef(0)
+  const scrollbarDragRef = useRef(false)
+  // A remembered or saved view to reach once the grid has grown far enough to hold it.
+  const pendingScrollRestoreRef = useRef<{ scrollLeft: number; scrollTop: number; attempts: number } | null>(null)
+  const contextMenuKeyAtRef = useRef(0)
   const editorCommitViaKeyRef = useRef(false)
   const [fillTarget, setFillTarget] = useState<Coord | null>(null)
+  /** The error cell whose explanation card is open (hover or click on its indicator). */
+  const [errorCard, setErrorCard] = useState<{ key: string; pinned: boolean } | null>(null)
+  const errorTipKey = errorTip ? `${errorTip.row}:${errorTip.col}:${errorTip.code}` : null
+  useEffect(() => { setErrorCard(null) }, [errorTipKey])
+  const moveDragRef = useRef<{
+    pointerId: number
+    start: { x: number; y: number }
+    pointer: { x: number; y: number }
+    /** Offset of the grabbed cell inside the block. */
+    grab: Coord
+    source: OverlayBounds
+    moved: boolean
+    copy: boolean
+    target: OverlayBounds | null
+  } | null>(null)
+  const moveFrameRef = useRef<number | null>(null)
+  const updateMoveFrameRef = useRef<() => void>(() => {})
+  const cellAtPointRef = useRef<(x: number, y: number) => Coord | null>(() => null)
+  const [moveDrag, setMoveDrag] = useState<{ target: OverlayBounds; copy: boolean } | null>(null)
   const [resize, setResize] = useState<DimensionResize | null>(null)
   const [freezeDrag, setFreezeDrag] = useState<FreezeDrag | null>(null)
   const [viewport, setViewport] = useState({ scrollLeft: 0, scrollTop: 0, width: 1000, height: 600 })
@@ -1952,8 +2243,31 @@ function SpreadsheetGrid({
       .map((index) => ({ index, size: hiddenRows.has(index) ? 0 : resize?.axis === 'row' && resize.index === index ? resize.pixels : rowPixelHeight(Number(sheet.rowHeights?.[String(index + 1)]), zoom) }))
       .sort((a, b) => a.index - b.index)
   }, [hiddenRows, resize, sheet.rowHeights, zoom])
-  const rows = clamp(Math.max(DEFAULT_ROWS, sheet.rowCount + 25), DEFAULT_ROWS, 1_048_576)
-  const columns = clamp(Math.max(DEFAULT_COLS, sheet.colCount + 8), DEFAULT_COLS, 16_384)
+  // The grid behaves as if unbounded (like Excel's 1,048,576 x 16,384): it lays out the used
+  // area, the selection and the scrolled-to area plus a margin, and grows as you go further.
+  // Only the visible window is rendered. Browsers cap one layout box near 33.5 million pixels,
+  // so very high zoom levels reach fewer rows.
+  const extentSelection = selectionBounds(selection)
+  const rows = virtualExtent({
+    minimum: DEFAULT_ROWS,
+    used: sheet.rowCount,
+    usedMargin: 25,
+    selectionEnd: extentSelection.bottom,
+    selectionMargin: 25,
+    viewEnd: axisIndexAt(viewport.scrollTop + viewport.height, 1_048_576, defaultRow, rowMetrics),
+    viewMargin: Math.ceil(viewport.height / Math.max(1, defaultRow)),
+    limit: Math.min(1_048_576, Math.max(DEFAULT_ROWS, Math.floor(32_000_000 / Math.max(1, defaultRow)))),
+  })
+  const columns = virtualExtent({
+    minimum: DEFAULT_COLS,
+    used: sheet.colCount,
+    usedMargin: 8,
+    selectionEnd: extentSelection.right,
+    selectionMargin: 8,
+    viewEnd: axisIndexAt(viewport.scrollLeft + viewport.width, 16_384, defaultColumn, columnMetrics),
+    viewMargin: Math.ceil(viewport.width / Math.max(1, defaultColumn)),
+    limit: Math.min(16_384, Math.max(DEFAULT_COLS, Math.floor(32_000_000 / Math.max(1, defaultColumn)))),
+  })
   const mergeRanges = useMemo(() => (sheet.merges || []).map(mergeBounds).filter((value): value is NonNullable<ReturnType<typeof mergeBounds>> => Boolean(value)), [sheet.merges])
   const frozenRowCount = clamp(Math.trunc(Number(sheet.frozen?.rows) || 0), 0, rows)
   const frozenColumnCount = clamp(Math.trunc(Number(sheet.frozen?.columns) || 0), 0, columns)
@@ -1996,6 +2310,69 @@ function SpreadsheetGrid({
       pendingViewportRef.current = null
     }
   }, [syncPinnedOverlays, viewportNode])
+
+  // Ctrl+mouse wheel zooms the sheet (10%–400%, 15% a notch as in Excel) about the pointer,
+  // instead of the page. The listener is not passive so the browser's own zoom never runs.
+  const zoomRef = useRef(zoom)
+  zoomRef.current = zoom
+  const onZoomRequestRef = useRef(onZoomRequest)
+  onZoomRequestRef.current = onZoomRequest
+  const zoomAnchorRef = useRef<{ sheetX: number; sheetY: number; localX: number; localY: number; from: number } | null>(null)
+  useEffect(() => {
+    const element = viewportNode
+    if (!element) return
+    let pinch = 0
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey || event.altKey) return
+      event.preventDefault()
+      const request = onZoomRequestRef.current
+      if (!request || !event.deltaY) return
+      const current = zoomRef.current
+      let next: number
+      if (event.deltaMode !== 0 || Math.abs(event.deltaY) >= 50) {
+        // A mouse wheel notch: 15 points, snapped so 100% is always reachable again.
+        const step = event.deltaY < 0 ? 0.15 : -0.15
+        next = Math.round((current + step) * 100) / 100
+      } else {
+        // A touchpad pinch sends many small deltas: zoom smoothly in whole percents.
+        pinch += event.deltaY
+        if (Math.abs(pinch) < 4) return
+        next = Math.round(current * Math.exp(-pinch * 0.01) * 100) / 100
+        pinch = 0
+      }
+      next = clamp(next, 0.1, 4)
+      if (next === current) return
+      const rect = element.getBoundingClientRect()
+      const localX = Math.max(0, event.clientX - rect.left - HEADER_WIDTH)
+      const localY = Math.max(0, event.clientY - rect.top - HEADER_HEIGHT)
+      // Notches that arrive before the grid has redrawn keep the first anchor, measured at
+      // the zoom the sheet is still laid out at.
+      zoomAnchorRef.current ??= { sheetX: element.scrollLeft + localX, sheetY: element.scrollTop + localY, localX, localY, from: current }
+      zoomRef.current = next
+      request(next)
+    }
+    element.addEventListener('wheel', handleWheel, { passive: false })
+    return () => element.removeEventListener('wheel', handleWheel)
+  }, [viewportNode])
+  useLayoutEffect(() => {
+    const anchor = zoomAnchorRef.current
+    const element = viewportRef.current
+    zoomAnchorRef.current = null
+    if (!anchor || !element || anchor.from === zoom) return
+    // The cell under the pointer stays under it: sheet pixels scale with the zoom.
+    const ratio = zoom / anchor.from
+    const scrollLeft = Math.max(0, anchor.sheetX * ratio - anchor.localX)
+    const scrollTop = Math.max(0, anchor.sheetY * ratio - anchor.localY)
+    element.scrollLeft = scrollLeft
+    element.scrollTop = scrollTop
+    if (editScrollLockRef.current) editScrollLockRef.current = { scrollLeft: element.scrollLeft, scrollTop: element.scrollTop }
+    syncPinnedOverlays(element.scrollLeft, element.scrollTop)
+    if (Math.abs(element.scrollLeft - scrollLeft) > 1 || Math.abs(element.scrollTop - scrollTop) > 1) {
+      // The grid grows to the new extent on the next render; finish the scroll then.
+      pendingScrollRestoreRef.current = { scrollLeft, scrollTop, attempts: 0 }
+    }
+    setViewport((current) => current.scrollLeft === element.scrollLeft && current.scrollTop === element.scrollTop ? current : { ...current, scrollLeft: element.scrollLeft, scrollTop: element.scrollTop })
+  }, [syncPinnedOverlays, zoom])
 
   useEffect(() => {
     const moveResize = (event: globalThis.PointerEvent) => {
@@ -2042,7 +2419,7 @@ function SpreadsheetGrid({
   }, [onColumnResize, onRowResize, zoom])
 
   useEffect(() => {
-    const release = () => { pointDraggingRef.current = false; headerDragRef.current = null }
+    const release = () => { pointDraggingRef.current = false; headerDragRef.current = null; scrollbarDragRef.current = false }
     window.addEventListener('pointerup', release)
     window.addEventListener('blur', release)
     return () => {
@@ -2149,17 +2526,61 @@ function SpreadsheetGrid({
     return () => { document.documentElement.style.cursor = previous }
   }, [freezeDrag?.axis])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = viewportRef.current
     if (!element) return
-    const topLeft = coordOf(sheet.frozen?.topLeftCell || '')
-    element.scrollLeft = topLeft ? Math.max(0, axisOffset(topLeft.col, defaultColumn, columnMetrics) - frozenWidth) : 0
-    element.scrollTop = topLeft ? Math.max(0, axisOffset(topLeft.row, defaultRow, rowMetrics) - frozenHeight) : 0
+    // Returning to a sheet restores where it was scrolled this session; a sheet not visited
+    // yet opens at the file's saved top-left cell.
+    const remembered = scrollMemory?.get(sheet.id)
+    let scrollLeft: number
+    let scrollTop: number
+    if (remembered) {
+      const scale = remembered.zoom > 0 ? zoom / remembered.zoom : 1
+      scrollLeft = Math.max(0, remembered.scrollLeft * scale)
+      scrollTop = Math.max(0, remembered.scrollTop * scale)
+    } else {
+      const topLeft = coordOf(sheet.frozen?.topLeftCell || '')
+      scrollLeft = topLeft ? Math.max(0, axisOffset(topLeft.col, defaultColumn, columnMetrics) - frozenWidth) : 0
+      scrollTop = topLeft ? Math.max(0, axisOffset(topLeft.row, defaultRow, rowMetrics) - frozenHeight) : 0
+    }
+    element.scrollLeft = scrollLeft
+    element.scrollTop = scrollTop
     syncPinnedOverlays(element.scrollLeft, element.scrollTop)
+    // A far view may lie past the rows laid out for the previous sheet: grow the grid to it,
+    // then finish the scroll once it fits (after the next render, or the next frame).
+    if (Math.abs(element.scrollLeft - scrollLeft) > 1 || Math.abs(element.scrollTop - scrollTop) > 1) {
+      pendingScrollRestoreRef.current = { scrollLeft, scrollTop, attempts: 0 }
+      const retry = () => {
+        const pending = pendingScrollRestoreRef.current
+        const target = viewportRef.current
+        if (!pending || !target) return
+        target.scrollLeft = pending.scrollLeft
+        target.scrollTop = pending.scrollTop
+        syncPinnedOverlays(target.scrollLeft, target.scrollTop)
+        pending.attempts += 1
+        const reached = Math.abs(target.scrollLeft - pending.scrollLeft) <= 1 && Math.abs(target.scrollTop - pending.scrollTop) <= 1
+        if (reached || pending.attempts >= 4) pendingScrollRestoreRef.current = null
+        else window.requestAnimationFrame(retry)
+      }
+      window.requestAnimationFrame(retry)
+    }
+    setViewport((current) => current.scrollLeft === scrollLeft && current.scrollTop === scrollTop ? current : { ...current, scrollLeft, scrollTop })
   // A newly activated sheet owns its saved view. Zooming or editing must not
   // unexpectedly snap that view back to the file's original top-left cell.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sheet.id])
+  }, [sheet.id, documentKey])
+
+  useLayoutEffect(() => {
+    const pending = pendingScrollRestoreRef.current
+    const element = viewportRef.current
+    if (!pending || !element) return
+    element.scrollLeft = pending.scrollLeft
+    element.scrollTop = pending.scrollTop
+    syncPinnedOverlays(element.scrollLeft, element.scrollTop)
+    pending.attempts += 1
+    const reached = Math.abs(element.scrollLeft - pending.scrollLeft) <= 1 && Math.abs(element.scrollTop - pending.scrollTop) <= 1
+    if (reached || pending.attempts >= 4) pendingScrollRestoreRef.current = null
+  })
 
   useLayoutEffect(() => {
     const element = viewportRef.current
@@ -2190,26 +2611,54 @@ function SpreadsheetGrid({
     return () => window.cancelAnimationFrame(frame)
   }, [editing, syncPinnedOverlays])
 
+  /** Scrolls the least distance that brings a cell into view (outside the frozen panes). */
+  const revealCellRef = useRef<(coord: Coord, attempt?: number) => void>(() => {})
+  const revealCell = useCallback((coord: Coord, attempt = 0) => {
+    const element = viewportRef.current
+    if (!element) return
+    const x = HEADER_WIDTH + axisOffset(coord.col, defaultColumn, columnMetrics)
+    const y = HEADER_HEIGHT + axisOffset(coord.row, defaultRow, rowMetrics)
+    const width = axisSize(coord.col, defaultColumn, columnMetrics)
+    const height = axisSize(coord.row, defaultRow, rowMetrics)
+    let wantedLeft = element.scrollLeft
+    let wantedTop = element.scrollTop
+    if (coord.col >= frozenColumnCount) {
+      if (x < element.scrollLeft + HEADER_WIDTH + frozenWidth) wantedLeft = Math.max(0, x - HEADER_WIDTH - frozenWidth)
+      else if (x + width > element.scrollLeft + element.clientWidth) wantedLeft = x + width - element.clientWidth
+    }
+    if (coord.row >= frozenRowCount) {
+      if (y < element.scrollTop + HEADER_HEIGHT + frozenHeight) wantedTop = Math.max(0, y - HEADER_HEIGHT - frozenHeight)
+      else if (y + height > element.scrollTop + element.clientHeight) wantedTop = y + height - element.clientHeight
+    }
+    if (wantedLeft !== element.scrollLeft) element.scrollLeft = wantedLeft
+    if (wantedTop !== element.scrollTop) element.scrollTop = wantedTop
+    // A deliberate reveal during an edit (pointing at a far cell) moves the edit's scroll lock.
+    const lock = editScrollLockRef.current
+    if (lock) {
+      lock.scrollLeft = element.scrollLeft
+      lock.scrollTop = element.scrollTop
+    }
+    // A jump far past the laid-out grid (Go To A5000, Ctrl+Down) grows the grid in the same
+    // render, but Chromium can still clamp the scroll to the old size until the next frame.
+    if (attempt < 3 && (Math.abs(element.scrollLeft - wantedLeft) > 1 || Math.abs(element.scrollTop - wantedTop) > 1)) {
+      window.requestAnimationFrame(() => revealCellRef.current(coord, attempt + 1))
+    }
+  }, [columnMetrics, defaultColumn, defaultRow, frozenColumnCount, frozenHeight, frozenRowCount, frozenWidth, rowMetrics])
+  revealCellRef.current = revealCell
+
   useEffect(() => {
     // While a cell is being edited, Chromium will also try to keep the caret in view.
     // That caret can sit far past the cell box on a long unwrapped draft, so following
     // it (or the selection) would shove the sheet to the far edge. Stay put until edit ends.
     if (editing) return
-    const element = viewportRef.current
-    if (!element) return
-    const x = HEADER_WIDTH + axisOffset(selection.focus.col, defaultColumn, columnMetrics)
-    const y = HEADER_HEIGHT + axisOffset(selection.focus.row, defaultRow, rowMetrics)
-    const width = axisSize(selection.focus.col, defaultColumn, columnMetrics)
-    const height = axisSize(selection.focus.row, defaultRow, rowMetrics)
-    if (selection.focus.col >= frozenColumnCount) {
-      if (x < element.scrollLeft + HEADER_WIDTH + frozenWidth) element.scrollLeft = Math.max(0, x - HEADER_WIDTH - frozenWidth)
-      else if (x + width > element.scrollLeft + element.clientWidth) element.scrollLeft = x + width - element.clientWidth
-    }
-    if (selection.focus.row >= frozenRowCount) {
-      if (y < element.scrollTop + HEADER_HEIGHT + frozenHeight) element.scrollTop = Math.max(0, y - HEADER_HEIGHT - frozenHeight)
-      else if (y + height > element.scrollTop + element.clientHeight) element.scrollTop = y + height - element.clientHeight
-    }
-  }, [editing, selection.focus.col, selection.focus.row, defaultColumn, defaultRow, columnMetrics, rowMetrics, frozenColumnCount, frozenRowCount, frozenHeight, frozenWidth])
+    revealCell(selection.focus)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editing, selection.focus.col, selection.focus.row, revealCell])
+
+  useEffect(() => {
+    if (scrollRequest) revealCell(scrollRequest)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollRequest?.id])
 
   const frozenRenderRowEnd = frozenRowCount
     ? Math.min(frozenRowCount - 1, axisIndexAt(Math.max(0, viewport.height - HEADER_HEIGHT), rows, defaultRow, rowMetrics) + 2)
@@ -2419,15 +2868,23 @@ function SpreadsheetGrid({
   const handleViewportScroll = (target: HTMLDivElement) => {
     const lock = editScrollLockRef.current
     if (lock && (target.scrollLeft !== lock.scrollLeft || target.scrollTop !== lock.scrollTop)) {
-      // Cell edit focus/selection-range and Chromium caret scrolling try to yank the
-      // viewport to the grid edge. Hold the position the edit started at until commit.
-      target.scrollLeft = lock.scrollLeft
-      target.scrollTop = lock.scrollTop
-      syncPinnedOverlays(lock.scrollLeft, lock.scrollTop)
-      return
+      if (scrollbarDragRef.current || performance.now() < userScrollUntilRef.current) {
+        // The wheel or the scrollbar moved the sheet during an edit, so a formula can point
+        // at cells outside the first view, as in Excel. The edit now holds this position.
+        lock.scrollLeft = target.scrollLeft
+        lock.scrollTop = target.scrollTop
+      } else {
+        // Cell edit focus/selection-range and Chromium caret scrolling try to yank the
+        // viewport to the grid edge. Hold the edit's position instead.
+        target.scrollLeft = lock.scrollLeft
+        target.scrollTop = lock.scrollTop
+        syncPinnedOverlays(lock.scrollLeft, lock.scrollTop)
+        return
+      }
     }
     const scrollLeft = target.scrollLeft
     const scrollTop = target.scrollTop
+    scrollMemory?.set(sheet.id, { scrollLeft, scrollTop, zoom })
     // Keep the handful of pinned overlays on the compositor without changing
     // an inherited style on every grid cell.
     syncPinnedOverlays(scrollLeft, scrollTop)
@@ -2441,7 +2898,10 @@ function SpreadsheetGrid({
       (endCol < columns - 1 && visibleRight > axisOffset(endCol + 1, defaultColumn, columnMetrics) - columnGuard)
     const needsRows = (startRow > 0 && visibleTop < axisOffset(startRow, defaultRow, rowMetrics) + rowGuard) ||
       (endRow < rows - 1 && visibleBottom > axisOffset(endRow + 1, defaultRow, rowMetrics) - rowGuard)
-    if (!needsColumns && !needsRows) return
+    // Nearing the end of the laid-out grid: lay out more, so scrolling simply continues.
+    const nearsEnd = (rows < 1_048_576 && visibleBottom > axisOffset(rows, defaultRow, rowMetrics) - target.clientHeight * 0.5) ||
+      (columns < 16_384 && visibleRight > axisOffset(columns, defaultColumn, columnMetrics) - target.clientWidth * 0.5)
+    if (!needsColumns && !needsRows && !nearsEnd) return
     pendingViewportRef.current = { scrollLeft, scrollTop }
     if (viewportFrameRef.current !== null) return
     viewportFrameRef.current = window.requestAnimationFrame(() => {
@@ -2455,10 +2915,34 @@ function SpreadsheetGrid({
     })
   }
 
+  /** Shift+F10 or the Menu key: the cell context menu opens at the active cell, as in Excel. */
+  const openContextMenuAtActiveCell = () => {
+    const element = viewportRef.current
+    if (!element) return
+    const focus = selectionRef.current.focus
+    revealCell(focus)
+    const rect = element.getBoundingClientRect()
+    const x = rect.left + HEADER_WIDTH + axisOffset(focus.col, defaultColumn, columnMetrics) - (focus.col < frozenColumnCount ? 0 : element.scrollLeft)
+    const y = rect.top + HEADER_HEIGHT + axisOffset(focus.row, defaultRow, rowMetrics) - (focus.row < frozenRowCount ? 0 : element.scrollTop)
+    const width = axisSize(focus.col, defaultColumn, columnMetrics)
+    const height = axisSize(focus.row, defaultRow, rowMetrics)
+    onContextTarget({ kind: 'cell', coord: focus }, {
+      x: clamp(x + Math.min(width, 48), rect.left, rect.right - 8),
+      y: clamp(y + height, rect.top, rect.bottom - 8),
+    })
+  }
+
   const handleViewportContextMenu = (event: MouseEvent<HTMLDivElement>) => {
     const element = viewportRef.current
     if (!element) return
     if (isNativeTextEditingTarget(event.target)) return
+    const pointerType = (event.nativeEvent as globalThis.PointerEvent).pointerType
+    if (event.button !== 2 && !pointerType) {
+      // A keyboard-made context menu (Shift+F10, Menu key) has no pointer position.
+      event.preventDefault()
+      if (performance.now() - contextMenuKeyAtRef.current > 1_000) openContextMenuAtActiveCell()
+      return
+    }
     const rect = element.getBoundingClientRect()
     const localX = event.clientX - rect.left
     const localY = event.clientY - rect.top
@@ -2694,8 +3178,14 @@ function SpreadsheetGrid({
   }
 
   useEffect(() => {
-    const finishFill = (apply: boolean, pointerId?: number) => {
+    const finishFill = (apply: boolean, pointerId?: number, toggle = false) => {
       if (!fillDraggingRef.current || (pointerId !== undefined && fillPointerIdRef.current !== pointerId)) return
+      // A press that never moved is a click (or half of a double-click), not a drag: the
+      // handle reaches past the corner, so it must not fill the neighbouring cell.
+      const start = fillStartRef.current
+      const end = fillPointerRef.current
+      if (start && end && Math.abs(end.x - start.x) < 4 && Math.abs(end.y - start.y) < 4) apply = false
+      fillStartRef.current = null
       fillDraggingRef.current = false
       fillPointerIdRef.current = null
       fillPointerRef.current = null
@@ -2704,7 +3194,8 @@ function SpreadsheetGrid({
       const target = fillTargetRef.current
       fillTargetRef.current = null
       setFillTarget(null)
-      if (apply && target) onFill(target)
+      // Ctrl held as the drag ends swaps copying and continuing a series, as in Excel.
+      if (apply && target) onFill(target, toggle ? { toggle: true } : undefined)
       viewportRef.current?.focus({ preventScroll: true })
     }
     const moveFill = (event: globalThis.PointerEvent) => {
@@ -2713,7 +3204,7 @@ function SpreadsheetGrid({
       if (fillFrameRef.current !== null) window.cancelAnimationFrame(fillFrameRef.current)
       updateFillFrameRef.current()
     }
-    const endFill = (event: globalThis.PointerEvent) => finishFill(true, event.pointerId)
+    const endFill = (event: globalThis.PointerEvent) => finishFill(true, event.pointerId, event.ctrlKey || event.metaKey)
     const cancelFill = (event: globalThis.PointerEvent) => finishFill(false, event.pointerId)
     const moveMouseFill = (event: globalThis.MouseEvent) => {
       if (!fillDraggingRef.current || fillPointerIdRef.current !== -1) return
@@ -2721,7 +3212,7 @@ function SpreadsheetGrid({
       if (fillFrameRef.current !== null) window.cancelAnimationFrame(fillFrameRef.current)
       updateFillFrameRef.current()
     }
-    const endMouseFill = () => finishFill(true, -1)
+    const endMouseFill = (event: globalThis.MouseEvent) => finishFill(true, -1, event.ctrlKey || event.metaKey)
     const cancelOnBlur = () => finishFill(false)
     window.addEventListener('pointermove', moveFill)
     window.addEventListener('pointerup', endFill)
@@ -2739,6 +3230,160 @@ function SpreadsheetGrid({
       if (fillFrameRef.current !== null) window.cancelAnimationFrame(fillFrameRef.current)
     }
   }, [onFill])
+
+  // ---- Drag the selection border to move the block; Ctrl copies (Excel, Sheets) -------------
+  /** The cell under a viewport point, through the frozen panes and the scroll. */
+  const cellAtClientPoint = (x: number, y: number): Coord | null => {
+    const element = viewportRef.current
+    if (!element) return null
+    const rect = element.getBoundingClientRect()
+    const localX = Math.max(0, x - rect.left - HEADER_WIDTH)
+    const localY = Math.max(0, y - rect.top - HEADER_HEIGHT)
+    const colPixel = localX < frozenWidth ? localX : localX + element.scrollLeft
+    const rowPixel = localY < frozenHeight ? localY : localY + element.scrollTop
+    return { row: axisIndexAt(rowPixel, rows, defaultRow, rowMetrics), col: axisIndexAt(colPixel, columns, defaultColumn, columnMetrics) }
+  }
+  updateMoveFrameRef.current = () => {
+    const drag = moveDragRef.current
+    const element = viewportRef.current
+    if (!drag || !element) return
+    const { x, y } = drag.pointer
+    if (!drag.moved && Math.abs(x - drag.start.x) < 4 && Math.abs(y - drag.start.y) < 4) return
+    drag.moved = true
+    const rect = element.getBoundingClientRect()
+    const edge = 28
+    let deltaX = 0
+    let deltaY = 0
+    if (x < rect.left + HEADER_WIDTH + edge) deltaX = -Math.min(24, Math.max(4, (rect.left + HEADER_WIDTH + edge - x) * 0.36))
+    else if (x > rect.right - 12 - edge) deltaX = Math.min(24, Math.max(4, (x - rect.right + 12 + edge) * 0.36))
+    if (y < rect.top + HEADER_HEIGHT + edge) deltaY = -Math.min(24, Math.max(4, (rect.top + HEADER_HEIGHT + edge - y) * 0.36))
+    else if (y > rect.bottom - 12 - edge) deltaY = Math.min(24, Math.max(4, (y - rect.bottom + 12 + edge) * 0.36))
+    if (deltaX || deltaY) {
+      element.scrollLeft = Math.max(0, element.scrollLeft + deltaX)
+      element.scrollTop = Math.max(0, element.scrollTop + deltaY)
+    }
+    const cell = cellAtClientPoint(x, y)
+    if (cell) {
+      const height = drag.source.bottom - drag.source.top
+      const width = drag.source.right - drag.source.left
+      const top = clamp(cell.row - drag.grab.row, 0, SHEET_LAST_ROW - height)
+      const left = clamp(cell.col - drag.grab.col, 0, SHEET_LAST_COL - width)
+      drag.target = { top, left, bottom: top + height, right: left + width }
+      setMoveDrag((current) => (current && current.copy === drag.copy && current.target.top === top && current.target.left === left
+        ? current
+        : { target: drag.target!, copy: drag.copy }))
+    }
+    if (deltaX || deltaY) moveFrameRef.current = window.requestAnimationFrame(() => updateMoveFrameRef.current())
+  }
+  const beginMoveDrag = (event: ReactPointerEvent<HTMLSpanElement>) => {
+    if (event.button !== 0 || editing || !onMoveCells) return
+    event.preventDefault()
+    event.stopPropagation()
+    viewportRef.current?.focus({ preventScroll: true })
+    const pointerCell = cellAtClientPoint(event.clientX, event.clientY) || { row: bounds.top, col: bounds.left }
+    const point = { x: event.clientX, y: event.clientY }
+    moveDragRef.current = {
+      pointerId: event.pointerId,
+      start: point,
+      pointer: point,
+      // The cell of the block that was grabbed stays under the pointer.
+      grab: { row: clamp(pointerCell.row, bounds.top, bounds.bottom) - bounds.top, col: clamp(pointerCell.col, bounds.left, bounds.right) - bounds.left },
+      source: { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right },
+      moved: false,
+      copy: event.ctrlKey || event.metaKey,
+      target: null,
+    }
+    // Cells extend the selection while a button is held over them unless a handle is being
+    // dragged; the move is such a drag (its pointer id stays off the fill handle's listeners).
+    fillDraggingRef.current = true
+    try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* Window listeners still finish the drag. */ }
+  }
+  const moveHandlersRef = useRef({ onMoveCells, onSelection })
+  moveHandlersRef.current = { onMoveCells, onSelection }
+  useEffect(() => {
+    const finishMove = (apply: boolean) => {
+      const drag = moveDragRef.current
+      if (!drag) return
+      moveDragRef.current = null
+      if (fillPointerIdRef.current === null) fillDraggingRef.current = false
+      if (moveFrameRef.current !== null) window.cancelAnimationFrame(moveFrameRef.current)
+      moveFrameRef.current = null
+      setMoveDrag(null)
+      if (!apply) return
+      if (!drag.moved) {
+        // A click on the border (no drag) selects the cell under it, as a click there would.
+        const cell = cellAtPointRef.current(drag.pointer.x, drag.pointer.y)
+        if (cell) moveHandlersRef.current.onSelection({ anchor: cell, focus: cell })
+        return
+      }
+      const target = drag.target
+      if (target && (target.top !== drag.source.top || target.left !== drag.source.left)) {
+        moveHandlersRef.current.onMoveCells?.(drag.source, { row: target.top, col: target.left }, drag.copy)
+      }
+      viewportRef.current?.focus({ preventScroll: true })
+    }
+    const move = (event: globalThis.PointerEvent) => {
+      const drag = moveDragRef.current
+      if (!drag || drag.pointerId !== event.pointerId) return
+      drag.pointer = { x: event.clientX, y: event.clientY }
+      drag.copy = event.ctrlKey || event.metaKey
+      if (moveFrameRef.current !== null) window.cancelAnimationFrame(moveFrameRef.current)
+      updateMoveFrameRef.current()
+    }
+    const end = (event: globalThis.PointerEvent) => {
+      const drag = moveDragRef.current
+      if (!drag || drag.pointerId !== event.pointerId) return
+      drag.pointer = { x: event.clientX, y: event.clientY }
+      // Ctrl as the block is dropped decides between moving and copying, as in Excel.
+      drag.copy = event.ctrlKey || event.metaKey
+      finishMove(true)
+    }
+    const cancel = () => finishMove(false)
+    const key = (event: globalThis.KeyboardEvent) => {
+      const drag = moveDragRef.current
+      if (!drag) return
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); finishMove(false); return }
+      if (event.key === 'Control' || event.key === 'Meta') {
+        drag.copy = event.type === 'keydown'
+        if (drag.target) setMoveDrag({ target: drag.target, copy: drag.copy })
+      }
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', end)
+    window.addEventListener('pointercancel', cancel)
+    window.addEventListener('blur', cancel)
+    window.addEventListener('keydown', key, true)
+    window.addEventListener('keyup', key, true)
+    return () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', end)
+      window.removeEventListener('pointercancel', cancel)
+      window.removeEventListener('blur', cancel)
+      window.removeEventListener('keydown', key, true)
+      window.removeEventListener('keyup', key, true)
+      if (moveFrameRef.current !== null) window.cancelAnimationFrame(moveFrameRef.current)
+    }
+  }, [])
+  cellAtPointRef.current = cellAtClientPoint
+
+  // Excel's dropdown arrow beside the active cell when it has a list (Sheets' chips open on a click).
+  const activeDropdown = useMemo(() => {
+    if (editing || !onOpenDropdown) return null
+    const focus = selection.focus
+    const merge = mergeRanges.find((item) => focus.row >= item.top && focus.row <= item.bottom && focus.col >= item.left && focus.col <= item.right)
+    const anchor = merge ? { row: merge.top, col: merge.left } : focus
+    const address = addressOf(anchor)
+    const cell = sheet.cells[address]
+    if (cell?.type === 'checkbox') return null
+    const validation = sheet.dataValidations ? validationForCell(sheet, address, anchor) : undefined
+    const listed = validation?.type === 'list' && validation.showDropDown !== true ? validation : undefined
+    if (listed && dropdownPresentation(listed).style === 'chip') return null
+    const options = listed ? listOptionsFor(listed, address) : []
+    if (!options.length && cell?.type !== 'dropdown') return null
+    const value = resolvedValue(sheet.id, address)
+    if (typeof value === 'boolean' && options.length === 2 && options[0].toLocaleUpperCase() === 'TRUE' && options[1].toLocaleUpperCase() === 'FALSE') return null
+    return { address, bounds: merge ? { top: merge.top, bottom: merge.bottom, left: merge.left, right: merge.right } : { top: anchor.row, bottom: anchor.row, left: anchor.col, right: anchor.col } }
+  }, [editing, listOptionsFor, mergeRanges, onOpenDropdown, resolvedValue, selection.focus, sheet])
 
   // Conditional formats are computed for the scrolled window (in 64-row x 16-column chunks,
   // so ordinary scrolling reuses the result) plus the frozen bands, never the rows between.
@@ -2771,7 +3416,7 @@ function SpreadsheetGrid({
     const props: GridCellRowProps = {
       coordinates, mergeMap, conditionalMap, sheet, pane, zoom, columns, frozenRowCount, frozenColumnCount, defaultColumn, defaultRow,
       columnMetrics, rowMetrics, mergeRanges, selectionRef, viewportRef, fillDraggingRef, displayValue, resolvedValue, staleValue,
-      onSelection, onBeginEdit, onCellValue, onOpenHyperlink, onPointCell, pointDraggingRef, listOptionsFor, sparklineFor,
+      onSelection, onBeginEdit, onCellValue, onOpenHyperlink, onPointCell, pointDraggingRef, listOptionsFor, onOpenDropdown, sparklineFor,
     }
     const cached = rowElementCacheRef.current.get(key)
     const entry = cached && gridRowPropsEqual(cached.props, props) ? cached : { props, element: <GridCellRow key={key} {...props} /> }
@@ -2785,7 +3430,10 @@ function SpreadsheetGrid({
           data-selection-pane={pane}
           style={{ left: selectionLeft + (pane === 'body' ? HEADER_WIDTH : 0), top: selectionTop + (pane === 'body' ? HEADER_HEIGHT : 0), width: selectionWidth, height: selectionHeight }}
           aria-hidden="true"
-        >{pane === selectionHandlePane && <span
+        >{onMoveCells && !editing && (['top', 'right', 'bottom', 'left'] as const).map((side) => (
+          // The border is a handle: drag it to move the cells, with Ctrl to copy them.
+          <span key={side} className={`selection-move-edge is-${side}`} data-move-edge={side} onPointerDown={beginMoveDrag} />
+        ))}{pane === selectionHandlePane && <span
           className="fill-handle"
           onPointerDown={(event) => {
             if (event.button !== 0) return
@@ -2794,6 +3442,7 @@ function SpreadsheetGrid({
             fillDraggingRef.current = true
             fillPointerIdRef.current = event.pointerId
             fillPointerRef.current = { x: event.clientX, y: event.clientY }
+            fillStartRef.current = { x: event.clientX, y: event.clientY }
             fillTargetRef.current = null
             setFillTarget(null)
             try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* Window listeners still complete the drag. */ }
@@ -2806,9 +3455,15 @@ function SpreadsheetGrid({
             fillDraggingRef.current = true
             fillPointerIdRef.current = -1
             fillPointerRef.current = { x: event.clientX, y: event.clientY }
+            fillStartRef.current = { x: event.clientX, y: event.clientY }
             fillTargetRef.current = null
             setFillTarget(null)
             updateFillFrameRef.current()
+          }}
+          onDoubleClick={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            onFillDoubleClick?.()
           }}
         />}</div>
   ) : null
@@ -2826,8 +3481,25 @@ function SpreadsheetGrid({
       height: axisOffset(bottom + 1, defaultRow, rowMetrics) - axisOffset(top, defaultRow, rowMetrics),
     }
   }
+  // In a multi-cell selection the active cell (where typing goes, and what Enter/Tab move)
+  // gets its own thin frame, as Excel and Sheets set it apart from the rest of the range.
+  const activeCellBounds = (() => {
+    if (bounds.top === bounds.bottom && bounds.left === bounds.right) return null
+    if (mergeRanges.some((merge) => merge.top === bounds.top && merge.bottom === bounds.bottom && merge.left === bounds.left && merge.right === bounds.right)) return null
+    const focus = selection.focus
+    const merge = mergeRanges.find((item) => focus.row >= item.top && focus.row <= item.bottom && focus.col >= item.left && focus.col <= item.right)
+    return merge ? { top: merge.top, bottom: merge.bottom, left: merge.left, right: merge.right } : { top: focus.row, bottom: focus.row, left: focus.col, right: focus.col }
+  })()
   const renderOverlays = (pane: CellPane) => (
     <>
+      {activeCellBounds && !editing && intersectingPanes(activeCellBounds, frozenRowCount, frozenColumnCount).includes(pane) && (
+        <div
+          className="active-cell-frame"
+          data-active-cell={addressOf({ row: activeCellBounds.top, col: activeCellBounds.left })}
+          style={{ ...overlayRect(activeCellBounds, pane), position: 'absolute', pointerEvents: 'none', zIndex: 7, boxShadow: 'inset 0 0 0 1px var(--accent)' }}
+          aria-hidden="true"
+        />
+      )}
       {spillOutline && intersectingPanes(spillOutline, frozenRowCount, frozenColumnCount).includes(pane) && (
         <div className="spill-outline" data-spill-outline={pane} style={overlayRect(spillOutline, pane)} aria-hidden="true" />
       )}
@@ -2860,9 +3532,62 @@ function SpreadsheetGrid({
             >{active ? <Filter size={Math.round(size * 0.6)} /> : <ChevronDown size={Math.round(size * 0.7)} />}</button>
           )
         }))}
-      {cutRange && intersectingPanes(cutRange, frozenRowCount, frozenColumnCount).includes(pane) && (
-        <div className="cut-marquee" style={overlayRect(cutRange, pane)} aria-hidden="true" />
+      {clipboardRange && intersectingPanes(clipboardRange, frozenRowCount, frozenColumnCount).includes(pane) && (
+        <div className="cut-marquee" data-clipboard-marquee={pane} style={overlayRect(clipboardRange, pane)} aria-hidden="true" />
       )}
+      {moveDrag && intersectingPanes(moveDrag.target, frozenRowCount, frozenColumnCount).includes(pane) && (
+        <div className="move-preview" data-move-preview={rangeAddress(moveDrag.target)} style={overlayRect(moveDrag.target, pane)} aria-hidden="true">
+          {pane === cellPane(moveDrag.target.bottom < frozenRowCount, moveDrag.target.right < frozenColumnCount) && (
+            <span className="move-preview-label">{moveDrag.copy ? `Copy to ${rangeAddress(moveDrag.target)}` : rangeAddress(moveDrag.target)}</span>
+          )}
+        </div>
+      )}
+      {activeDropdown && onOpenDropdown && cellPane(activeDropdown.bounds.bottom < frozenRowCount, activeDropdown.bounds.right < frozenColumnCount) === pane && (() => {
+        const rect = overlayRect(activeDropdown.bounds, pane)
+        const size = Math.max(14, Math.min(19, rect.height - 3))
+        return (
+          <button
+            type="button"
+            className="cell-dropdown-button"
+            data-dropdown-button={activeDropdown.address}
+            aria-label={`Choose a value for ${activeDropdown.address}`}
+            title="Choose from the list (Alt+Down)"
+            tabIndex={-1}
+            style={{ left: rect.left + rect.width - size - 2, top: rect.top + (rect.height - size) / 2, width: size, height: size }}
+            onMouseDown={(event) => { event.preventDefault(); event.stopPropagation() }}
+            onClick={(event) => { event.stopPropagation(); onOpenDropdown(activeDropdown.address) }}
+          ><ChevronDown size={Math.round(size * 0.72)} /></button>
+        )
+      })()}
+      {pane === 'body' && pagePreview && pagePreview.pages.map((page) => {
+        // View > Page break preview: each printed page outlined and numbered, as in Excel.
+        const rect = overlayRect(page, 'body')
+        return (
+          <div key={`page-${page.pageNumber}-${page.top}-${page.left}`} className="page-preview-page" data-preview-page={page.pageNumber} style={rect} aria-hidden="true">
+            <span style={{ fontSize: Math.round(Math.max(10, Math.min(44 * zoom, rect.width / 4.5, rect.height / 2))) }}>Page {page.pageNumber}</span>
+          </div>
+        )
+      })}
+      {autofillOptions && onAutofillOptions && !editing && cellPane(autofillOptions.bottom < frozenRowCount, autofillOptions.right < frozenColumnCount) === pane && (() => {
+        // Excel's Auto Fill Options button, just past the filled range's corner.
+        const rect = overlayRect(autofillOptions, pane)
+        return (
+          <button
+            type="button"
+            className="filter-button autofill-options-button"
+            data-autofill-options
+            aria-label="Auto Fill Options"
+            title="Auto Fill Options"
+            style={{ left: rect.left + rect.width + 3, top: rect.top + rect.height + 3, width: 24, height: 18, gridAutoFlow: 'column', columnGap: 1 }}
+            onMouseDown={(event) => { event.preventDefault(); event.stopPropagation() }}
+            onClick={(event) => {
+              event.stopPropagation()
+              const box = event.currentTarget.getBoundingClientRect()
+              onAutofillOptions({ x: box.left, y: box.bottom + 2 })
+            }}
+          ><Copy size={11} /><ChevronDown size={9} /></button>
+        )
+      })()}
       {invalidCells.map((coord) => cellPane(coord.row < frozenRowCount, coord.col < frozenColumnCount) === pane ? (
         <div key={`invalid-${coord.row}-${coord.col}`} className="invalid-circle" style={overlayRect({ top: coord.row, bottom: coord.row, left: coord.col, right: coord.col }, pane)} aria-hidden="true" />
       ) : null)}
@@ -2873,6 +3598,66 @@ function SpreadsheetGrid({
             {inputMessage.title && <strong>{inputMessage.title}</strong>}
             {inputMessage.text && <span>{inputMessage.text}</span>}
           </div>
+        )
+      })()}
+      {errorTip && !editing && !(inputMessage && inputMessage.row === errorTip.row && inputMessage.col === errorTip.col) && cellPane(errorTip.row < frozenRowCount, errorTip.col < frozenColumnCount) === pane && (() => {
+        // The selected error cell gets a small indicator beside it (Excel's error smart tag);
+        // what the error means opens from it on hover or click (Sheets' error card), so moving
+        // through a column of errors never covers the cells around them.
+        const rect = overlayRect({ top: errorTip.row, bottom: errorTip.row, left: errorTip.col, right: errorTip.col }, pane)
+        const key = `${errorTip.row}:${errorTip.col}:${errorTip.code}`
+        const open = errorCard?.key === key
+        const stop = (event: ReactSyntheticEvent) => { event.preventDefault(); event.stopPropagation() }
+        return (
+          <>
+            <button
+              type="button"
+              className="cell-error-indicator"
+              data-error-indicator={errorTip.code}
+              tabIndex={-1}
+              aria-label={`What ${errorTip.code} means`}
+              aria-expanded={open}
+              style={{ left: rect.left + rect.width + 2, top: rect.top + Math.max(0, (rect.height - 16) / 2) }}
+              onPointerDown={stop}
+              onMouseDown={stop}
+              onClick={(event) => { event.stopPropagation(); setErrorCard((current) => (current?.key === key && current.pinned ? null : { key, pinned: true })) }}
+              onMouseEnter={() => setErrorCard((current) => (current?.key === key && current.pinned ? current : { key, pinned: false }))}
+              onMouseLeave={() => setErrorCard((current) => (current?.key === key && !current.pinned ? null : current))}
+            >!</button>
+            {open && (
+              <div className="cell-error-tip" role="tooltip" data-error-tip={errorTip.code} style={{ left: rect.left + Math.min(rect.width, 40), top: rect.top + rect.height + 4 }}>
+                <strong>{errorTip.code} · {errorTip.title}</strong>
+                <span>{errorTip.text}</span>
+              </div>
+            )}
+          </>
+        )
+      })()}
+      {pane === 'body' && pageBreaks && (() => {
+        // Excel's dashed page-break lines, drawn after a print preview.
+        const area = overlayRect({ top: pageBreaks.top, bottom: pageBreaks.bottom, left: pageBreaks.left, right: pageBreaks.right }, 'body')
+        const manual = new Set(pageBreaks.manualRows)
+        return (
+          <>
+            {pageBreaks.rows.filter((row) => row > pageBreaks.top && row <= pageBreaks.bottom + 1 && row < rows).map((row) => (
+              <div
+                key={`page-row-${row}`}
+                className={`page-break-line is-row${manual.has(row) ? ' is-manual' : ''}`}
+                data-page-break-row={row + 1}
+                style={{ left: area.left, width: area.width, top: HEADER_HEIGHT + axisOffset(row, defaultRow, rowMetrics) - 1 }}
+                aria-hidden="true"
+              />
+            ))}
+            {pageBreaks.columns.filter((col) => col > pageBreaks.left && col <= pageBreaks.right + 1 && col < columns).map((col) => (
+              <div
+                key={`page-col-${col}`}
+                className="page-break-line is-column"
+                data-page-break-column={columnName(col)}
+                style={{ top: area.top, height: area.height, left: HEADER_WIDTH + axisOffset(col, defaultColumn, columnMetrics) - 1 }}
+                aria-hidden="true"
+              />
+            ))}
+          </>
         )
       })()}
     </>
@@ -2942,15 +3727,30 @@ function SpreadsheetGrid({
         viewportRef.current = node
         if (node && node !== viewportNode) setViewportNode(node)
       }}
-      className={`sheet-viewport${editing ? ' is-editing' : ''}${useImportedDefaults ? ' uses-imported-defaults' : ''}${showGridlines ? '' : ' hides-gridlines'}${showNotes ? '' : ' hides-notes'}`}
-      style={{ '--cell-zoom': zoom } as CSSProperties}
+      className={`sheet-viewport${editing ? ' is-editing' : ''}${moveDrag ? ` is-moving-cells${moveDrag.copy ? ' is-copying-cells' : ''}` : ''}${useImportedDefaults ? ' uses-imported-defaults' : ''}${showGridlines ? '' : ' hides-gridlines'}${showNotes ? '' : ' hides-notes'}`}
+      // Stays scrollable while editing (the wheel and scrollbar reach cells for a formula);
+      // the edit scroll lock above only undoes the scrolls the caret causes.
+      style={{ '--cell-zoom': zoom, overflow: 'auto' } as CSSProperties}
       tabIndex={0}
       role="grid"
       aria-label={`${sheet.name} spreadsheet grid`}
       aria-rowcount={rows}
       aria-colcount={columns}
       aria-activedescendant={`cell-${sheet.id}-${addressOf(selection.focus)}`}
-      onKeyDown={onKeyDown}
+      onKeyDown={(event) => {
+        if (!editing && !event.ctrlKey && !event.altKey && !event.metaKey && (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey))) {
+          event.preventDefault()
+          contextMenuKeyAtRef.current = performance.now()
+          openContextMenuAtActiveCell()
+          return
+        }
+        onKeyDown(event)
+      }}
+      onWheel={() => { userScrollUntilRef.current = performance.now() + 450 }}
+      onPointerDown={(event) => {
+        // A press on the viewport itself (not a cell) is its scrollbar.
+        if (event.target === event.currentTarget) scrollbarDragRef.current = true
+      }}
       onScroll={(event) => handleViewportScroll(event.currentTarget)}
       onContextMenu={handleViewportContextMenu}
     >
@@ -3076,7 +3876,12 @@ function SpreadsheetGrid({
               }}
               value={editing.draft}
               onChange={(event) => {
-                onDraft(event.target.value)
+                const native = event.nativeEvent as InputEvent
+                onDraft(event.target.value, {
+                  inputType: typeof native.inputType === 'string' ? native.inputType : '',
+                  caret: event.target.selectionStart,
+                  composing: Boolean(native.isComposing),
+                })
                 onEditorCaret(event.target.selectionStart, event.target.selectionEnd)
               }}
               onSelect={(event) => onEditorCaret(event.currentTarget.selectionStart, event.currentTarget.selectionEnd)}
@@ -3124,11 +3929,18 @@ function SpreadsheetGrid({
                 onCommitEdit()
               }}
               onKeyDown={(event) => {
-                if (onEditorKeyDown(event)) {
-                  if (event.defaultPrevented && !editorOverlayRef.current) editorCommitViaKeyRef.current = true
+                const handled = onEditorKeyDown(event)
+                if (handled === 'committed') {
+                  // The key already committed (or filled) the entry: hand the keyboard back to
+                  // the grid, and let the resulting blur pass without a second commit.
+                  editorCommitViaKeyRef.current = true
+                  viewportRef.current?.focus({ preventScroll: true })
                   return
                 }
-                if (event.key === 'Escape') { event.preventDefault(); onCancelEdit() }
+                if (handled) return
+                // Every way out of the editor returns focus to the grid, so the arrows and
+                // typing keep working without a click (focus would otherwise fall to <body>).
+                if (event.key === 'Escape') { event.preventDefault(); editorCommitViaKeyRef.current = true; viewportRef.current?.focus({ preventScroll: true }); onCancelEdit() }
                 else if (event.key === 'Enter' && !event.altKey) { event.preventDefault(); editorCommitViaKeyRef.current = true; onCommitEdit(event.shiftKey ? 'up' : 'down'); viewportRef.current?.focus({ preventScroll: true }) }
                 else if (event.key === 'Tab') { event.preventDefault(); editorCommitViaKeyRef.current = true; onCommitEdit(event.shiftKey ? 'left' : 'right'); viewportRef.current?.focus({ preventScroll: true }) }
               }}
@@ -3149,6 +3961,18 @@ function SpreadsheetGrid({
                   transform: pinnedTransform(frozenColumn, frozenRow),
                 }}
               />
+            )}
+            {editorNote && (
+              <div
+                className={`formula-problem${pinClasses}`}
+                role="alert"
+                data-formula-problem
+                style={{ left, top: top + height + 4, transform: pinnedTransform(frozenColumn, frozenRow) }}
+              >
+                <strong>{editorNote.title}</strong>
+                <span>{editorNote.text}</span>
+                {editorNote.hint && <small>{editorNote.hint}</small>}
+              </div>
             )}
             </>
           )
@@ -3463,7 +4287,9 @@ export default function App() {
   const [nameManagerOpen, setNameManagerOpen] = useState(false)
   const [formatDialogTab, setFormatDialogTab] = useState<FormatCellsTab | null>(null)
   const [conditionalPanelOpen, setConditionalPanelOpen] = useState(false)
-  const [cutRange, setCutRange] = useState<({ sheetId: string } & OverlayBounds) | null>(null)
+  // The copied or cut range: Excel's marching-ants marquee, until Esc, an edit, or a move.
+  const [clipboardRange, setClipboardRange] = useState<({ sheetId: string; mode: 'copy' | 'cut' } & OverlayBounds) | null>(null)
+  const [scrollRequest, setScrollRequest] = useState<{ row: number; col: number; id: number } | null>(null)
   const [pasteSpecialOpen, setPasteSpecialOpen] = useState(false)
   const [selectedChartId, setSelectedChartId] = useState<string | null>(null)
   const [chartEditorId, setChartEditorId] = useState<string | null>(null)
@@ -3474,7 +4300,7 @@ export default function App() {
   const [replaceValue, setReplaceValue] = useState('')
   const [searchOptions, setSearchOptions] = useState<SearchOptions>({ matchCase: false, entireCell: false, workbook: false, lookIn: 'values' })
   const [searchOptionsOpen, setSearchOptionsOpen] = useState(false)
-  const [contextMenu, setContextMenu] = useState<{ kind: GridContextTarget['kind'] | 'sheet-tab' | 'status' | 'image'; x: number; y: number; sheetId?: string; imageId?: string } | null>(null)
+  const [contextMenu, setContextMenu] = useState<{ kind: GridContextTarget['kind'] | 'sheet-tab' | 'status' | 'image' | 'autofill'; x: number; y: number; sheetId?: string; imageId?: string } | null>(null)
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null)
   const [protectDialogOpen, setProtectDialogOpen] = useState(false)
   const [sparklineDialog, setSparklineDialog] = useState<{ kind: SparklineKind; data: string; location: string } | null>(null)
@@ -3497,6 +4323,31 @@ export default function App() {
   const [assistDismissed, setAssistDismissed] = useState(false)
   const [assistAnchor, setAssistAnchor] = useState<{ left: number; top: number; bottom: number; width: number } | null>(null)
   const [editorSelectionRequest, setEditorSelectionRequest] = useState<{ start: number; end: number; id: number } | null>(null)
+  // Insert/edit link (Ctrl+K), keyboard reference (Ctrl+/), calculation options, Alt+Down list.
+  const [linkDialog, setLinkDialog] = useState<{ sheetId: string; address: string } | null>(null)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const [calcOptionsOpen, setCalcOptionsOpen] = useState(false)
+  const [pickList, setPickList] = useState<{ sheetId: string; address: string; items: string[]; label: string; fromValidation: boolean; anchor: { left: number; top: number; bottom: number; width: number }; presentation?: DropdownPresentation; current?: string } | null>(null)
+  // Picking a chart's data range on the sheet: the grid selects, Enter applies, Esc cancels.
+  const [rangePick, setRangePick] = useState<{ sheetId: string; apply: (rangeText: string) => void } | null>(null)
+  const rangePickRef = useRef(rangePick)
+  rangePickRef.current = rangePick
+  // A typed formula that cannot be entered as written: the editor stays open with this note.
+  const [formulaProblem, setFormulaProblem] = useState<{ sheetId: string; address: string; title: string; text: string; hint?: string } | null>(null)
+  const [autoCompleteEnabled, setAutoCompleteEnabled] = useState(readAutoCompletePreference)
+  // Bumped by F9 / Shift+F9 / Ctrl+Alt+F9 so the grid redraws recalculated values.
+  const [calcTick, setCalcTick] = useState(0)
+  const [circularRefs, setCircularRefs] = useState<Array<{ sheetId: string; address: string }>>([])
+  // Page breaks from the last print preview, drawn as dashed lines (View > Page breaks).
+  const [previewPageBreaks, setPreviewPageBreaks] = useState<SpreadsheetPreviewPage[] | null>(null)
+  const [showPageBreaks, setShowPageBreaks] = useState(true)
+  const [menuSearchRequest, setMenuSearchRequest] = useState(0)
+  /** The AutoComplete suggestion showing in the cell editor: typed text and the entry it completes. */
+  const autoCompleteRef = useRef<{ sheetId: string; address: string; typed: string; match: string } | null>(null)
+  /** Each sheet's zoom (Excel keeps one per sheet view), and the sheet `zoom` belongs to. */
+  const sheetZoomRef = useRef(new Map<string, number>())
+  const zoomSheetRef = useRef<string | null>(null)
+  const circularNoticeRef = useRef('')
   const formulaBarRef = useRef<HTMLTextAreaElement>(null)
   const formulaBarSelectionRef = useRef<{ start: number; end: number } | null>(null)
   const formulaInputRef = useRef<'cell' | 'bar' | null>(null)
@@ -3513,10 +4364,28 @@ export default function App() {
   const openCreateTableRef = useRef<() => void>(() => {})
   const [pointerDown, setPointerDown] = useState(false)
   const historyRef = useRef<HistoryEntry[]>([])
+  /** The latest saveWorkbook, for callbacks that are created once (close guard, replace prompt). */
+  const saveWorkbookRef = useRef<(saveAs?: boolean, requestedFormat?: string) => Promise<void>>(async () => {})
   const futureRef = useRef<HistoryEntry[]>([])
+  // The undo step the file on disk matches (null: before any step), so undoing back to the
+  // save point leaves the workbook clean again.
+  const savedEntryRef = useRef<HistoryEntry | null | typeof UNREACHABLE_SAVE_POINT>(null)
   const internalClipboard = useRef<InternalClipboard | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const searchOriginRef = useRef('A1')
+  // Find: where the next search starts (sheet + cell), whether that cell itself may match, the
+  // query/options the matches were last anchored for, and the match currently shown.
+  const searchOriginSheetRef = useRef<string | null>(null)
+  const searchOriginInclusiveRef = useRef(false)
+  const searchAnchorKeyRef = useRef('')
+  const searchCurrentRef = useRef<{ sheetId: string; address: string } | null>(null)
+  const searchRevealAfterRef = useRef<{ sheetId: string; address: string } | null>(null)
+  // A row typed with Tab: Enter returns to the column where it started.
+  const tabRunRef = useRef<TabRun | null>(null)
+  // Each sheet's own selection and scroll position, kept while switching sheets.
+  const sheetSelectionsRef = useRef(new Map<string, Selection>())
+  const sheetScrollRef = useRef(new Map<string, { scrollLeft: number; scrollTop: number; zoom: number }>())
+  const scrollRequestIdRef = useRef(0)
   const promptIdRef = useRef(0)
   const formulaBarDirtyRef = useRef<{ sheetId: string; address: string; draft: string } | null>(null)
   const workbookRef = useRef(workbook)
@@ -3525,10 +4394,27 @@ export default function App() {
   const selectionRef = useRef(selection)
   const editingRef = useRef(editing)
   // Assigned once commitCell exists; held in a ref so save/close/discard keep stable
-  // identities and never re-subscribe their IPC listeners on every keystroke.
-  const flushPendingEditsRef = useRef<() => void>(() => {})
+  // identities and never re-subscribe their IPC listeners on every keystroke. Returns false
+  // when a pending entry failed data validation (its alert is showing), so the caller stops.
+  const flushPendingEditsRef = useRef<() => boolean>(() => true)
+  // Defined further down; reached through refs by code that runs earlier in the component.
+  const commitWithValidationRef = useRef<(address: string, draft: string) => boolean>(() => true)
+  const cancelClipboardModeRef = useRef<() => void>(() => {})
+  /** Gives the keyboard back to the grid after a dialog, menu or prompt closes. */
+  const restoreGridFocusRef = useRef<() => void>(() => {
+    window.requestAnimationFrame(() => {
+      const active = document.activeElement
+      if (active && active !== document.body && active !== document.documentElement) return
+      if (!document.hasFocus() || document.querySelector('[aria-modal="true"], [role="menu"], [role="dialog"]')) return
+      document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
+    })
+  })
   // In-app confirmations (native confirm() dialogs block the renderer and look foreign).
   const confirmRef = useRef<(message: string) => Promise<boolean>>(async (message) => window.confirm(message))
+  // A persistent note the user dismisses (what a save changed or left out); set with askAlert.
+  const informRef = useRef<(title: string, message: string) => void>(() => {})
+  // Excel-style choice dialogs for commands defined before askAlert (the Sort Warning).
+  const askAlertRef = useRef<(request: AlertRequest) => Promise<string>>(async () => 'cancel')
   // One calculation engine follows the open workbook across revisions, recalculating only
   // what an edit invalidates. Hints from immer patches spare it from diffing big sheets.
   const engineRef = useRef<CalculationEngine | null>(null)
@@ -3555,42 +4441,83 @@ export default function App() {
   const hiddenRowSet = useMemo(() => hiddenIndexSet(activeSheet?.hiddenRows), [activeSheet?.hiddenRows])
   const hiddenColSet = useMemo(() => hiddenIndexSet(activeSheet?.hiddenCols), [activeSheet?.hiddenCols])
 
-  const fitSheetView = useCallback((mode: 'width' | 'sheet') => {
+  const fitSheetView = useCallback((mode: 'width' | 'sheet' | 'selection') => {
     if (!activeSheet) return
     const viewport = document.querySelector<HTMLElement>('.sheet-viewport')
     if (!viewport) return
-    // Fit the actual form/content, not the editor's extra blank rows/columns.
-    // This changes the view only; source dimensions and formatting stay intact.
+    // Fit the actual form/content, not the editor's extra blank rows/columns (or, for Zoom to
+    // Selection, the selected cells). This changes the view only; nothing in the file changes.
+    let top = 0
+    let left = 0
     let bottom = 0
     let right = 0
-    for (const address of Object.keys(activeSheet.cells)) {
-      const position = coordOf(address)
-      if (position) { bottom = Math.max(bottom, position.row); right = Math.max(right, position.col) }
-    }
-    for (const merge of activeSheet.merges || []) {
-      const range = mergeBounds(merge)
-      if (range) { bottom = Math.max(bottom, range.bottom); right = Math.max(right, range.right) }
+    if (mode === 'selection') {
+      const selected = selectionBounds(selectionRef.current)
+      top = selected.top
+      left = selected.left
+      bottom = Math.min(selected.bottom, Math.max(selected.top, activeSheet.rowCount - 1))
+      right = Math.min(selected.right, Math.max(selected.left, activeSheet.colCount - 1))
+    } else {
+      for (const address of Object.keys(activeSheet.cells)) {
+        const position = coordOf(address)
+        if (position) { bottom = Math.max(bottom, position.row); right = Math.max(right, position.col) }
+      }
+      for (const merge of activeSheet.merges || []) {
+        const range = mergeBounds(merge)
+        if (range) { bottom = Math.max(bottom, range.bottom); right = Math.max(right, range.right) }
+      }
     }
     const imported = true
     const sourceWidth = Number(activeSheet.properties?.defaultColWidth)
     const sourceHeight = Number(activeSheet.properties?.defaultRowHeight)
     const defaultWidth = sourceWidth > 0 ? columnPixelWidth(sourceWidth, 1) : imported ? IMPORTED_COL_WIDTH : DEFAULT_COL_WIDTH
     const defaultHeight = sourceHeight > 0 ? rowPixelHeight(sourceHeight, 1) : imported ? IMPORTED_ROW_HEIGHT : DEFAULT_ROW_HEIGHT
-    const extent = (count: number, fallback: number, values: Record<string, number>, hidden: number[] | undefined, pixels: (value: number, zoom: number) => number) => {
+    // Pixels at 100% of rows/columns first..last (0-based), hidden ones excluded.
+    const extent = (first: number, last: number, fallback: number, values: Record<string, number>, hidden: number[] | undefined, pixels: (value: number, zoom: number) => number) => {
       const hiddenSet = new Set(hidden || [])
-      let total = count * fallback
+      let total = (last - first + 1) * fallback
       for (const [key, value] of Object.entries(values || {})) {
-        if (Number(key) >= 1 && Number(key) <= count && !hiddenSet.has(Number(key))) total += pixels(value, 1) - fallback
+        if (Number(key) >= first + 1 && Number(key) <= last + 1 && !hiddenSet.has(Number(key))) total += pixels(value, 1) - fallback
       }
-      for (const index of hiddenSet) if (index >= 1 && index <= count) total -= fallback
+      for (const index of hiddenSet) if (index >= first + 1 && index <= last + 1) total -= fallback
       return Math.max(1, total)
     }
-    const width = extent(right + 1, defaultWidth, activeSheet.colWidths, activeSheet.hiddenCols, columnPixelWidth)
-    const height = extent(bottom + 1, defaultHeight, activeSheet.rowHeights, activeSheet.hiddenRows, rowPixelHeight)
-    const ratio = Math.min((viewport.clientWidth - HEADER_WIDTH - 14) / width, mode === 'sheet' ? (viewport.clientHeight - HEADER_HEIGHT - 14) / height : 2)
-    setZoom(clamp(Math.floor(ratio * 100) / 100, 0.1, 2))
-    viewport.scrollTo({ top: 0, left: 0 })
+    const width = extent(left, right, defaultWidth, activeSheet.colWidths, activeSheet.hiddenCols, columnPixelWidth)
+    const height = extent(top, bottom, defaultHeight, activeSheet.rowHeights, activeSheet.hiddenRows, rowPixelHeight)
+    const ratio = Math.min((viewport.clientWidth - HEADER_WIDTH - 14) / width, mode === 'width' ? 4 : (viewport.clientHeight - HEADER_HEIGHT - 14) / height)
+    const next = clamp(Math.floor(ratio * 100) / 100, 0.1, 4)
+    setZoom(next)
+    if (mode !== 'selection') { viewport.scrollTo({ top: 0, left: 0 }); return }
+    // Zoom to Selection brings the selection to the top-left of the view once the grid has
+    // been laid out at the new zoom.
+    const scrollLeft = left > 0 ? extent(0, left - 1, defaultWidth, activeSheet.colWidths, activeSheet.hiddenCols, columnPixelWidth) * next : 0
+    const scrollTop = top > 0 ? extent(0, top - 1, defaultHeight, activeSheet.rowHeights, activeSheet.hiddenRows, rowPixelHeight) * next : 0
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => viewport.scrollTo({ left: scrollLeft, top: scrollTop })))
   }, [activeSheet, workbook?.metadata?.sourceName])
+
+  // Zoom belongs to a sheet, as in Excel: each sheet keeps its own (saved in its sheet view),
+  // and showing a sheet restores it. Sheet switches made without activateSheet (Go To another
+  // sheet, undo, deleting a sheet) load the zoom here.
+  useEffect(() => {
+    const sheetId = workbook?.activeSheetId
+    if (!sheetId) return
+    if (zoomSheetRef.current !== sheetId) {
+      zoomSheetRef.current = sheetId
+      const sheet = workbook?.sheets.find((item) => item.id === sheetId)
+      const next = sheetZoomRef.current.get(sheetId) ?? savedSheetZoom(sheet) ?? 1
+      if (next !== zoom) setZoom(next)
+      return
+    }
+    sheetZoomRef.current.set(sheetId, zoom)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workbook?.activeSheetId, zoom])
+
+  // An AutoComplete suggestion and a formula problem note belong to the open entry only.
+  useEffect(() => {
+    if (editing) return
+    autoCompleteRef.current = null
+    setFormulaProblem(null)
+  }, [editing])
 
   const syncEngine = useCallback((target: WorkbookModel) => {
     let engine = engineRef.current
@@ -3618,9 +4545,18 @@ export default function App() {
     engineHintRef.current = null
   }, [])
   /** Workbook with fresh formula results and spill metadata, for save/print/export. */
-  const calculatedWorkbook = useCallback((target: WorkbookModel) => syncEngine(target).withResults(), [syncEngine])
+  const calculatedWorkbook = useCallback((target: WorkbookModel, forSave = true) => {
+    const engine = syncEngine(target)
+    // Saving or exporting a manual-mode workbook recalculates it first (Excel); redraw the grid.
+    const pending = engine.needsRecalculation
+    const result = engine.withResults({ forSave })
+    if (pending && !engine.needsRecalculation) setCalcTick((value) => value + 1)
+    return result
+  }, [syncEngine])
   const calcEngine = useMemo(() => (workbook ? syncEngine(workbook) : null), [syncEngine, workbook])
-  const sheetById = useMemo(() => new Map((workbook?.sheets || []).map((sheet) => [sheet.id, sheet])), [workbook])
+  // calcTick: F9 recalculates inside the engine, so value readers must be rebuilt to redraw.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const sheetById = useMemo(() => new Map((workbook?.sheets || []).map((sheet) => [sheet.id, sheet])), [workbook, calcTick])
   const displayValue = useCallback((sheetId: string, address: string) => {
     if (!calcEngine) return ''
     const sheet = sheetById.get(sheetId)
@@ -3652,11 +4588,12 @@ export default function App() {
     const value = calcEngine.getValue(sheetId, address)
     return value === null && !sheetById.get(sheetId)?.cells[address] ? undefined : value
   }, [calcEngine, sheetById])
-  const staleValue = useCallback((sheetId: string, address: string) => Boolean(calcEngine?.isStale(sheetId, address)), [calcEngine])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const staleValue = useCallback((sheetId: string, address: string) => Boolean(calcEngine?.isStale(sheetId, address)), [calcEngine, calcTick])
   /** Values, display text, colours, and formula evaluation for the data tools. */
   const dataHostFor = useCallback((sheet: SheetData): DataHost => {
     const engine = calcEngine
-    const resolveReference = (reference: string, depth = 0): Array<{ value: CellScalar; text: string }> | null => {
+    const resolveReference = (reference: string, depth = 0): Array<{ value: CellScalar; text: string; numFmt?: string }> | null => {
       const text = reference.trim().replace(/^=/, '')
       const match = /^(?:(?:'((?:[^']|'')+)'|([^!]+))!)?\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec(text)
       const current = workbookRef.current
@@ -3672,12 +4609,14 @@ export default function App() {
       const left = columnIndex(match[3])
       const bottom = match[6] ? Number(match[6]) - 1 : top
       const right = match[5] ? columnIndex(match[5]) : left
-      const output: Array<{ value: CellScalar; text: string }> = []
+      const output: Array<{ value: CellScalar; text: string; numFmt?: string }> = []
       for (let row = Math.min(top, bottom); row <= Math.max(top, bottom) && output.length < 10_000; row += 1) {
         for (let col = Math.min(left, right); col <= Math.max(left, right); col += 1) {
           const address = addressOf({ row, col })
           const value = engine ? engine.getValue(target.id, address) : target.cells[address]?.value ?? null
-          output.push({ value: value ?? null, text: displayValue(target.id, address) })
+          // The number format travels with a dropdown pick from these cells.
+          const numFmt = target.cells[address]?.numFmt || target.cells[address]?.style?.numFmt
+          output.push({ value: value ?? null, text: displayValue(target.id, address), ...(numFmt ? { numFmt } : {}) })
         }
       }
       return output
@@ -3752,14 +4691,46 @@ export default function App() {
     } catch {
       return null
     }
-  // Recalculate whenever any workbook value may have changed.
+  // Recalculate whenever any workbook value may have changed (an edit, or F9).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSheetForFormats, calcEngine, workbook])
+  }, [activeSheetForFormats, calcEngine, workbook, calcTick])
 
   const resetHistory = useCallback(() => {
     historyRef.current = []
     futureRef.current = []
+    // A freshly opened or created workbook is its own save point.
+    savedEntryRef.current = null
     setHistoryTick((value) => value + 1)
+  }, [])
+
+  /** Record an undo step (and forget the redo stack), keeping the save point reachable. */
+  const pushHistory = useCallback((entry: HistoryEntry) => {
+    historyRef.current.push(entry)
+    if (historyRef.current.length > MAX_HISTORY) {
+      const dropped = historyRef.current.shift()
+      // The saved state came before the dropped step, so undo can no longer return to it; or
+      // it came right after it, which is now the bottom of the stack.
+      if (savedEntryRef.current === null) savedEntryRef.current = UNREACHABLE_SAVE_POINT
+      else if (savedEntryRef.current === dropped) savedEntryRef.current = null
+    }
+    futureRef.current = []
+  }, [])
+
+  /** Undo and Redo make the file clean again when they land on the last saved state (Sheets). */
+  const syncDirtyWithHistory = useCallback(() => {
+    const top = historyRef.current[historyRef.current.length - 1] ?? null
+    const clean = savedEntryRef.current !== UNREACHABLE_SAVE_POINT && top === savedEntryRef.current
+    dirtyRef.current = !clean
+    setDirty(!clean)
+  }, [])
+
+  /** Undo/Redo show where the change happened: its sheet, its cells, scrolled into view. */
+  const restoreHistoryView = useCallback((selection: Selection | undefined) => {
+    if (!selection) return
+    tabRunRef.current = null
+    setSelection(selection)
+    scrollRequestIdRef.current += 1
+    setScrollRequest({ row: selection.focus.row, col: selection.focus.col, id: scrollRequestIdRef.current })
   }, [])
 
   const mutateWorkbook = useCallback((mutator: (next: WorkbookModel) => void) => {
@@ -3785,9 +4756,7 @@ export default function App() {
         inversePatches = [...syncInverse, ...inversePatches]
       }
     }
-    historyRef.current.push({ patches, inversePatches })
-    if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift()
-    futureRef.current = []
+    pushHistory({ patches, inversePatches, sheetId: current.activeSheetId, selectionBefore: selectionRef.current })
     recordEngineHint(current, next, patches)
     workbookRef.current = next
     setWorkbook(next)
@@ -3796,7 +4765,7 @@ export default function App() {
     dirtyRef.current = true
     setDirty(true)
     setHistoryTick((value) => value + 1)
-  }, [recordEngineHint])
+  }, [pushHistory, recordEngineHint])
 
   const resizeColumn = useCallback((column: number, width: number) => {
     mutateWorkbook((next) => {
@@ -3817,43 +4786,91 @@ export default function App() {
     })
   }, [mutateWorkbook])
 
+  /** Apply a history step's patches and bring its sheet to the front. */
+  const applyHistoryPatches = useCallback((current: WorkbookModel, patches: Patch[], sheetId: string | undefined) => {
+    let next = applyPatches(current, patches)
+    let applied = patches
+    if (sheetId && next.activeSheetId !== sheetId && next.sheets.some((sheet) => sheet.id === sheetId)) {
+      const focus: Patch[] = [{ op: 'replace', path: ['activeSheetId'], value: sheetId }]
+      next = applyPatches(next, focus)
+      applied = [...patches, ...focus]
+    }
+    recordEngineHint(current, next, applied)
+    workbookRef.current = next
+    setWorkbook(next)
+  }, [recordEngineHint])
+
   const undo = useCallback(() => {
     const current = workbookRef.current
     const entry = historyRef.current.pop()
     if (!current || !entry) return
+    // Redo returns to where the user is now.
+    entry.sheetIdAfter = current.activeSheetId
+    entry.selectionAfter = selectionRef.current
     futureRef.current.push(entry)
-    const previous = applyPatches(current, entry.inversePatches)
-    recordEngineHint(current, previous, entry.inversePatches)
-    workbookRef.current = previous
-    setWorkbook(previous)
-    setDirty(true)
+    applyHistoryPatches(current, entry.inversePatches, entry.sheetId)
+    syncDirtyWithHistory()
     setEditing(null)
+    restoreHistoryView(entry.selectionBefore)
     setHistoryTick((value) => value + 1)
-  }, [recordEngineHint])
+  }, [applyHistoryPatches, restoreHistoryView, syncDirtyWithHistory])
 
   const redo = useCallback(() => {
     const current = workbookRef.current
     const entry = futureRef.current.pop()
     if (!current || !entry) return
     historyRef.current.push(entry)
-    const next = applyPatches(current, entry.patches)
-    recordEngineHint(current, next, entry.patches)
-    workbookRef.current = next
-    setWorkbook(next)
-    setDirty(true)
+    applyHistoryPatches(current, entry.patches, entry.sheetIdAfter)
+    syncDirtyWithHistory()
     setEditing(null)
+    restoreHistoryView(entry.selectionAfter)
     setHistoryTick((value) => value + 1)
-  }, [recordEngineHint])
+  }, [applyHistoryPatches, restoreHistoryView, syncDirtyWithHistory])
 
-  const canDiscard = useCallback(async () => {
-    flushPendingEditsRef.current()
-    return !dirtyRef.current || (await confirmRef.current('Discard the unsaved changes in this spreadsheet?'))
+  /** True when the history is at the last saved state (read from refs, so it is current right after a save). */
+  const isAtSavePoint = useCallback(() => {
+    const top = historyRef.current[historyRef.current.length - 1] ?? null
+    return savedEntryRef.current !== UNREACHABLE_SAVE_POINT && top === savedEntryRef.current
   }, [])
+
+  /** Save / Don't Save / Cancel before another workbook replaces this one (Save is the default). */
+  const canDiscard = useCallback(async () => {
+    // An entry that fails validation stops here: its alert decides, and nothing is replaced.
+    if (!flushPendingEditsRef.current()) return false
+    if (!dirtyRef.current) return true
+    const io = getSimpleIO()
+    if (!io) return confirmRef.current('Discard the unsaved changes in this spreadsheet?')
+    const name = documentRef.current?.name
+    const answer = await io.prompt(documentRef.current?.path ? 'prompts.unsaved' : 'prompts.unsaved-untitled', { name: name || 'this spreadsheet', kind: 'spreadsheet' })
+    if (answer === 'dont-save') return true
+    if (answer !== 'save') return false
+    await saveWorkbookRef.current(false)
+    return isAtSavePoint()
+  }, [isAtSavePoint])
 
   const askText = useCallback((request: TextPromptRequest) => new Promise<string | null>((resolve) => {
     promptIdRef.current += 1
     setTextPrompt({ ...request, id: promptIdRef.current, resolve })
   }), [])
+
+  /**
+   * View state of a newly opened or created workbook: the active sheet's saved zoom (other
+   * sheets load theirs when shown), no page breaks from another file's preview, no pick mode.
+   */
+  const resetDocumentView = useCallback((target: WorkbookModel) => {
+    sheetZoomRef.current.clear()
+    const sheet = target.sheets.find((item) => item.id === target.activeSheetId) || target.sheets[0]
+    zoomSheetRef.current = sheet?.id || null
+    setZoom(savedSheetZoom(sheet) ?? 1)
+    setPreviewPageBreaks(null)
+    setFormulaProblem(null)
+    setRangePick(null)
+    setPickList(null)
+    setLinkDialog(null)
+    setCircularRefs([])
+    autoCompleteRef.current = null
+    circularNoticeRef.current = ''
+  }, [])
 
   const applyPayload = useCallback((payload: WorkbookPayload) => {
     const normalized = normalizeWorkbook(payload.workbook, payload.name)
@@ -3861,6 +4878,7 @@ export default function App() {
     resetEngine(normalized)
     workbookRef.current = normalized
     setWorkbook(normalized)
+    resetDocumentView(normalized)
     setDocumentFile({
       documentId: payload.documentId,
       path: payload.path,
@@ -3870,7 +4888,12 @@ export default function App() {
       warnings: payload.warnings || [],
       stats: payload.stats,
     })
-    setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    // Open where the file was left: its saved active cell (Excel stores one per sheet view).
+    sheetSelectionsRef.current.clear()
+    sheetScrollRef.current.clear()
+    tabRunRef.current = null
+    cancelClipboardModeRef.current()
+    setSelection(savedSheetSelection(normalized.sheets.find((sheet) => sheet.id === normalized.activeSheetId)) || { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
     setEditing(null)
     setDirty(false)
     setWarningOpen(false)
@@ -3881,7 +4904,7 @@ export default function App() {
       }))
     }
     if (payload.warnings?.length) setToast(`Opened with ${payload.warnings.length} compatibility ${payload.warnings.length === 1 ? 'note' : 'notes'}`)
-  }, [resetEngine, resetHistory])
+  }, [resetDocumentView, resetEngine, resetHistory])
 
   const newWorkbook = useCallback(async () => {
     if (!(await canDiscard())) return
@@ -3893,7 +4916,12 @@ export default function App() {
       resetEngine(next)
       workbookRef.current = next
       setWorkbook(next)
+      resetDocumentView(next)
       setDocumentFile({ documentId, path: null, name: 'Untitled.xlsx', sourceFormat: 'xlsx', requiresSaveAs: true, warnings: [] })
+      sheetSelectionsRef.current.clear()
+      sheetScrollRef.current.clear()
+      tabRunRef.current = null
+      cancelClipboardModeRef.current()
       setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
       setEditing(null)
       setDirty(false)
@@ -3903,7 +4931,7 @@ export default function App() {
     } finally {
       setBusy('')
     }
-  }, [canDiscard, resetEngine, resetHistory])
+  }, [canDiscard, resetDocumentView, resetEngine, resetHistory])
 
   const openWorkbook = useCallback(async () => {
     if (!(await canDiscard())) return
@@ -3949,7 +4977,9 @@ export default function App() {
   }, [applyPayload, canDiscard])
 
   const saveWorkbook = useCallback(async (saveAs = false, requestedFormat?: string) => {
-    flushPendingEditsRef.current()
+    // Ctrl+S mid-entry saves the entry, never the value before it, and never an entry that
+    // data validation rejects (its alert is showing instead).
+    if (!flushPendingEditsRef.current()) return
     const currentWorkbook = workbookRef.current
     const currentDocument = documentRef.current
     if (!currentWorkbook || !currentDocument) return
@@ -3966,12 +4996,22 @@ export default function App() {
     if ((format === 'csv' || format === 'tsv') && currentWorkbook.sheets.length > 1 && !(await confirmRef.current(`${format.toUpperCase()} keeps only the active sheet and cannot store formatting, merges, or multiple sheets. Continue?`))) return
     if (format === 'xlsx' && currentDocument.sourceFormat !== 'xlsx' && currentDocument.warnings.length && !(await confirmRef.current(`Convert this ${currentDocument.sourceFormat.toUpperCase()} workbook to XLSX? Values, formulas, and common formatting will be carried across, but unsupported native features may not have a cross-format equivalent and can be simplified or omitted.`))) return
     if (format === 'xlsx' && currentDocument.sourceFormat === 'xlsx' && dirtyRef.current && currentDocument.warnings.length && !(await confirmRef.current('This workbook contains features listed in the compatibility note that may be simplified after editing. Save the edited workbook anyway?'))) return
-    if (format === 'xls' && dirtyRef.current && currentDocument.warnings.some((warning) => /contains VBA|truncated|dropped|could not/i.test(warning)) && !(await confirmRef.current('This workbook contains unsupported features described in the compatibility note. Save the edited XLS workbook? An original backup will be kept before overwriting it.'))) return
+    // Without the local document engine an edited .xls/.ods is written as an .xlsx beside it and
+    // the original is not touched, so the overwrite warning below does not apply.
+    const getCapabilities = (window.simpleCalc as typeof window.simpleCalc & { getCapabilities?: () => Promise<{ officeEngine?: boolean }> }).getCapabilities
+    const officeEngine = (format === 'xls' || format === 'ods') && getCapabilities
+      ? await getCapabilities().then((value) => value?.officeEngine !== false, () => true)
+      : true
+    if (format === 'xls' && officeEngine && dirtyRef.current && currentDocument.warnings.some((warning) => /contains VBA|truncated|dropped|could not/i.test(warning)) && !(await confirmRef.current('This workbook contains unsupported features described in the compatibility note. Save the edited XLS workbook? An original backup will be kept before overwriting it.'))) return
+    // The undo step this save captures: undoing back to it later makes the workbook clean again.
+    const savedEntry = historyRef.current[historyRef.current.length - 1] ?? null
     setBusy(`Saving ${format.toUpperCase()} workbook…`)
     try {
       const result = await window.simpleCalc.saveWorkbook({
         documentId: currentDocument.documentId,
-        workbook: toFileWorkbook(calculatedWorkbook(currentWorkbook)),
+        // Each sheet's active cell goes into its sheet view, so the file reopens there (here
+        // and in Excel). Saved only, never an edit: it does not make the workbook dirty.
+        workbook: toFileWorkbook(withActiveCells(calculatedWorkbook(currentWorkbook), sheetSelectionsRef.current, selectionRef.current, sheetZoomRef.current)),
         saveAs: saveAs || !currentDocument.path || format !== currentDocument.sourceFormat,
         format,
         suggestedName: currentDocument.name,
@@ -3980,6 +5020,9 @@ export default function App() {
       if (!result) return
       if (documentRef.current?.documentId !== currentDocument.documentId) return
       const savedLatestRevision = workbookRef.current === currentWorkbook
+      // A save without the document engine may have gone to an .xlsx next to the original
+      // (`redirected`): the window now edits that file, and the user is told so.
+      const outcome = result as typeof result & { redirected?: boolean; originalPath?: string; message?: string; notes?: string[] }
       setDocumentFile((current) => current ? {
         ...current,
         path: result.path,
@@ -3990,9 +5033,17 @@ export default function App() {
         backupPath: result.backupPath,
       } : current)
       setWorkbook((current) => current ? { ...current, name: result.name } : current)
+      savedEntryRef.current = savedEntry
       if (savedLatestRevision) setDirty(false)
       setRecent((current) => rememberRecent(current, { path: result.path, name: result.name, format: result.format, openedAt: Date.now() }))
       setToast(savedLatestRevision ? `Saved ${result.name}${result.backupPath ? ' · Original backup kept' : ''}` : `Saved ${result.name} · Newer edits still need saving`)
+      const notes = Array.isArray(outcome.notes) ? outcome.notes.filter((note) => typeof note === 'string' && note.trim()) : []
+      if (outcome.redirected || notes.length) {
+        const lines: string[] = []
+        if (outcome.redirected) lines.push(outcome.message || `Saved as "${result.name}". The original file was not changed.`)
+        if (notes.length) lines.push(`${lines.length ? '\n' : ''}Not kept in this ${result.format.toUpperCase()} file:`, ...notes.map((note) => `• ${note}`))
+        informRef.current(outcome.redirected ? 'Saved as an Excel workbook' : 'Saved with changes', lines.join('\n'))
+      }
     } catch (error) {
       setToast(errorMessage(error))
     } finally {
@@ -4001,7 +5052,7 @@ export default function App() {
   }, [calculatedWorkbook])
 
   const openPrintDialog = useCallback(() => {
-    flushPendingEditsRef.current()
+    if (!flushPendingEditsRef.current()) return
     if (!workbookRef.current || !documentRef.current) {
       setToast('Open a spreadsheet before printing')
       return
@@ -4009,12 +5060,13 @@ export default function App() {
     setPrintOpen(true)
   }, [])
 
-  const createPrintPayload = useCallback((options: SpreadsheetPrintOptions) => {
-    flushPendingEditsRef.current()
+  const createPrintPayload = useCallback((options: SpreadsheetPrintOptions, flushEdits = true, forSave = false) => {
+    // The background page-break preview never commits what is still being typed (flushEdits false).
+    if (flushEdits && !flushPendingEditsRef.current()) throw new Error('Finish or cancel the cell entry first: it does not meet the cell’s data validation.')
     const currentWorkbook = workbookRef.current
     const currentDocument = documentRef.current
     if (!currentWorkbook || !currentDocument) throw new Error('There is no spreadsheet to print.')
-    let printableWorkbook = calculatedWorkbook(currentWorkbook)
+    let printableWorkbook = calculatedWorkbook(currentWorkbook, forSave)
     const normalFont = currentWorkbook.metadata?.normalFont as { name?: string; size?: number; bold?: boolean; italic?: boolean } | undefined
     if (normalFont?.name && Number(normalFont.size) > 0) {
       const context = document.createElement('canvas').getContext('2d')
@@ -4078,30 +5130,53 @@ export default function App() {
   const renderPrintPreview = useCallback(async (options: SpreadsheetPrintOptions) => {
     return window.simpleCalc.renderPrintPreview(createPrintPayload(options))
   }, [createPrintPayload])
+  const renderPageBreakPreview = useCallback(async (options: SpreadsheetPrintOptions) => {
+    return window.simpleCalc.renderPrintPreview(createPrintPayload(options, false))
+  }, [createPrintPayload])
+  // Read through a ref so the page-break preview effect follows layout changes only.
+  const renderPageBreakPreviewRef = useRef(renderPageBreakPreview)
+  renderPageBreakPreviewRef.current = renderPageBreakPreview
 
   const printWorkbook = useCallback(async (options: SpreadsheetPrintOptions) => {
     return window.simpleCalc.printWorkbook(createPrintPayload(options))
   }, [createPrintPayload])
 
   const exportWorkbook = useCallback(async (format: SpreadsheetExportFormat, options: SpreadsheetPrintOptions) => {
-    const payload = createPrintPayload(options)
+    // An export is a save in another format: a manual-mode workbook is recalculated first.
+    const payload = createPrintPayload(options, true, true)
     const currentDocument = documentRef.current
     const currentWorkbook = workbookRef.current
     if (!currentDocument || !currentWorkbook) throw new Error('There is no spreadsheet to export.')
     if ((format === 'csv' || format === 'tsv') && currentWorkbook.sheets.length > 1 && !(await confirmRef.current(`${format.toUpperCase()} exports only the active sheet. Other sheets, formatting, merges, formulas, charts, and images will not be included. Continue?`))) return false
     if (format === 'xlsx' && currentDocument.sourceFormat !== 'xlsx' && currentDocument.warnings.length && !(await confirmRef.current(`Export this ${currentDocument.sourceFormat.toUpperCase()} workbook as XLSX? Values, formulas, and common formatting will be carried across, but unsupported native features may be simplified or omitted.`))) return false
     if (format === 'xlsx' && currentDocument.sourceFormat === 'xlsx' && dirtyRef.current && currentDocument.warnings.length && !(await confirmRef.current('This workbook contains features listed in the compatibility note that may be simplified in an edited XLSX export. Continue?'))) return false
+    const fileWorkbook = toFileWorkbook(payload.workbook)
+    let acceptLoss = false
+    if (format === 'xls') {
+      // Without the document engine an Excel 97-2003 file keeps values only: say what goes and ask.
+      const check = await window.simpleCalc.checkExport({ workbook: fileWorkbook, format })
+      if (check.confirmationRequired) {
+        const lost = check.losses.length ? `\n\nNot kept:\n${check.losses.map((loss) => `• ${loss}`).join('\n')}` : ''
+        if (!(await confirmRef.current(`An Excel 97-2003 (.xls) file made here keeps cell values only.${lost}\n\nExport as XLSX instead to keep everything. Export values only?`))) return false
+        acceptLoss = true
+      }
+    }
     setBusy(`Exporting ${format.toUpperCase()}…`)
     try {
       const result = await window.simpleCalc.exportWorkbook({
         ...payload,
-        workbook: toFileWorkbook(payload.workbook),
+        workbook: fileWorkbook,
         format,
         suggestedName: currentDocument.name,
         sourceUnmodified: !dirtyRef.current,
+        ...(acceptLoss ? { acceptLoss: true } : {}),
       })
       if (!result) return false
       setToast(`Exported ${result.name}`)
+      // A basic XLS/ODS export (no document engine) lists what the file could not keep.
+      const notes = (result as typeof result & { notes?: unknown }).notes
+      const lost = Array.isArray(notes) ? notes.filter((note): note is string => typeof note === 'string' && Boolean(note.trim())) : []
+      if (lost.length) informRef.current('Exported with changes', [`Not kept in ${result.name}:`, ...lost.map((note) => `• ${note}`)].join('\n'))
       return true
     } catch (error) {
       setToast(errorMessage(error))
@@ -4111,13 +5186,53 @@ export default function App() {
     }
   }, [createPrintPayload])
 
+  saveWorkbookRef.current = saveWorkbook
+
+  // The shared window guard asks about unsaved work (Save / Don't Save / Cancel) on every
+  // close path; the entry being typed is committed first so it is part of that answer.
   const closeWindow = useCallback(async () => {
-    flushPendingEditsRef.current()
-    if (dirtyRef.current && !(await confirmRef.current('Close simple_calc and discard unsaved changes?'))) return
+    if (!flushPendingEditsRef.current()) return
     window.simpleCalc.close()
   }, [])
 
+  // Answers for the window guard, registered once and reading the latest state from refs.
+  useEffect(() => {
+    const io = getSimpleIO()
+    if (!io) return undefined
+    const offs = [
+      io.onRequest('close-query', () => {
+        flushPendingEditsRef.current()
+        return { dirty: dirtyRef.current, title: documentRef.current?.name || undefined, kind: 'spreadsheet', untitled: !documentRef.current?.path }
+      }),
+      io.onRequest('save-now', async () => {
+        if (!flushPendingEditsRef.current()) return false
+        await saveWorkbookRef.current(false)
+        return isAtSavePoint()
+      }),
+      io.onRequest('discard', () => true),
+    ]
+    return () => offs.forEach((off) => off())
+  }, [isAtSavePoint])
+
   useEffect(() => window.simpleCalc.onCloseRequested(closeWindow), [closeWindow])
+  // Excel and Sheets always hand the keyboard back to the grid. When focus falls to <body>
+  // because the focused element went away (a closed menu, prompt or dialog, an unmounted
+  // editor), the grid takes it back, unless a dialog or menu is still open. A click on blank
+  // space elsewhere keeps its usual meaning.
+  useEffect(() => {
+    const onFocusOut = (event: FocusEvent) => {
+      if (event.relatedTarget) return
+      const lost = event.target
+      window.requestAnimationFrame(() => {
+        if (lost instanceof Element && lost.isConnected) return
+        restoreGridFocusRef.current()
+      })
+    }
+    document.addEventListener('focusout', onFocusOut)
+    return () => document.removeEventListener('focusout', onFocusOut)
+  }, [])
+  // A newly opened or created workbook starts with the keyboard on its grid.
+  useEffect(() => { if (documentFile?.documentId) restoreGridFocusRef.current() }, [documentFile?.documentId])
   useEffect(() => {
     if (!import.meta.env.DEV) return
     // Development-only automation hook used by the QA scripts.
@@ -4134,6 +5249,10 @@ export default function App() {
     const sheetId = workbookRef.current.activeSheetId
     const sheet = workbookRef.current.sheets.find((item) => item.id === sheetId)
     if (!sheet || rawCellValue(sheet.cells[address]) === draft) { setEditing(null); return }
+    // An entry that parses to exactly the stored cell ('1,000' over 1000 in #,##0) changes
+    // nothing, so it must not add an undo step either.
+    const stored = sheet.cells[address]
+    if (stored && stableCellJson(parseDraft(draft, stored)) === stableCellJson(stored)) { setEditing(null); return }
     const target = coordOf(address)
     if (target && sheet.pivots?.some((pivot) => pivot.extent && target.row >= pivot.anchor.row && target.row < pivot.anchor.row + pivot.extent.rows && target.col >= pivot.anchor.col && target.col < pivot.anchor.col + pivot.extent.cols)) {
       setEditing(null)
@@ -4152,10 +5271,21 @@ export default function App() {
         })
         if (inferred) cell.numFmt = inferred
       }
+      // An entry with line breaks (Alt+Enter) turns on Wrap Text so every line shows, as in
+      // Excel, unless the cell is set to clip or shrink its text.
+      const lineBreaks = !cell.formula && typeof cell.value === 'string' && /[\r\n]/.test(cell.value)
+      const protection = sheetProtection(target)
+      const alignment = cell.style?.alignment
+      if (lineBreaks && !alignment?.wrapText && !alignment?.clipText && !alignment?.shrinkToFit && (!protection || protectionAllows(protection, 'formatCells'))) {
+        cell.style = { ...(cell.style || {}), alignment: { ...(alignment || {}), wrapText: true } }
+      }
       if (hasCellContent(cell)) target.cells[address] = cell
       else delete target.cells[address]
       const coord = coordOf(address)
       if (coord && target.tables?.length) applyTableEntry(next, target, address, coord)
+      if (coord && lineBreaks && cell.style?.alignment?.wrapText && (!protection || protectionAllows(protection, 'formatRows'))) {
+        growRowForLineBreaks(next, target, address, coord.row, cell)
+      }
       if (coord) {
         target.rowCount = Math.max(target.rowCount, coord.row + 1)
         target.colCount = Math.max(target.colCount, coord.col + 1)
@@ -4177,30 +5307,16 @@ export default function App() {
       }
     })
     setEditing(null)
+    // Entering data ends copy/cut mode, as in Excel (a copy can still be pasted).
+    cancelClipboardModeRef.current()
   }, [mutateWorkbook])
-
-  // Saving, closing or replacing the workbook has to see the text the user is still typing.
-  flushPendingEditsRef.current = () => {
-    const pendingFormulaBar = formulaBarDirtyRef.current
-    if (pendingFormulaBar) {
-      formulaBarDirtyRef.current = null
-      if (pendingFormulaBar.sheetId === workbookRef.current?.activeSheetId) {
-        commitCell(pendingFormulaBar.address, pendingFormulaBar.draft)
-      }
-    }
-    const pendingEditor = editingRef.current
-    if (pendingEditor) {
-      editingRef.current = null
-      commitCell(pendingEditor.address, pendingEditor.draft)
-    }
-  }
 
   useEffect(() => {
     const pending = formulaBarDirtyRef.current
     if (pending) {
       if (pending.sheetId === activeSheet?.id && pending.address === activeAddress) return
       formulaBarDirtyRef.current = null
-      if (pending.sheetId === activeSheet?.id) commitCell(pending.address, pending.draft)
+      if (pending.sheetId === activeSheet?.id) commitWithValidationRef.current(pending.address, pending.draft)
     }
     setFormulaDraft(rawCellValue(activeCell))
   }, [activeSheet?.id, activeAddress, activeCell, commitCell])
@@ -4236,21 +5352,146 @@ export default function App() {
     })
   }, [mutateWorkbook])
 
-  const openHyperlink = useCallback((target: string) => {
-    void window.simpleCalc.openExternal(target).catch((error) => setToast(errorMessage(error)))
+  /**
+   * A pick from a cell's dropdown counts as typing the entry (Excel and Sheets): '2' from the
+   * list "1,2,3" is the number 2, "1/15/2026" a date. An option read from cells stores that
+   * cell's own value and number format, so "$10.00" is 10 in currency format, never text.
+   */
+  const pickListOption = useCallback((address: string, option: string) => {
+    const current = workbookRef.current
+    const sheet = current?.sheets.find((item) => item.id === current.activeSheetId)
+    const coord = coordOf(address)
+    if (!sheet || !coord) return
+    // "Select…" empties the cell, like Delete (validation never blocks clearing).
+    if (option === '') { commitCell(address, ''); return }
+    const found = findValidation(sheet.dataValidations, coord.row, coord.col)
+    let entry: ReturnType<typeof listEntryForOption> = null
+    try {
+      // The same source the dropdown listed its options from (see listOptionsFor).
+      entry = found ? listEntryForOption(found.validation, option, dataHostFor(sheet), { row: coord.row, col: coord.col }) : null
+    } catch {
+      entry = null
+    }
+    if (!entry || entry.literal || entry.value === null || (typeof entry.value === 'string' && isFormulaError(entry.value))) {
+      commitWithValidationRef.current(address, option)
+      return
+    }
+    const { value, numFmt } = entry
+    mutateWorkbook((next) => {
+      const target = next.sheets.find((item) => item.id === next.activeSheetId)!
+      const previous = target.cells[address] || {}
+      const cell: CellData = { ...previous, value }
+      for (const key of ['formula', 'formulaType', 'formulaRange', 'dynamicFormula', 'result', 'resultType', 'display', 'richText', 'arrayMember'] as const) delete cell[key]
+      if (typeof value === 'number' && numFmt && numFmt !== 'General' && !(previous.numFmt || previous.style?.numFmt)) cell.numFmt = numFmt
+      target.cells[address] = cell
+      if (target.tables?.length) applyTableEntry(next, target, address, coord)
+    })
+    cancelClipboardModeRef.current()
+  }, [commitCell, dataHostFor, mutateWorkbook])
+
+  /** The grid's checkboxes store a logical; its dropdowns store the picked entry. */
+  const setGridCellValue = useCallback((address: string, value: CellData['value']) => {
+    if (typeof value === 'string') pickListOption(address, value)
+    else setCellValue(address, value)
+  }, [pickListOption, setCellValue])
+
+  /** Selects a place in this workbook ("Sheet2!A1", a name, a table); assigned further down. */
+  const followLocationRef = useRef<(location: string, depth?: number) => boolean>(() => false)
+
+  /**
+   * Follow a hyperlink, as Excel does on a click: a place in this workbook ("#Sheet2!A1", a
+   * defined name) is selected right here; web and email links go to the browser or mail app;
+   * a linked spreadsheet opens in another simple_calc window. Nothing else is opened.
+   */
+  const openHyperlink = useCallback((target: string, source?: { sheetId: string; address: string }) => {
+    // While a formula is being written (or a chart range picked), a click on a link cell
+    // selects or points at that cell instead.
+    if (formulaInputRef.current || rangePickRef.current) return
+    let link = target
+    if (source && target.startsWith('=')) {
+      // =HYPERLINK(location, name): the location is evaluated where the formula is.
+      const engine = engineRef.current
+      const argument = hyperlinkFormulaArgument(target.slice(1))
+      const coord = coordOf(source.address)
+      const value = engine && argument && coord ? engine.evaluateAt(source.sheetId, `=${argument}`, coord.row, coord.col) : null
+      if (typeof value !== 'string' || !value.trim() || isFormulaError(value)) { setToast('This link has no valid destination.'); return }
+      link = value.trim()
+    }
+    const parsed = classifyLinkTarget(link, documentRef.current?.name)
+    if (parsed.kind === 'internal') {
+      if (!followLocationRef.current(parsed.location)) setToast(`Reference isn’t valid: ${parsed.location}`)
+      return
+    }
+    if (parsed.kind === 'external') {
+      // Everything stays in Simple unless the user says otherwise: a web or email link (above
+      // all one a HYPERLINK() formula builds from cell values) is shown and confirmed first.
+      const app = /^mailto:/i.test(parsed.url) ? 'your email app' : 'your web browser'
+      const shown = parsed.url.length > 300 ? `${parsed.url.slice(0, 300)}…` : parsed.url
+      void confirmRef.current(`This link opens outside Simple, in ${app}:\n\n${shown}\n\nOpen it?`)
+        .then((accepted) => accepted ? window.simpleCalc.openExternal(parsed.url) : undefined)
+        .catch((error) => setToast(errorMessage(error)))
+      return
+    }
+    if (parsed.kind === 'file') {
+      const resolved = resolveLinkedPath(parsed.path, documentRef.current?.path)
+      if (!resolved && (isNetworkPath(parsed.path) || isNetworkPath(documentRef.current?.path || ''))) {
+        setToast('Links to network locations are not opened. Use File > Open to open that file.')
+        return
+      }
+      if (resolved && isSpreadsheetPath(resolved)) {
+        void window.simpleCalc.openInNewWindow(resolved).catch((error) => setToast(errorMessage(error)))
+        return
+      }
+      setToast(!resolved ? 'Save this workbook first: the link points to a file next to it.' : 'Only spreadsheet files can be opened from a link.')
+      return
+    }
+    // A reference written without "#" ("Sheet2!A1", "A1") still goes there.
+    if (followLocationRef.current(link)) return
+    setToast(parsed.reason)
   }, [])
 
-  const beginEdit = useCallback((initialDraft?: string) => {
+  const autoCompleteEnabledRef = useRef(autoCompleteEnabled)
+  autoCompleteEnabledRef.current = autoCompleteEnabled
+  /**
+   * Excel's AutoComplete: text typed at the end of an entry is completed with the one entry of
+   * the column block (above and below) that starts with it. Text only: numbers, dates, formulas
+   * and IME composition are left alone. Returns the editor text and where the suggestion starts.
+   */
+  const autoCompleteFor = useCallback((address: string | undefined, draft: string, input?: EditorInputInfo) => {
+    autoCompleteRef.current = null
+    const sheet = workbookRef.current?.sheets.find((item) => item.id === workbookRef.current?.activeSheetId)
+    const coord = address ? coordOf(address) : null
+    if (!autoCompleteEnabledRef.current || !input || !sheet || !coord || !address) return null
+    if (input.composing || (input.inputType !== 'insertText' && input.inputType !== 'insertReplacementText')) return null
+    if (input.caret !== draft.length || !draft.trim() || /^[=+\-@']/.test(draft) || /[\r\n]/.test(draft)) return null
+    if (typeof parseDraft(draft).value !== 'string') return null
+    const match = autoCompleteMatch(draft, columnTextEntries(sheet.cells, coord.row, coord.col))
+    if (!match) return null
+    autoCompleteRef.current = { sheetId: sheet.id, address, typed: draft, match }
+    return { text: autoCompleteDraft(draft, match), start: draft.length }
+  }, [])
+
+  const beginEdit = useCallback((initialDraft?: string, options?: { typed?: boolean }) => {
     const current = workbookRef.current
     const sheet = current?.sheets.find((item) => item.id === current.activeSheetId) || current?.sheets[0]
     if (!sheet) return
     const address = mergeMasterAddress(sheet, addressOf(selectionRef.current.focus))
     pointRef.current = null
-    setEditing({ address, draft: initialDraft === undefined ? rawCellValue(sheet.cells[address]) : initialDraft, mode: initialDraft === undefined ? 'edit' : 'enter' })
+    autoCompleteRef.current = null
+    // The first typed character can already complete a column entry ("A" → "Apple").
+    const completion = options?.typed && initialDraft !== undefined
+      ? autoCompleteFor(address, initialDraft, { inputType: 'insertText', caret: initialDraft.length, composing: false })
+      : null
+    setEditing({ address, draft: completion ? completion.text : initialDraft === undefined ? rawCellValue(sheet.cells[address]) : initialDraft, mode: initialDraft === undefined ? 'edit' : 'enter' })
+    if (completion) {
+      selectionRequestIdRef.current += 1
+      setEditorSelectionRequest({ start: completion.start, end: completion.text.length, id: selectionRequestIdRef.current })
+    }
     setAssistDismissed(false)
-  }, [])
+  }, [autoCompleteFor])
 
   const handleGridSelection = useCallback((next: Selection) => {
+    tabRunRef.current = null
     setSelection(next)
     setEditing(null)
   }, [])
@@ -4291,9 +5532,15 @@ export default function App() {
     setContextMenu({ kind: target.kind, x: position.x, y: position.y })
   }, [])
 
+  /** Rows an active filter hides on the active sheet: Delete, fills, Copy and formatting skip them. */
+  const filteredOutRows = useCallback(() => {
+    const current = workbookRef.current
+    return filterSkippedRows(current?.sheets.find((item) => item.id === current.activeSheetId))
+  }, [])
+
   const clearSelection = useCallback(() => {
-    const addresses = rangeAddresses(selection)
-    if (!addresses.length) { setToast('That selection is too large to clear at once.'); return }
+    const addresses = rangeAddresses(selection, 100_000, filteredOutRows())
+    if (!addresses.length) { if (selectionArea(selection) > 100_000) setToast('That selection is too large to clear at once.'); return }
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => {
@@ -4304,11 +5551,11 @@ export default function App() {
         else delete sheet.cells[address]
       })
     })
-  }, [mutateWorkbook, selection])
+  }, [filteredOutRows, mutateWorkbook, selection])
 
   const applyStyle = useCallback((update: (style: CellStyle) => void) => {
-    const addresses = rangeAddresses(selection)
-    if (!addresses.length) { setToast('That selection is too large to format at once.'); return }
+    const addresses = rangeAddresses(selection, 100_000, filteredOutRows())
+    if (!addresses.length) { if (selectionArea(selection) > 100_000) setToast('That selection is too large to format at once.'); return }
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => {
@@ -4317,16 +5564,16 @@ export default function App() {
         update(style)
       })
     })
-  }, [mutateWorkbook, selection])
+  }, [filteredOutRows, mutateWorkbook, selection])
 
   const setNumberFormat = useCallback((numFmt: string) => {
-    const addresses = rangeAddresses(selection)
+    const addresses = rangeAddresses(selection, 100_000, filteredOutRows())
     if (!addresses.length) return
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => { sheet.cells[address] = { ...(sheet.cells[address] || {}), numFmt } })
     })
-  }, [mutateWorkbook, selection])
+  }, [filteredOutRows, mutateWorkbook, selection])
 
   const adjustDecimals = useCallback((delta: 1 | -1) => {
     const activeValue = activeSheet && calcEngine ? calcEngine.getValue(activeSheet.id, activeAddress) : undefined
@@ -4336,8 +5583,8 @@ export default function App() {
   }, [activeAddress, activeCell, activeSheet, calcEngine, setNumberFormat])
 
   const clearFormatting = useCallback(() => {
-    const addresses = rangeAddresses(selection)
-    if (!addresses.length) { setToast('That selection is too large to format at once.'); return }
+    const addresses = rangeAddresses(selection, 100_000, filteredOutRows())
+    if (!addresses.length) { if (selectionArea(selection) > 100_000) setToast('That selection is too large to format at once.'); return }
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => {
@@ -4350,12 +5597,12 @@ export default function App() {
         else delete sheet.cells[address]
       })
     })
-  }, [mutateWorkbook, selection])
+  }, [filteredOutRows, mutateWorkbook, selection])
 
   const setBorderPreset = useCallback((preset: 'all' | 'outer' | 'bottom' | 'clear') => {
     const bounds = selectionBounds(selection)
-    const addresses = rangeAddresses(selection)
-    if (!addresses.length) { setToast('That selection is too large to format at once.'); return }
+    const addresses = rangeAddresses(selection, 100_000, filteredOutRows())
+    if (!addresses.length) { if (selectionArea(selection) > 100_000) setToast('That selection is too large to format at once.'); return }
     const side: CellBorderSide = { style: 'thin', color: { argb: 'FFD5D9D2' } }
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
@@ -4377,7 +5624,7 @@ export default function App() {
         }
       })
     })
-  }, [mutateWorkbook, selection])
+  }, [filteredOutRows, mutateWorkbook, selection])
 
   /** Apply a Format Cells change to the selection with Excel's edge/inside-border semantics. */
   const applyFormatChangeToSelection = useCallback((change: FormatCellsChange) => {
@@ -4386,10 +5633,13 @@ export default function App() {
     if (total > 100_000) { setToast('That selection is too large to format at once.'); return }
     const { merge, ...cellChange } = change
     const hasCellChange = Object.values(cellChange).some((value) => value !== undefined)
+    const skipRows = filteredOutRows()
     if (hasCellChange) {
       mutateWorkbook((next) => {
         const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
         for (let row = bounds.top; row <= bounds.bottom; row += 1) {
+          // A filtered list is formatted on its visible rows only (Excel).
+          if (skipRows.has(row)) continue
           for (let col = bounds.left; col <= bounds.right; col += 1) {
             const address = addressOf({ row, col })
             const updated = applyFormatChangeToCell(sheet.cells[address], cellChange, cellPosition(row, col, bounds))
@@ -4418,15 +5668,15 @@ export default function App() {
     }
     if (merge === true) mergeSelectionRef.current()
     else if (merge === false) unmergeSelectionRef.current()
-  }, [mutateWorkbook])
+  }, [filteredOutRows, mutateWorkbook])
 
   const applyBorderPresetToSelection = useCallback((preset: BorderPreset, side: CellBorderSide) => {
     applyFormatChangeToSelection({ borders: borderPresetChange(preset, side) })
   }, [applyFormatChangeToSelection])
 
   const applyCellStyleToSelection = useCallback((preset: CellStylePreset) => {
-    const addresses = rangeAddresses(selectionRef.current)
-    if (!addresses.length) { setToast('That selection is too large to format at once.'); return }
+    const addresses = rangeAddresses(selectionRef.current, 100_000, filteredOutRows())
+    if (!addresses.length) { if (selectionArea(selectionRef.current) > 100_000) setToast('That selection is too large to format at once.'); return }
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       addresses.forEach((address) => {
@@ -4435,7 +5685,7 @@ export default function App() {
         else delete sheet.cells[address]
       })
     })
-  }, [mutateWorkbook])
+  }, [filteredOutRows, mutateWorkbook])
 
   const [formatPainter, setFormatPainter] = useState<{ cells: Array<Array<Pick<CellData, 'style' | 'numFmt'>>>; sticky: boolean } | null>(null)
   const formatPainterRef = useRef(formatPainter)
@@ -4621,28 +5871,40 @@ export default function App() {
     })
   }, [mutateWorkbook, selection])
 
+  /** Ctrl+K: insert or edit the active cell's link (web address or a place in this workbook). */
   const insertLink = useCallback(async () => {
     if (!activeSheet) return
-    const existing = activeCell?.hyperlink || 'https://'
-    const entered = (await askText({ title: 'Insert link', label: 'Link URL or email address', initialValue: existing }))?.trim()
-    if (!entered) return
-    const target = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entered) ? `mailto:${entered}` : /^[a-z][a-z0-9+.-]*:/i.test(entered) ? entered : `https://${entered}`
-    try {
-      const parsed = new URL(target)
-      if (!['http:', 'https:', 'mailto:'].includes(parsed.protocol)) throw new Error('Unsupported protocol')
-    } catch {
-      setToast('Enter a valid web or email link.')
-      return
-    }
-    if (activeCell?.formula) { setToast('A formula cell cannot also contain a direct hyperlink.'); return }
-    const currentText = activeCell?.value == null ? '' : String(activeCell.value)
-    const text = await askText({ title: 'Insert link', label: 'Text to display', initialValue: currentText || entered })
-    if (text === null) return
+    if (!flushPendingEditsRef.current()) return
+    setLinkDialog({ sheetId: activeSheet.id, address: activeAddress })
+  }, [activeAddress, activeSheet])
+
+  /** The link dialog's result: the target (and display text) go into the cell as one undo step. */
+  const applyLink = useCallback((dialog: { sheetId: string; address: string }, result: InsertLinkResult | null, initialText: string) => {
+    setLinkDialog(null)
     mutateWorkbook((next) => {
-      const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
-      sheet.cells[activeAddress] = { ...(sheet.cells[activeAddress] || {}), value: text || entered, hyperlink: target, hyperlinkTooltip: target }
+      const sheet = next.sheets.find((item) => item.id === dialog.sheetId)
+      if (!sheet) return
+      const cell: CellData = { ...(sheet.cells[dialog.address] || {}) }
+      if (!result) {
+        // Remove link: the text stays, the link goes.
+        delete cell.hyperlink
+        delete cell.hyperlinkTooltip
+      } else {
+        // The display text replaces the cell's value only when it was changed (a number that is
+        // linked as it is stays a number); a formula cell keeps its formula.
+        if (result.text !== null && !cell.formula && result.text !== initialText) {
+          cell.value = result.text
+          for (const key of ['richText', 'display', 'result', 'resultType'] as const) delete cell[key]
+        }
+        cell.hyperlink = result.target
+        if (result.tooltip) cell.hyperlinkTooltip = result.tooltip
+        else delete cell.hyperlinkTooltip
+      }
+      if (hasCellContent(cell)) sheet.cells[dialog.address] = cell
+      else delete sheet.cells[dialog.address]
     })
-  }, [activeAddress, activeCell, activeSheet, askText, mutateWorkbook])
+    restoreGridFocusRef.current()
+  }, [mutateWorkbook])
 
   const editAnnotation = useCallback(async (kind: 'note' | 'comment') => {
     const current = noteText(activeCell?.note)
@@ -4792,12 +6054,13 @@ export default function App() {
     const needed = command.startsWith('insert-rows') ? 'insertRows' : command.startsWith('insert-columns') ? 'insertColumns' : command === 'delete-rows' ? 'deleteRows' : 'deleteColumns'
     if (protection && !protectionAllows(protection, needed)) { setToast(PROTECTED_MESSAGE); return }
     try {
-      const result = applySelectionStructureCommand(current, current.activeSheetId, selection, command)
+      // An active cell moved inside the range (Enter/Tab) no longer spans it: pass the range.
+      const span = selectionBounds(selection)
+      const operand = selection.range ? { anchor: { row: span.top, col: span.left }, focus: { row: span.bottom, col: span.right } } : selection
+      const result = applySelectionStructureCommand(current, current.activeSheetId, operand, command)
       const withCharts = transformWorkbookChartsForStructure(result.workbook, current.activeSheetId, result.operation)
       const [next, patches, inversePatches] = produceWithPatches(current, (draft) => { Object.assign(draft, withCharts) })
-      historyRef.current.push({ patches, inversePatches })
-      if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift()
-      futureRef.current = []
+      pushHistory({ patches, inversePatches, sheetId: current.activeSheetId, selectionBefore: selection })
       workbookRef.current = next
       setWorkbook(next)
       setSelection(result.selection)
@@ -4810,7 +6073,7 @@ export default function App() {
     } catch (error) {
       setToast(errorMessage(error))
     }
-  }, [selection])
+  }, [pushHistory, selection])
 
   /** Excel's Insert/Delete cells with a shift direction (partial rows or columns). */
   const applyCellShift = useCallback((direction: 'down' | 'right' | 'up' | 'left') => {
@@ -4821,9 +6084,7 @@ export default function App() {
     try {
       const result = shiftCells(current, current.activeSheetId, bounds, direction)
       const [next, patches, inversePatches] = produceWithPatches(current, (draft) => { Object.assign(draft, result) })
-      historyRef.current.push({ patches, inversePatches })
-      if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift()
-      futureRef.current = []
+      pushHistory({ patches, inversePatches, sheetId: current.activeSheetId, selectionBefore: selection })
       workbookRef.current = next
       setWorkbook(next)
       setEditing(null)
@@ -4833,7 +6094,7 @@ export default function App() {
     } catch (error) {
       setToast(errorMessage(error))
     }
-  }, [selection])
+  }, [pushHistory, selection])
 
   const openShiftDialog = useCallback((mode: 'insert' | 'delete') => {
     const sheet = activeSheet
@@ -5399,31 +6660,50 @@ export default function App() {
     const bounds = selectionBounds(selection)
     const total = (bounds.bottom - bounds.top + 1) * (bounds.right - bounds.left + 1)
     if (total > 100_000) { setToast('That selection is too large to copy at once.'); return false }
+    // A filtered list copies its visible rows only, as Excel and Sheets do; they paste together.
+    const skipRows = filterSkippedRows(activeSheet)
+    const rows: number[] = []
+    for (let row = bounds.top; row <= bounds.bottom; row += 1) if (!skipRows.has(row)) rows.push(row)
+    const filtered = rows.length !== bounds.bottom - bounds.top + 1
+    if (!rows.length) { setToast('Every row of the selection is filtered out.'); return false }
+    if (filtered && cut) { setToast("Cut can't move a filtered range. Copy it, or clear the filter first."); return false }
+    const rowIndex = new Map(rows.map((row, index) => [row, index]))
     const matrix: CellData[][] = []
+    // Paste Values pastes what the copied formulas showed at copy time, as Excel and Sheets do.
+    const values: Array<Array<CellScalar | undefined>> = []
     const validations: Array<Array<Record<string, unknown> | undefined>> = []
     const hasValidations = Boolean(activeSheet.dataValidations && Object.keys(activeSheet.dataValidations).length)
-    for (let row = bounds.top; row <= bounds.bottom; row += 1) {
+    for (const row of rows) {
       const cells: CellData[] = []
+      const calculated: Array<CellScalar | undefined> = []
       const rules: Array<Record<string, unknown> | undefined> = []
       for (let col = bounds.left; col <= bounds.right; col += 1) {
-        cells.push(structuredClone(activeSheet.cells[addressOf({ row, col })] || {}) as CellData)
+        const address = addressOf({ row, col })
+        const cell = activeSheet.cells[address]
+        cells.push(structuredClone(cell || {}) as CellData)
+        calculated.push(cell?.formula && calcEngine ? calcEngine.getValue(activeSheet.id, address) : undefined)
         if (hasValidations) rules.push(findValidation(activeSheet.dataValidations, row, col)?.validation as Record<string, unknown> | undefined)
       }
       matrix.push(cells)
+      values.push(calculated)
       if (hasValidations) validations.push(rules)
     }
     const merges = (activeSheet.merges || []).flatMap((range) => {
       const merged = mergeBounds(range)
       if (!merged || merged.top < bounds.top || merged.left < bounds.left || merged.bottom > bounds.bottom || merged.right > bounds.right) return []
-      return [rangeAddress({ top: merged.top - bounds.top, bottom: merged.bottom - bounds.top, left: merged.left - bounds.left, right: merged.right - bounds.left })]
+      // A merge across a filtered-out row cannot travel with the visible rows.
+      const top = rowIndex.get(merged.top)
+      const bottom = rowIndex.get(merged.bottom)
+      if (top === undefined || bottom === undefined || bottom - top !== merged.bottom - merged.top) return []
+      return [rangeAddress({ top, bottom, left: merged.left - bounds.left, right: merged.right - bounds.left })]
     })
     const columnWidths = Array.from({ length: bounds.right - bounds.left + 1 }, (_, offset) => activeSheet.colWidths[String(bounds.left + offset + 1)])
     const serialized = serializeSelectionToClipboard(matrix, {
-      displayAt: (row, col) => displayValue(activeSheet.id, addressOf({ row: bounds.top + row, col: bounds.left + col })),
+      displayAt: (row, col) => displayValue(activeSheet.id, addressOf({ row: rows[row], col: bounds.left + col })),
       cssColor: (color) => cssColor(color),
       columnWidthsPx: columnWidths.map((width) => (width === undefined ? IMPORTED_COL_WIDTH : columnPixelWidth(width, 1))),
-      rowHeightsPx: Array.from({ length: bounds.bottom - bounds.top + 1 }, (_, offset) => {
-        const height = activeSheet.rowHeights[String(bounds.top + offset + 1)]
+      rowHeightsPx: rows.map((row) => {
+        const height = activeSheet.rowHeights[String(row + 1)]
         return height === undefined ? IMPORTED_ROW_HEIGHT : rowPixelHeight(height, 1)
       }),
       merges,
@@ -5437,17 +6717,44 @@ export default function App() {
       text: serialized.text,
       origin: { row: bounds.top, col: bounds.left },
       cells: matrix,
+      values,
+      documentId: documentRef.current?.documentId ?? null,
+      sourceCells: activeSheet.cells,
       sheetId: activeSheet.id,
       sheetName: activeSheet.name,
       merges,
       columnWidths,
       validations: hasValidations ? validations : undefined,
       cut,
+      ...(filtered ? { sourceRows: rows } : {}),
     }
-    setCutRange(cut ? { sheetId: activeSheet.id, ...bounds } : null)
-    setToast(`${total.toLocaleString()} ${total === 1 ? 'cell' : 'cells'} ${cut ? 'cut' : 'copied'}`)
+    // Both copy and cut show the marching-ants marquee until Esc, an edit, or the move.
+    setClipboardRange({ sheetId: activeSheet.id, mode: cut ? 'cut' : 'copy', ...bounds })
+    const copied = rows.length * (bounds.right - bounds.left + 1)
+    setToast(`${copied.toLocaleString()} ${copied === 1 ? 'cell' : 'cells'} ${cut ? 'cut' : filtered ? 'copied (visible cells only)' : 'copied'}`)
     return true
-  }, [activeSheet, displayValue, selection])
+  }, [activeSheet, calcEngine, displayValue, selection])
+
+  /**
+   * Ends copy/cut mode (Esc, entering data, a structural change, another workbook): the
+   * marquee goes, and a pending cut can no longer move cells. Its snapshot stays on the
+   * internal clipboard as a copy, so Ctrl+V still pastes it rather than losing it.
+   */
+  const cancelClipboardMode = useCallback(() => {
+    setClipboardRange(null)
+    const clip = internalClipboard.current
+    if (clip?.cut) internalClipboard.current = { ...clip, cut: false }
+  }, [])
+  cancelClipboardModeRef.current = cancelClipboardMode
+
+  // Any change to the copied cells (an edit, insert/delete, sort, undo) or another document
+  // cancels cut mode, so Ctrl+V can never move a stale rectangle or another file's cells.
+  useEffect(() => {
+    const clip = internalClipboard.current
+    if (!clip || !workbook) return
+    if (clipboardSourceIntact({ documentId: clip.documentId, sheetId: clip.sheetId, cells: clip.sourceCells }, { documentId: documentFile?.documentId ?? null, sheets: workbook.sheets })) return
+    cancelClipboardMode()
+  }, [cancelClipboardMode, documentFile?.documentId, workbook])
 
   /** Excel's cut + paste: move the block, keep its formulas, and re-point references to it. */
   const moveClipboardBlock = useCallback((clip: InternalClipboard, destination: Coord) => {
@@ -5463,6 +6770,7 @@ export default function App() {
     const colDelta = destination.col - rect.left
     if (!rowDelta && !colDelta && source.id === target.id) return
     if (destination.row + height > 1_048_576 || destination.col + width > 16_384) { setToast('The paste area extends beyond the sheet.'); return }
+    const crossSheet = source.id !== target.id
     mutateWorkbook((next) => {
       const from = next.sheets.find((sheet) => sheet.id === source.id)!
       const to = next.sheets.find((sheet) => sheet.id === target.id)!
@@ -5478,7 +6786,19 @@ export default function App() {
       for (let row = 0; row < height; row += 1) {
         for (let col = 0; col < width; col += 1) delete to.cells[addressOf({ row: destination.row + row, col: destination.col + col })]
       }
-      for (const [address, cell] of moved) to.cells[address] = cell
+      if (crossSheet) {
+        // Formulas re-point before the block lands, so the moved cells are rewritten once:
+        // as formulas that came from the source sheet (references inside the block follow
+        // it; the rest keep pointing at the source sheet with an explicit prefix).
+        repointMovedReferences(next, source.name, target.name, rect, rowDelta, colDelta)
+        for (const [address, cell] of moved) {
+          to.cells[address] = cell.formula
+            ? { ...cell, formula: relocateMovedFormula(cell.formula, { sourceSheet: source.name, destinationSheet: target.name, rect, rowDelta, colDelta }) }
+            : cell
+        }
+      } else {
+        for (const [address, cell] of moved) to.cells[address] = cell
+      }
       // Merges travel with the block.
       const movedMerges: string[] = []
       from.merges = (from.merges || []).filter((range) => {
@@ -5491,18 +6811,11 @@ export default function App() {
       to.rowCount = Math.max(to.rowCount, destination.row + height)
       to.colCount = Math.max(to.colCount, destination.col + width)
       // Every formula that referred to the moved cells now refers to their new place.
-      for (const sheet of next.sheets) {
-        for (const address in sheet.cells) {
-          const cell = sheet.cells[address]
-          if (!cell?.formula) continue
-          const formula = moveReferencesInFormula(cell.formula, { formulaSheet: sheet.name, sourceSheet: source.name, rect, rowDelta, colDelta, destinationSheet: target.name })
-          if (formula !== cell.formula) sheet.cells[address] = { ...cell, formula }
-        }
-      }
+      if (!crossSheet) repointMovedReferences(next, source.name, target.name, rect, rowDelta, colDelta)
     })
     setSelection({ anchor: destination, focus: { row: destination.row + height - 1, col: destination.col + width - 1 } })
     internalClipboard.current = null
-    setCutRange(null)
+    setClipboardRange(null)
   }, [mutateWorkbook])
 
   /** Paste (or Paste Special) at the selection: internal copies keep everything; other apps' HTML keeps formatting. */
@@ -5511,10 +6824,28 @@ export default function App() {
     try {
       const payload = await readRichClipboard()
       if (!options && !payload.text.trim() && !payload.html && payload.image) { await insertPicture(payload.image); return }
-      const clip = internalClipboard.current && internalClipboard.current.text === payload.text ? internalClipboard.current : null
+      let clip = internalClipboard.current && internalClipboard.current.text === payload.text ? internalClipboard.current : null
       const bounds = selectionBounds(selection)
-      if (clip?.cut && !options) {
-        moveClipboardBlock(clip, { row: bounds.top, col: bounds.left })
+      const currentDocumentId = documentRef.current?.documentId ?? null
+      if (clip?.cut) {
+        const intact = clipboardSourceIntact(
+          { documentId: clip.documentId, sheetId: clip.sheetId, cells: clip.sourceCells },
+          { documentId: currentDocumentId, sheets: workbookRef.current?.sheets || [] },
+        )
+        if (intact && !options) {
+          moveClipboardBlock(clip, { row: bounds.top, col: bounds.left })
+          return
+        }
+        if (!intact) {
+          // The cut cells changed since Ctrl+X (or came from another workbook): moving would
+          // take the wrong cells, so they paste as a copy and nothing is lost.
+          clip = { ...clip, cut: false }
+          internalClipboard.current = clip
+          setClipboardRange(null)
+        }
+      }
+      if (clip && options?.pasteLink && clip.documentId !== currentDocumentId) {
+        setToast('Paste link works within the same workbook.')
         return
       }
       let sourceCells: Array<Array<CellData | undefined>>
@@ -5523,7 +6854,20 @@ export default function App() {
       let columnWidths: Array<number | undefined> | undefined
       let validations: InternalClipboard['validations']
       let sourceSheetName = activeSheet.name
-      if (clip) {
+      if (clip?.sourceRows) {
+        // A filtered copy holds visible rows from apart: each formula moves from the row it really
+        // came from to where it lands, as if the rows had been next to each other.
+        if (options?.pasteLink) { setToast("Paste Link isn't available for a copy of a filtered range."); return }
+        const rows = clip.sourceRows
+        sourceCells = clip.cells.map((cells, index) => cells.map((cell) => (cell?.formula
+          ? { ...cell, formula: shiftFormulaReferences(cell.formula.replace(/^=/, ''), bounds.top + index - rows[index], bounds.left - clip!.origin.col) }
+          : cell)))
+        sourceOrigin = { row: bounds.top, col: bounds.left }
+        merges = clip.merges
+        columnWidths = clip.columnWidths
+        validations = clip.validations
+        sourceSheetName = clip.sheetName
+      } else if (clip) {
         sourceCells = clip.cells
         sourceOrigin = clip.origin
         merges = clip.merges
@@ -5539,7 +6883,6 @@ export default function App() {
         columnWidths = parsed.columnWidths?.map((width) => (width === undefined ? undefined : modelColumnWidth(width, 1)))
         if (parsed.sourceSheetName) sourceSheetName = parsed.sourceSheetName
       }
-      const clipSheet = clip ? workbookRef.current?.sheets.find((sheet) => sheet.id === clip.sheetId) : undefined
       const result = applyPasteSpecial({
         source: { cells: sourceCells, origin: sourceOrigin, sheetName: sourceSheetName, merges, columnWidths, validations },
         destination: bounds,
@@ -5547,7 +6890,9 @@ export default function App() {
         options: options || { paste: 'all' },
         shiftFormula: shiftFormulaReferences,
         destinationSheetName: activeSheet.name,
-        resolveValue: clipSheet && calcEngine ? (_cell, row, col) => calcEngine.getValue(clipSheet.id, addressOf({ row, col })) : undefined,
+        // Values of the copied cells as they were calculated at copy time (never the live
+        // cells at the same offset from A1, nor another workbook's cells).
+        resolveValue: clip ? snapshotValueResolver(clip.values) : undefined,
       })
       if (result.error) { setToast(result.error); return }
       mutateWorkbook((next) => {
@@ -5572,40 +6917,72 @@ export default function App() {
         sheet.rowCount = Math.max(sheet.rowCount, area.bottom + 1)
         sheet.colCount = Math.max(sheet.colCount, area.right + 1)
       })
+      // Copy mode outlives a paste (paste again elsewhere), as in Excel: re-stamp the source
+      // when this paste landed on the copied sheet, so the marquee is not taken for stale.
+      const pasted = internalClipboard.current
+      if (pasted && clip && pasted === clip && !pasted.cut) {
+        const sourceSheet = workbookRef.current?.sheets.find((item) => item.id === pasted.sheetId)
+        if (sourceSheet && pasted.documentId === currentDocumentId) internalClipboard.current = { ...pasted, sourceCells: sourceSheet.cells }
+      }
       setSelection({ anchor: { row: result.selection.top, col: result.selection.left }, focus: { row: result.selection.bottom, col: result.selection.right } })
     } catch (error) {
       setToast(isClipboardTooLarge(error) ? error.message : errorMessage(error))
     }
-  }, [activeSheet, calcEngine, insertPicture, moveClipboardBlock, mutateWorkbook, selection])
+  }, [activeSheet, insertPicture, moveClipboardBlock, mutateWorkbook, selection])
 
-  const autofillSelection = useCallback((target: Coord) => {
-    if (!activeSheet) return
-    const source = selectionBounds(selection)
-    const expandedSelection = fillSelectionForTarget(selection, target)
-    const expanded = selectionBounds(expandedSelection)
-    if (expanded.top === source.top && expanded.bottom === source.bottom && expanded.left === source.left && expanded.right === source.right) return
+  /** The last fill handle fill while its Auto Fill Options button shows (until the next edit). */
+  const [autofillMenu, setAutofillMenu] = useState<{
+    sheetId: string
+    source: Selection
+    target: Coord
+    mode: AutofillMode
+    /** The option the fill amounts to (checked in the menu). */
+    applied: AutofillMode | null
+    options: AutofillMode[]
+    filled: OverlayBounds
+    entry: HistoryEntry
+    after: WorkbookModel
+  } | null>(null)
+  const autofillMenuRef = useRef(autofillMenu)
+  autofillMenuRef.current = autofillMenu
+  // The button goes with the next edit, undo or sheet switch, as in Excel.
+  useEffect(() => {
+    if (autofillMenu && (workbook !== autofillMenu.after || workbook?.activeSheetId !== autofillMenu.sheetId)) setAutofillMenu(null)
+  }, [autofillMenu, workbook])
 
-    const overlapsExpanded = (bounds: { top: number; bottom: number; left: number; right: number }) => (
-      bounds.bottom >= expanded.top && bounds.top <= expanded.bottom && bounds.right >= expanded.left && bounds.left <= expanded.right
+  /** Why a fill over `bounds` cannot run (merged cells, an array formula), or null. */
+  const fillBlocker = useCallback((sheet: SheetData, bounds: OverlayBounds, verb: 'Autofill' | 'Fill') => {
+    const overlaps = (range: { top: number; bottom: number; left: number; right: number }) => (
+      range.bottom >= bounds.top && range.top <= bounds.bottom && range.right >= bounds.left && range.left <= bounds.right
     )
-    if ((activeSheet.merges || []).some((range) => {
-      const bounds = mergeBounds(range)
-      return Boolean(bounds && overlapsExpanded(bounds))
-    })) {
-      setToast('Autofill is unavailable across merged cells. Unmerge them first.')
-      return
-    }
-    const protectedFormula = Object.entries(activeSheet.cells).some(([address, cell]) => {
+    if ((sheet.merges || []).some((range) => {
+      const merged = mergeBounds(range)
+      return Boolean(merged && overlaps(merged))
+    })) return `${verb} is unavailable across merged cells. Unmerge them first.`
+    if (Object.entries(sheet.cells).some(([address, cell]) => {
       if (!(cell.formulaType === 'array' || cell.formulaRange || cell.dynamicFormula)) return false
       const formulaBounds = cell.formulaRange ? mergeBounds(cell.formulaRange) : null
-      if (formulaBounds) return overlapsExpanded(formulaBounds)
+      if (formulaBounds) return overlaps(formulaBounds)
       const coord = coordOf(address)
-      return Boolean(coord && overlapsExpanded({ top: coord.row, bottom: coord.row, left: coord.col, right: coord.col }))
-    })
-    if (protectedFormula) {
-      setToast('Autofill cannot overwrite an array formula range.')
-      return
-    }
+      return Boolean(coord && overlaps({ top: coord.row, bottom: coord.row, left: coord.col, right: coord.col }))
+    })) return `${verb} cannot overwrite an array formula range.`
+    return null
+  }, [])
+
+  /**
+   * The fill handle: extend `sourceSelection` to `target` with `mode` (the default, Ctrl's
+   * copy/series toggle, or an Auto Fill Options choice). Returns whether anything was filled.
+   */
+  const runAutofill = useCallback((sourceSelection: Selection, target: Coord, mode: AutofillMode) => {
+    const current = workbookRef.current
+    const sheet = current?.sheets.find((item) => item.id === current.activeSheetId)
+    if (!current || !sheet) return false
+    const source = selectionBounds(sourceSelection)
+    const expandedSelection = fillSelectionForTarget(sourceSelection, target)
+    const expanded = selectionBounds(expandedSelection)
+    if (expanded.top === source.top && expanded.bottom === source.bottom && expanded.left === source.left && expanded.right === source.right) return false
+    const blocker = fillBlocker(sheet, expanded, 'Autofill')
+    if (blocker) { setToast(blocker); return false }
 
     const destination = expanded.top < source.top
       ? { top: expanded.top, bottom: source.top - 1, left: source.left, right: source.right }
@@ -5616,72 +6993,136 @@ export default function App() {
           : { top: source.top, bottom: source.bottom, left: source.right + 1, right: expanded.right }
 
     try {
-      const patch = createAutofillPatch({ cells: activeSheet.cells, source, destination })
-      const changeCount = Object.keys(patch.changes).length
+      const request = { cells: sheet.cells, source, destination, date1904: Boolean(current.metadata?.date1904) }
+      const patch = createAutofillPatch({ ...request, mode })
+      // A filtered list fills its visible rows only (Excel); a series still counts every row.
+      const skipRows = filterSkippedRows(sheet)
+      const changes = visibleChanges(patch.changes, skipRows)
+      const changeCount = Object.keys(changes).length
+      if (!changeCount) { setToast('Every row to fill is filtered out.'); return false }
       mutateWorkbook((next) => {
-        const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
-        Object.entries(patch.changes).forEach(([address, cell]) => {
-          if (cell && hasCellContent(cell)) sheet.cells[address] = cell
-          else delete sheet.cells[address]
+        const target = next.sheets.find((item) => item.id === next.activeSheetId)!
+        Object.entries(changes).forEach(([address, cell]) => {
+          if (cell && hasCellContent(cell)) target.cells[address] = cell
+          else delete target.cells[address]
         })
-        sheet.rowCount = Math.max(sheet.rowCount, expanded.bottom + 1)
-        sheet.colCount = Math.max(sheet.colCount, expanded.right + 1)
+        target.rowCount = Math.max(target.rowCount, expanded.bottom + 1)
+        target.colCount = Math.max(target.colCount, expanded.right + 1)
       })
+      const entry = historyRef.current[historyRef.current.length - 1]
+      if (workbookRef.current === current || !entry) return false
+      // Which menu option the fill amounts to: a default fill either copied or made a series.
+      let applied: AutofillMode | null = mode === 'auto' || mode === 'toggle' ? null : mode
+      if (!applied && changeCount <= 20_000) {
+        const copy = visibleChanges(createAutofillPatch({ ...request, mode: 'copy' }).changes, skipRows)
+        applied = JSON.stringify(copy) === JSON.stringify(changes) ? 'copy' : 'series'
+      }
       setSelection(expandedSelection)
       setEditing(null)
+      setAutofillMenu({ sheetId: sheet.id, source: sourceSelection, target, mode, applied, options: patch.options, filled: expanded, entry, after: workbookRef.current! })
       setToast(`Filled ${changeCount.toLocaleString()} ${changeCount === 1 ? 'cell' : 'cells'}`)
+      return true
     } catch (error) {
       setToast(errorMessage(error))
+      return false
     }
-  }, [activeSheet, mutateWorkbook, selection])
+  }, [fillBlocker, mutateWorkbook])
+
+  const autofillSelection = useCallback((target: Coord, options?: { toggle?: boolean }) => {
+    runAutofill(selection, target, options?.toggle ? 'toggle' : 'auto')
+  }, [runAutofill, selection])
+
+  /** Double-click on the fill handle: fill down as far as the data beside the selection goes. */
+  const fillToAdjacentData = useCallback(() => {
+    const current = workbookRef.current
+    const sheet = current?.sheets.find((item) => item.id === current.activeSheetId)
+    if (!sheet) return
+    const engine = engineRef.current
+    const hasContent = (row: number, col: number) => {
+      const address = addressOf({ row, col })
+      const cell = sheet.cells[address]
+      if (cell && (cell.formula || (cell.value !== undefined && cell.value !== null && cell.value !== ''))) return true
+      const value = engine?.getValue(sheet.id, address)
+      return value !== null && value !== undefined && value !== ''
+    }
+    const bounds = selectionBounds(selectionRef.current)
+    const bottom = fillHandleDoubleClickBottom(hasContent, bounds)
+    if (bottom === null || bottom <= bounds.bottom) return
+    runAutofill(selectionRef.current, { row: bottom, col: bounds.right }, 'auto')
+  }, [runAutofill])
+
+  /** An Auto Fill Options choice replaces the last fill in place (still one undo step). */
+  const rerunAutofill = useCallback((mode: AutofillMode) => {
+    const state = autofillMenuRef.current
+    const current = workbookRef.current
+    if (!state || !current || current !== state.after || historyRef.current[historyRef.current.length - 1] !== state.entry) { setAutofillMenu(null); return }
+    historyRef.current.pop()
+    const previous = applyPatches(current, state.entry.inversePatches)
+    recordEngineHint(current, previous, state.entry.inversePatches)
+    workbookRef.current = previous
+    if (runAutofill(state.source, state.target, mode)) {
+      const replaced = historyRef.current[historyRef.current.length - 1]
+      if (replaced) {
+        replaced.sheetId = state.entry.sheetId
+        replaced.selectionBefore = state.entry.selectionBefore
+      }
+      return
+    }
+    // Nothing could be filled that way: the previous fill stays.
+    historyRef.current.push(state.entry)
+    recordEngineHint(previous, current, state.entry.patches)
+    workbookRef.current = current
+  }, [recordEngineHint, runAutofill])
 
   const fillSelectedRange = useCallback((direction: 'down' | 'right') => {
     if (!activeSheet) return
     const bounds = selectionBounds(selection)
-    if ((direction === 'down' && bounds.top === bounds.bottom) || (direction === 'right' && bounds.left === bounds.right)) {
-      setToast(`Select at least two ${direction === 'down' ? 'rows' : 'columns'} to fill ${direction}.`)
-      return
+    const skipRows = filterSkippedRows(activeSheet)
+    let source: OverlayBounds
+    let destination: OverlayBounds
+    if (direction === 'down') {
+      if (bounds.top === bounds.bottom) {
+        // One row selected: copy the (visible) row above into it, as Excel does.
+        let above = bounds.top - 1
+        while (above >= 0 && skipRows.has(above)) above -= 1
+        if (above < 0) return
+        source = { top: above, bottom: above, left: bounds.left, right: bounds.right }
+        destination = { top: above + 1, bottom: bounds.bottom, left: bounds.left, right: bounds.right }
+      } else {
+        source = { top: bounds.top, bottom: bounds.top, left: bounds.left, right: bounds.right }
+        destination = { top: bounds.top + 1, bottom: bounds.bottom, left: bounds.left, right: bounds.right }
+      }
+    } else if (bounds.left === bounds.right) {
+      // One column selected: copy the column to its left into it.
+      if (bounds.left === 0) return
+      source = { top: bounds.top, bottom: bounds.bottom, left: bounds.left - 1, right: bounds.left - 1 }
+      destination = { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.right }
+    } else {
+      source = { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.left }
+      destination = { top: bounds.top, bottom: bounds.bottom, left: bounds.left + 1, right: bounds.right }
     }
-    const overlaps = (range: { top: number; bottom: number; left: number; right: number }) => (
-      range.bottom >= bounds.top && range.top <= bounds.bottom && range.right >= bounds.left && range.left <= bounds.right
-    )
-    if ((activeSheet.merges || []).some((range) => {
-      const merged = mergeBounds(range)
-      return Boolean(merged && overlaps(merged))
-    })) {
-      setToast('Fill is unavailable across merged cells. Unmerge them first.')
-      return
-    }
-    if (Object.entries(activeSheet.cells).some(([address, cell]) => {
-      if (!(cell.formulaType === 'array' || cell.formulaRange || cell.dynamicFormula)) return false
-      const formulaBounds = cell.formulaRange ? mergeBounds(cell.formulaRange) : null
-      if (formulaBounds) return overlaps(formulaBounds)
-      const coord = coordOf(address)
-      return Boolean(coord && overlaps({ top: coord.row, bottom: coord.row, left: coord.col, right: coord.col }))
-    })) {
-      setToast('Fill cannot overwrite an array formula range.')
-      return
-    }
-    const source = direction === 'down'
-      ? { top: bounds.top, bottom: bounds.top, left: bounds.left, right: bounds.right }
-      : { top: bounds.top, bottom: bounds.bottom, left: bounds.left, right: bounds.left }
-    const destination = direction === 'down'
-      ? { top: bounds.top + 1, bottom: bounds.bottom, left: bounds.left, right: bounds.right }
-      : { top: bounds.top, bottom: bounds.bottom, left: bounds.left + 1, right: bounds.right }
+    const blocker = fillBlocker(activeSheet, { top: Math.min(source.top, destination.top), bottom: destination.bottom, left: Math.min(source.left, destination.left), right: destination.right }, 'Fill')
+    if (blocker) { setToast(blocker); return }
     try {
-      const patch = createAutofillPatch({ cells: activeSheet.cells, source, destination })
+      // Fill Down / Fill Right copy the top row (left column) as it is: a date stays that date,
+      // and formulas shift. A filtered list fills its visible rows only.
+      const patch = createAutofillPatch({ cells: activeSheet.cells, source, destination, mode: 'copy' })
+      const changes = visibleChanges(patch.changes, skipRows)
       mutateWorkbook((next) => {
         const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
-        Object.entries(patch.changes).forEach(([address, cell]) => {
+        Object.entries(changes).forEach(([address, cell]) => {
           if (cell && hasCellContent(cell)) sheet.cells[address] = cell
           else delete sheet.cells[address]
         })
+        sheet.rowCount = Math.max(sheet.rowCount, destination.bottom + 1)
+        sheet.colCount = Math.max(sheet.colCount, destination.right + 1)
       })
-      setToast(`Filled ${Object.keys(patch.changes).length.toLocaleString()} cells ${direction}`)
+      const count = Object.keys(changes).length
+      setToast(`Filled ${count.toLocaleString()} ${count === 1 ? 'cell' : 'cells'} ${direction}`)
     } catch (error) {
       setToast(errorMessage(error))
     }
-  }, [activeSheet, mutateWorkbook, selection])
+  }, [activeSheet, fillBlocker, mutateWorkbook, selection])
 
   /** Rows (0-based) that stay in place while sorting: hidden and filtered rows. */
   const fixedRowsForSort = useCallback((sheet: SheetData) => new Set((sheet.hiddenRows || []).map((row) => Number(row) - 1)), [])
@@ -5697,44 +7138,96 @@ export default function App() {
     return true
   }, [mutateWorkbook])
 
+  /**
+   * The range a sort works on, as in Excel: a single cell grows to its current region; a
+   * selection inside a table or the AutoFilter list sorts that whole list (header row kept); a
+   * selection with data right beside it asks first — the Sort Warning, where "Expand the
+   * selection" (the default) keeps every row together. Null when cancelled.
+   */
+  const resolveSortRegion = useCallback(async (sheet: SheetData, current: Selection): Promise<{ region: OverlayBounds | null; hasHeader?: boolean } | null> => {
+    const selected = selectionBounds(current)
+    const contains = (outer: OverlayBounds, inner: OverlayBounds) => inner.top >= outer.top && inner.bottom <= outer.bottom && inner.left >= outer.left && inner.right <= outer.right
+    // A table sorts its data rows (never its header or totals row).
+    const table = tableContaining(sheet, selected.top, selected.left)
+    const regions = table ? tableRegions(table) : null
+    if (regions && regions.header !== null && contains(regions, selected) && regions.dataBottom > regions.header) {
+      return { region: { top: regions.header, bottom: regions.dataBottom, left: regions.left, right: regions.right }, hasHeader: true }
+    }
+    const filterRef = sheet.filter?.ref || (typeof sheet.autoFilter === 'string' ? sheet.autoFilter : '')
+    const filterRange = filterRef ? mergeBounds(filterRef) : null
+    if (filterRange && contains(filterRange, selected) && filterRange.bottom > filterRange.top) return { region: filterRange, hasHeader: true }
+    if (selected.top === selected.bottom && selected.left === selected.right) return { region: filterRangeForSelection(sheet, selected, current.focus) }
+    const expanded = sortExpansionRegion(sheet, selected)
+    if (!expanded) return { region: selected }
+    const choice = await askAlertRef.current({
+      title: 'Sort Warning',
+      message: 'There is data next to your selection. It will not be sorted unless you include it, and its rows would no longer line up.\n\nWhat do you want to do?',
+      tone: 'warning',
+      buttons: [
+        { id: 'expand', label: 'Expand the selection', primary: true },
+        { id: 'current', label: 'Continue with the current selection' },
+        { id: 'cancel', label: 'Cancel' },
+      ],
+    })
+    if (choice === 'expand') return { region: expanded }
+    if (choice === 'current') return { region: selected }
+    return null
+  }, [])
+
   /** Excel's quick sort: by the active cell's column, over the selection or current region. */
-  const sortSelectionRange = useCallback((direction: 'asc' | 'desc') => {
-    const sheet = activeSheet
+  const sortSelectionRange = useCallback(async (direction: 'asc' | 'desc') => {
+    const initial = workbookRef.current?.sheets.find((item) => item.id === workbookRef.current?.activeSheetId)
+    if (!initial) return
+    const focus = selectionRef.current.focus
+    const resolved = await resolveSortRegion(initial, selectionRef.current)
+    if (!resolved) return
+    // The warning may have been open a while: sort the sheet as it is now.
+    const sheet = workbookRef.current?.sheets.find((item) => item.id === initial.id)
+    const region = resolved.region
     if (!sheet) return
-    const selected = selectionBounds(selection)
-    const region = selected.top === selected.bottom && selected.left === selected.right
-      ? filterRangeForSelection(sheet, selected, selection.focus)
-      : selected
     if (!region) { setToast('Select a range with data to sort.'); return }
     if (region.top === region.bottom) { setToast('Select a range with at least two rows to sort.'); return }
     if ((region.bottom - region.top + 1) * (region.right - region.left + 1) > 2_000_000) { setToast('That range is too large to sort at once.'); return }
     const host = dataHostFor(sheet)
-    const hasHeader = detectHeaderRow(region, host)
-    const key = clamp(selection.focus.col - region.left, 0, region.right - region.left)
+    const hasHeader = resolved.hasHeader ?? detectHeaderRow(region, host)
+    const key = clamp(focus.col - region.left, 0, region.right - region.left)
     const result = sortRange(sheet, { bounds: region, levels: [{ key, descending: direction === 'desc' }], hasHeader, fixed: fixedRowsForSort(sheet) }, host, shiftFormulaReferences)
     if (applySortResult(sheet, result, `Sorted ${rangeAddress(region)} by column ${columnName(region.left + key)} ${direction === 'asc' ? 'A→Z' : 'Z→A'}`)) {
       setSelection({ anchor: { row: region.top, col: region.left }, focus: { row: region.bottom, col: region.right } })
       setEditing(null)
     }
-  }, [activeSheet, applySortResult, dataHostFor, fixedRowsForSort, selection])
+  }, [applySortResult, dataHostFor, fixedRowsForSort, resolveSortRegion])
 
   const [filterMenu, setFilterMenu] = useState<{ key: string; col: number; anchor: { left: number; top: number; right: number; bottom: number } } | null>(null)
   const [tableDialog, setTableDialog] = useState<{ range: string; hasHeaders: boolean; style?: string } | null>(null)
   const [tableDesignOpen, setTableDesignOpen] = useState(false)
   const [shiftDialog, setShiftDialog] = useState<{ mode: 'insert' | 'delete'; initial: ShiftCellsChoice } | null>(null)
   const [goalSeekOpen, setGoalSeekOpen] = useState(false)
-  const [sortDialogOpen, setSortDialogOpen] = useState(false)
+  // Custom sort: the range it sorts is settled (Sort Warning included) before it opens.
+  const [sortDialog, setSortDialog] = useState<{ region: OverlayBounds; hasHeader?: boolean } | null>(null)
+  const openSortDialog = useCallback(async () => {
+    const sheet = workbookRef.current?.sheets.find((item) => item.id === workbookRef.current?.activeSheetId)
+    if (!sheet) return
+    const resolved = await resolveSortRegion(sheet, selectionRef.current)
+    if (!resolved) return
+    const selected = selectionBounds(selectionRef.current)
+    setSortDialog({ region: resolved.region || selected, hasHeader: resolved.hasHeader })
+  }, [resolveSortRegion])
   const [validationDialogOpen, setValidationDialogOpen] = useState(false)
   const [cleanupDialog, setCleanupDialog] = useState<'duplicates' | 'split' | null>(null)
   const [invalidCells, setInvalidCells] = useState<Coord[]>([])
   const [alertRequest, setAlertRequest] = useState<(AlertRequest & { resolve: (button: string) => void }) | null>(null)
   const askAlert = useCallback((request: AlertRequest) => new Promise<string>((resolve) => setAlertRequest({ ...request, resolve })), [])
+  askAlertRef.current = askAlert
   confirmRef.current = (message: string) => askAlert({
     title: 'simple_calc',
     message,
     tone: 'warning',
     buttons: [{ id: 'ok', label: 'Continue', primary: true }, { id: 'cancel', label: 'Cancel' }],
   }).then((button) => button === 'ok')
+  informRef.current = (title: string, message: string) => {
+    void askAlert({ title, message, tone: 'information', buttons: [{ id: 'ok', label: 'OK', primary: true }] })
+  }
 
   const insertChart = useCallback(() => {
     const sheet = activeSheet
@@ -5860,7 +7353,8 @@ export default function App() {
     const sheet = activeSheet
     const target = filterTargets.find((item) => item.key === key)
     if (!sheet || !target) return
-    const spec = sortSpecForFilter(target.state.ref, { key: col - target.bounds.left, descending }, { fixedRows: [...fixedRowsForSort(sheet)] })
+    // Hidden and filtered rows stay where they are (sortSpecForFilter takes 1-based rows).
+    const spec = sortSpecForFilter(target.state.ref, { key: col - target.bounds.left, descending }, { fixedRows: (sheet.hiddenRows || []).map(Number) })
     if (!spec) return
     const result = sortRange(sheet, spec, dataHostFor(sheet), shiftFormulaReferences)
     if (!result.ok) { setToast(result.error); return }
@@ -5869,7 +7363,7 @@ export default function App() {
       if (result.changed) applyCellChanges(draft.cells, result.changes)
       writeFilterState(draft, key, { ...target.state, sort: { column: col - target.bounds.left, descending } })
     })
-  }, [activeSheet, dataHostFor, filterTargets, fixedRowsForSort, mutateWorkbook, writeFilterState])
+  }, [activeSheet, dataHostFor, filterTargets, mutateWorkbook, writeFilterState])
 
   // ---- Tables -----------------------------------------------------------------------------------
   const openCreateTable = useCallback((style?: string) => {
@@ -6027,13 +7521,14 @@ export default function App() {
 
   const runCustomSort = useCallback((result: SortDialogResult) => {
     const sheet = activeSheet
-    if (!sheet) return
-    const selected = selectionBounds(selection)
-    const region = selected.top === selected.bottom && selected.left === selected.right ? filterRangeForSelection(sheet, selected, selection.focus) : selected
-    if (!region) return
+    const region = sortDialog?.region
+    if (!sheet || !region) return
     const outcome = sortRange(sheet, { bounds: region, levels: result.levels, hasHeader: result.hasHeader, orientation: result.orientation, caseSensitive: result.caseSensitive, fixed: result.orientation === 'rows' ? fixedRowsForSort(sheet) : undefined }, dataHostFor(sheet), shiftFormulaReferences)
-    if (applySortResult(sheet, outcome, `Sorted ${rangeAddress(region)}`)) setSortDialogOpen(false)
-  }, [activeSheet, applySortResult, dataHostFor, fixedRowsForSort, selection])
+    if (applySortResult(sheet, outcome, `Sorted ${rangeAddress(region)}`)) {
+      setSortDialog(null)
+      setSelection({ anchor: { row: region.top, col: region.left }, focus: { row: region.bottom, col: region.right } })
+    }
+  }, [activeSheet, applySortResult, dataHostFor, fixedRowsForSort, sortDialog])
 
   const applyCleanup = useCallback((kind: 'trim' | 'upper' | 'lower' | 'proper' | 'sentence' | 'fill-blanks') => {
     const sheet = activeSheet
@@ -6058,19 +7553,72 @@ export default function App() {
   /**
    * Commit an edit through the cell's data validation. Returns false when the entry was
    * rejected or needs confirmation (the alert then decides and may reopen the editor).
+   * `apply` performs the accepted entry (default: write it to the cell; Ctrl+Enter fills
+   * the selection with it instead), so every commit path validates the same way.
    */
-  const commitWithValidation = useCallback((address: string, draft: string) => {
+  const commitWithValidation = useCallback((address: string, draft: string, apply: (accepted: string) => void = (accepted) => commitCell(address, accepted), checkFormula: FormulaCheck = false) => {
     const sheet = workbookRef.current?.sheets.find((item) => item.id === workbookRef.current?.activeSheetId)
     const coord = coordOf(address)
-    if (!sheet || !coord || draft.startsWith('=')) { commitCell(address, draft); return true }
+    // A newly typed formula that cannot be read is not entered (Excel's "There's a problem with
+    // this formula"): a missing ")" or quote is offered as a correction, anything else keeps
+    // the editor open on the problem. Files' own formulas are never checked or rewritten, and
+    // a click away or a save still enters the text as typed, so nothing typed is lost.
+    if (sheet && coord && checkFormula !== false && draft.startsWith('=') && draft.trim().length > 1 && rawCellValue(sheet.cells[address]) !== draft) {
+      const diagnostic = engineRef.current?.diagnose(sheet.id, address, draft) ?? null
+      // Unknown functions enter as #NAME? (Excel), and so does syntax only Excel calculates.
+      if (diagnostic && diagnostic.kind !== 'unknown-function' && diagnostic.kind !== 'unknown-name' && !usesExcelOnlySyntax(draft)) {
+        const keepEditing = () => {
+          // Back to the cell being entered (a click may have moved the selection), keeping a
+          // selected block for Ctrl+Enter.
+          const inside = selectionBounds(selectionRef.current)
+          if (coord.row < inside.top || coord.row > inside.bottom || coord.col < inside.left || coord.col > inside.right) setSelection({ anchor: coord, focus: coord })
+          const reopened: EditingState = { address, draft, mode: 'edit' }
+          editingRef.current = reopened
+          setEditing(reopened)
+          setFormulaProblem({
+            sheetId: sheet.id,
+            address,
+            title: 'There’s a problem with this formula',
+            text: diagnostic.message,
+            hint: 'Fix the highlighted part, or press Esc to cancel. To enter it as text, start with an apostrophe (\').',
+          })
+          const start = clamp(diagnostic.position, 0, draft.length)
+          const end = clamp(diagnostic.position + Math.max(0, diagnostic.length), start, draft.length)
+          selectionRequestIdRef.current += 1
+          setEditorSelectionRequest({ start, end, id: selectionRequestIdRef.current })
+        }
+        if (diagnostic.suggestion) {
+          const suggestion = diagnostic.suggestion
+          editingRef.current = null
+          setEditing(null)
+          void askAlert({
+            title: 'Formula correction',
+            message: `There’s a problem with this formula. It was corrected to:\n\n${suggestion}\n\nDo you want to accept this correction?`,
+            tone: 'warning',
+            buttons: [{ id: 'yes', label: 'Yes', primary: true }, { id: 'no', label: 'No' }],
+          }).then((button) => {
+            if (button === 'yes') {
+              apply(suggestion)
+              // The corrected entry then moves on, as the key that entered it would have.
+              if (typeof checkFormula === 'object') checkFormula.afterAccept?.()
+              restoreGridFocusRef.current()
+            } else keepEditing()
+          })
+          return false
+        }
+        keepEditing()
+        return false
+      }
+    }
+    if (!sheet || !coord || draft.startsWith('=')) { apply(draft); return true }
     const found = findValidation(sheet.dataValidations, coord.row, coord.col)
-    if (!found || rawCellValue(sheet.cells[address]) === draft) { commitCell(address, draft); return true }
+    if (!found || rawCellValue(sheet.cells[address]) === draft) { apply(draft); return true }
     const parsed = parseDraft(draft, sheet.cells[address]).value
     const outcome = validateValue(found.validation, draft, parsed ?? null, dataHostFor(sheet), { row: coord.row, col: coord.col, anchor: found.anchor })
     if (outcome.ok || outcome.alert === 'none') {
       if (outcome.value !== undefined && outcome.value !== parsed && typeof outcome.value !== 'object') {
-        commitCell(address, typeof outcome.value === 'number' && !Number.isNaN(outcome.value) ? String(outcome.value) : String(outcome.value ?? ''))
-      } else commitCell(address, draft)
+        apply(typeof outcome.value === 'number' && !Number.isNaN(outcome.value) ? String(outcome.value) : String(outcome.value ?? ''))
+      } else apply(draft)
       return true
     }
     const tone = outcome.alert === 'warning' ? 'warning' : outcome.alert === 'information' ? 'information' : 'stop'
@@ -6080,16 +7628,53 @@ export default function App() {
         ? [{ id: 'yes', label: 'Yes', primary: true }, { id: 'no', label: 'No' }, { id: 'cancel', label: 'Cancel' }]
         : [{ id: 'ok', label: 'OK', primary: true }, { id: 'cancel', label: 'Cancel' }]
     const message = outcome.message?.text || 'This value doesn’t match the data validation restrictions defined for this cell.'
+    editingRef.current = null
     setEditing(null)
     void askAlert({ title: outcome.message?.title || 'simple_calc', message: tone === 'warning' ? `${message}\n\nContinue?` : message, tone, buttons }).then((button) => {
-      if (button === 'yes' || button === 'ok') commitCell(address, draft)
+      if (button === 'yes' || button === 'ok') apply(draft)
       else if (button === 'retry' || button === 'no') {
         setSelection({ anchor: coord, focus: coord })
         setEditing({ address, draft, mode: 'edit' })
       }
+      // Cancel discards the entry; whichever button, the keyboard returns to the sheet.
+      if (button !== 'retry' && button !== 'no') restoreGridFocusRef.current()
     })
     return false
   }, [askAlert, commitCell, dataHostFor])
+  commitWithValidationRef.current = commitWithValidation
+
+  /**
+   * Commit the open cell editor once (Enter, Tab, an arrow in Enter mode, a click away, or a
+   * save): validation runs, and the editor is marked done first so the blur that follows the
+   * key cannot commit the same entry a second time (one entry, one undo step).
+   */
+  const commitEditor = useCallback((draftOverride?: string, checkFormula: FormulaCheck = false) => {
+    const pending = editingRef.current
+    if (!pending) return true
+    editingRef.current = null
+    // An AutoComplete suggestion is accepted with the entry's own capitalisation (Excel).
+    const suggestion = autoCompleteRef.current
+    autoCompleteRef.current = null
+    const raw = draftOverride ?? pending.draft
+    const draft = suggestion && suggestion.address === pending.address ? acceptedAutoComplete(raw, suggestion) : raw
+    return commitWithValidation(pending.address, draft, undefined, checkFormula)
+  }, [commitWithValidation])
+
+  // Saving, closing, printing or replacing the workbook has to see what is still being typed:
+  // the formula bar, the cell editor, and any side-panel field that commits on blur. An entry
+  // that fails validation stops the caller (its alert is showing) so it is never saved as-is.
+  flushPendingEditsRef.current = () => {
+    const focused = document.activeElement
+    if (focused instanceof HTMLElement && focused !== formulaBarRef.current && !focused.classList.contains('cell-editor') && focused.closest('[data-chart-keep-selection], .chart-editor') && isNativeTextEditingTarget(focused)) {
+      focused.blur()
+    }
+    const pendingFormulaBar = formulaBarDirtyRef.current
+    if (pendingFormulaBar) {
+      formulaBarDirtyRef.current = null
+      if (pendingFormulaBar.sheetId === workbookRef.current?.activeSheetId && !commitWithValidation(pendingFormulaBar.address, pendingFormulaBar.draft)) return false
+    }
+    return commitEditor()
+  }
 
   const searchMatches = useMemo(() => {
     const query = searchQuery.trim()
@@ -6103,14 +7688,22 @@ export default function App() {
         const cell = sheet.cells[address]
         if (!cell) continue
         const candidates = searchOptions.lookIn === 'formulas'
-          ? [rawCellValue(cell)]
-          : [displayValue(sheet.id, address), cell.formula ? '' : rawCellValue(cell)]
+          ? [searchableCellText(cell)]
+          : [displayValue(sheet.id, address), cell.formula ? '' : searchableCellText(cell)]
         if (candidates.some((value) => value && textMatches(value, query, searchOptions))) output.push({ sheetId: sheet.id, address })
         if (output.length >= 50_000) return output
       }
     }
     return output
   }, [activeSheet, displayValue, searchOptions, searchQuery, workbook])
+
+  /** A match's place in Find's order (sheet, row, column). */
+  const searchPosition = useCallback((sheetId: string | null | undefined, address: string): OrderedPosition | null => {
+    const sheets = workbookRef.current?.sheets || []
+    const sheet = sheets.findIndex((item) => item.id === sheetId)
+    const coord = coordOf(address)
+    return sheet >= 0 && coord ? { sheet, row: coord.row, col: coord.col } : null
+  }, [])
 
   const revealSearchMatch = useCallback((index: number) => {
     if (!searchMatches.length) return
@@ -6119,17 +7712,31 @@ export default function App() {
     const coord = coordOf(match.address)
     if (!coord) return
     setSearchIndex(normalized)
+    // The shown match is where the next search continues from, on whichever sheet it is.
+    searchCurrentRef.current = match
+    searchOriginRef.current = match.address
+    searchOriginSheetRef.current = match.sheetId
+    searchOriginInclusiveRef.current = true
     if (workbookRef.current?.activeSheetId !== match.sheetId) setWorkbook((current) => current ? { ...current, activeSheetId: match.sheetId } : current)
     setSelection({ anchor: coord, focus: coord })
     setEditing(null)
   }, [searchMatches])
 
   const moveSearch = useCallback((direction: 1 | -1) => {
-    revealSearchMatch(searchIndex < 0 ? (direction === 1 ? 0 : searchMatches.length - 1) : searchIndex + direction)
-  }, [revealSearchMatch, searchIndex, searchMatches.length])
+    if (!searchMatches.length) return
+    if (searchIndex >= 0) { revealSearchMatch(searchIndex + direction); return }
+    // No match is shown (the last one went away, or another sheet is active): continue from
+    // the active cell, as Find Next does.
+    const positions = searchMatches.map((match) => searchPosition(match.sheetId, match.address) || { sheet: 0, row: 0, col: 0 })
+    const origin = searchPosition(workbookRef.current?.activeSheetId, addressOf(selectionRef.current.focus))
+    const index = !origin ? 0 : direction === 1 ? firstPositionAfter(positions, origin) : lastPositionBefore(positions, origin)
+    revealSearchMatch(index)
+  }, [revealSearchMatch, searchIndex, searchMatches, searchPosition])
 
   const openSearch = useCallback(() => {
     searchOriginRef.current = activeAddress
+    searchOriginSheetRef.current = workbookRef.current?.activeSheetId ?? null
+    searchOriginInclusiveRef.current = false
     setSearchOpen(true)
     window.requestAnimationFrame(() => {
       searchInputRef.current?.focus()
@@ -6156,13 +7763,16 @@ export default function App() {
     const cell = sheet?.cells[match.address]
     const draft = cell ? replacementDraft(cell, query, replaceValue, searchOptions) : null
     if (draft === null) { setToast('That match only appears in a formatted result and cannot be replaced.'); return }
-    searchOriginRef.current = match.address
+    // After replacing, Find moves on to the next match after this cell.
+    searchRevealAfterRef.current = { sheetId: match.sheetId, address: match.address }
+    const before = workbookRef.current
     mutateWorkbook((next) => {
       const target = next.sheets.find((item) => item.id === match.sheetId)!
       const updated = parseDraft(draft, target.cells[match.address])
       if (hasCellContent(updated)) target.cells[match.address] = updated
       else delete target.cells[match.address]
     })
+    if (workbookRef.current === before) searchRevealAfterRef.current = null
   }, [mutateWorkbook, replaceValue, searchIndex, searchMatches, searchOptions, searchQuery, workbook])
 
   const replaceAllMatches = useCallback(() => {
@@ -6194,21 +7804,32 @@ export default function App() {
   }, [searchOpen])
 
   useEffect(() => {
-    if (!searchOpen || !searchQuery.trim() || !searchMatches.length) {
+    // Only a new query or new options (or a Replace) move the selection to a match. Other
+    // workbook changes (typing in a cell, undo, switching sheets) keep the selection where
+    // it is and just keep the "n of m" counter on the match being shown.
+    const query = searchQuery.trim()
+    const key = searchOpen && query ? `${query}\u0000${JSON.stringify(searchOptions)}` : ''
+    const keyChanged = key !== searchAnchorKeyRef.current
+    searchAnchorKeyRef.current = key
+    const revealAfter = searchRevealAfterRef.current
+    searchRevealAfterRef.current = null
+    if (!key || !searchMatches.length) {
       setSearchIndex(-1)
+      searchCurrentRef.current = null
       return
     }
-    const origin = coordOf(searchOriginRef.current)
-    const activeId = workbookRef.current?.activeSheetId
-    const nextIndex = origin
-      ? searchMatches.findIndex(({ sheetId, address }) => {
-          const match = coordOf(address)
-          return sheetId === activeId && Boolean(match && (match.row > origin.row || (match.row === origin.row && match.col > origin.col)))
-        })
-      : 0
-    revealSearchMatch(nextIndex >= 0 ? nextIndex : 0)
+    if (keyChanged || revealAfter) {
+      const positions = searchMatches.map((match) => searchPosition(match.sheetId, match.address) || { sheet: 0, row: 0, col: 0 })
+      const origin = revealAfter
+        ? searchPosition(revealAfter.sheetId, revealAfter.address)
+        : searchPosition(searchOriginSheetRef.current ?? workbookRef.current?.activeSheetId, searchOriginRef.current)
+      revealSearchMatch(origin ? firstPositionAfter(positions, origin, !revealAfter && searchOriginInclusiveRef.current) : 0)
+      return
+    }
+    const current = searchCurrentRef.current
+    setSearchIndex(current ? searchMatches.findIndex((match) => match.sheetId === current.sheetId && match.address === current.address) : -1)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [revealSearchMatch, searchMatches, searchOpen, searchQuery])
+  }, [searchMatches, searchOpen, searchQuery, searchOptions])
 
   const addSheet = useCallback(() => {
     mutateWorkbook((next) => {
@@ -6232,8 +7853,9 @@ export default function App() {
     const finalName = name.slice(0, 31)
     mutateWorkbook((next) => {
       next.sheets.find((item) => item.id === sheetId)!.name = finalName
-      // Excel keeps every reference pointing at the renamed sheet.
-      rewriteWorkbookFormulas(next, (formula) => renameSheetInFormula(formula, sheet.name, finalName))
+      // Excel keeps every reference pointing at the renamed sheet: formulas, validation and
+      // conditional formats, names, sparklines, pivot sources and charts.
+      rewriteWorkbookFormulaText(next, (formula) => renameSheetInFormula(formula, sheet.name, finalName))
       for (const item of next.sheets) for (const pivot of item.pivots || []) pivot.source = renameSheetInFormula(pivot.source, sheet.name, finalName)
       const renamed = renameWorkbookChartReferences(next as WorkbookModel, sheet.name, finalName)
       renamed.sheets.forEach((item, index) => { if (item.charts !== next.sheets[index].charts) next.sheets[index].charts = item.charts })
@@ -6247,7 +7869,12 @@ export default function App() {
       const index = next.sheets.findIndex((sheet) => sheet.id === next.activeSheetId)
       const [removed] = next.sheets.splice(index, 1)
       next.activeSheetId = (next.sheets.slice(Math.max(0, index - 1)).find((sheet) => sheet.state === 'visible') || next.sheets.find((sheet) => sheet.state === 'visible') || next.sheets[0]).id
-      if (removed) rewriteWorkbookFormulas(next, (formula) => removeSheetFromFormula(formula, removed.name))
+      if (removed) {
+        // References to the deleted sheet become #REF! (sparklines too, never another sheet's
+        // cells), and names scoped to it go while later sheets keep theirs.
+        rewriteWorkbookFormulaText(next, (formula) => removeSheetFromFormula(formula, removed.name))
+        removeSheetScopedNames(next, index)
+      }
     })
     setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
   }, [activeSheet?.name, mutateWorkbook, workbook])
@@ -6276,20 +7903,25 @@ export default function App() {
   }, [mutateWorkbook])
 
   const duplicateActiveSheet = useCallback(() => {
-    if (!activeSheet) return
-    const copy = structuredClone(activeSheet) as SheetData
-    copy.id = makeId()
+    const current = workbookRef.current
+    if (!current) return
+    const sourceId = current.activeSheetId
+    let copy: SheetData
+    try {
+      // Unique table names, the copy's own references and charts on the copy, and no ties to
+      // the original's parts in the source file (Excel would have to repair the saved file).
+      copy = createSheetCopy(current, sourceId, { id: makeId(), makeId: (prefix) => makeId(prefix) })
+    } catch (error) {
+      setToast(errorMessage(error))
+      return
+    }
     mutateWorkbook((next) => {
-      const sourceIndex = next.sheets.findIndex((sheet) => sheet.id === next.activeSheetId)
-      const base = `${copy.name} copy`
-      let name = base
-      let suffix = 2
-      while (next.sheets.some((sheet) => sheet.name.toLocaleLowerCase() === name.toLocaleLowerCase())) name = `${base} ${suffix++}`
-      copy.name = name.slice(0, 31)
-      next.sheets.splice(sourceIndex + 1, 0, copy)
+      insertSheetCopy(next, copy, sourceId)
       next.activeSheetId = copy.id
     })
-  }, [activeSheet, mutateWorkbook])
+    // The copy opens where the original was being looked at.
+    sheetSelectionsRef.current.set(copy.id, selectionRef.current)
+  }, [mutateWorkbook])
 
   const setFreeze = useCallback((axis: 'rows' | 'columns' | 'both', count: number, columns = count) => {
     mutateWorkbook((next) => {
@@ -6364,9 +7996,23 @@ export default function App() {
     })
   }, [mutateWorkbook])
 
+  // Each sheet keeps its own selection (and the grid its own scroll position) while you
+  // switch between sheets, as in Excel.
+  useEffect(() => {
+    const sheetId = workbook?.activeSheetId
+    if (sheetId) sheetSelectionsRef.current.set(sheetId, selection)
+  }, [selection, workbook?.activeSheetId])
+
   const activateSheet = useCallback((sheetId: string) => {
-    setWorkbook((current) => current ? { ...current, activeSheetId: sheetId } : current)
-    setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    const current = workbookRef.current
+    if (!current || current.activeSheetId === sheetId) return
+    const target = current.sheets.find((sheet) => sheet.id === sheetId)
+    setWorkbook((value) => value ? { ...value, activeSheetId: sheetId } : value)
+    setSelection(sheetSelectionsRef.current.get(sheetId) || savedSheetSelection(target) || { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    // The sheet's own zoom comes back with it, in the same render (no flash at the old zoom).
+    zoomSheetRef.current = sheetId
+    setZoom(sheetZoomRef.current.get(sheetId) ?? savedSheetZoom(target) ?? 1)
+    tabRunRef.current = null
     setEditing(null)
   }, [])
 
@@ -6439,8 +8085,11 @@ export default function App() {
         maximum = Math.max(maximum, value)
       }
     }
+    // In a filtered list the status bar counts the visible rows only, as Excel does.
+    const skipRows = filterSkippedRows(activeSheet)
     if (selected <= 20_000) {
       for (let row = bounds.top; row <= bounds.bottom; row += 1) {
+        if (skipRows.has(row)) continue
         for (let col = bounds.left; col <= bounds.right; col += 1) {
           const address = addressOf({ row, col })
           includeCell(address, activeSheet.cells[address])
@@ -6449,7 +8098,7 @@ export default function App() {
     } else if (!pointerDown) {
       Object.entries(activeSheet.cells).forEach(([address, cell]) => {
         const coord = coordOf(address)
-        if (!coord || coord.row < bounds.top || coord.row > bounds.bottom || coord.col < bounds.left || coord.col > bounds.right) return
+        if (!coord || coord.row < bounds.top || coord.row > bounds.bottom || coord.col < bounds.left || coord.col > bounds.right || skipRows.has(coord.row)) return
         includeCell(address, cell)
       })
     }
@@ -6482,31 +8131,88 @@ export default function App() {
   })
 
   const moveSelectionImpl = useCallback((rowDelta: number, colDelta: number, extend = false) => {
+    tabRunRef.current = null
+    const ends = extend ? selectionExtension(selection) : { anchor: selection.focus, from: selection.focus }
     const next = {
-      row: stepPastHidden(selection.focus.row, rowDelta, 1_048_575, hiddenRowSet),
-      col: stepPastHidden(selection.focus.col, colDelta, 16_383, hiddenColSet),
+      row: stepPastHidden(ends.from.row, rowDelta, SHEET_LAST_ROW, hiddenRowSet),
+      col: stepPastHidden(ends.from.col, colDelta, SHEET_LAST_COL, hiddenColSet),
     }
-    setSelection((current) => ({ anchor: extend ? current.anchor : next, focus: next }))
-  }, [hiddenColSet, hiddenRowSet, selection.focus.col, selection.focus.row])
+    setSelection({ anchor: extend ? ends.anchor : next, focus: next })
+  }, [hiddenColSet, hiddenRowSet, selection])
   const moveSelection = moveSelectionImpl
   moveSelectionRef.current = moveSelectionImpl
 
   const jumpSelection = useCallback((rowDelta: number, colDelta: number, extend = false) => {
     if (!activeSheet) return
-    const next = edgeJumpCoord(activeSheet, selection.focus, rowDelta, colDelta, rowDelta !== 0 ? hiddenRowSet : hiddenColSet)
-    setSelection((current) => ({ anchor: extend ? current.anchor : next, focus: next }))
-  }, [activeSheet, hiddenColSet, hiddenRowSet, selection.focus])
+    tabRunRef.current = null
+    const ends = extend ? selectionExtension(selection) : { anchor: selection.focus, from: selection.focus }
+    const next = edgeJumpCoord(activeSheet, ends.from, rowDelta, colDelta, rowDelta !== 0 ? hiddenRowSet : hiddenColSet)
+    setSelection({ anchor: extend ? ends.anchor : next, focus: next })
+  }, [activeSheet, hiddenColSet, hiddenRowSet, selection])
 
-  const selectAllSheet = useCallback(() => {
+  /** Selects a range around the unchanged active cell (Ctrl+A, Ctrl+Space, Ctrl+Shift+8). */
+  const selectRangeKeepingActive = useCallback((range: { top: number; bottom: number; left: number; right: number }) => {
+    const active = selectionRef.current.focus
+    const inside = active.row >= range.top && active.row <= range.bottom && active.col >= range.left && active.col <= range.right
+    const focus = inside ? active : { row: range.top, col: range.left }
+    setSelection({ anchor: focus, focus, range })
+    setEditing(null)
+  }, [])
+
+  /**
+   * Select all. Ctrl+A is progressive as in Excel: the current region around the active cell
+   * first, then the whole sheet; the Select All command takes the whole sheet at once.
+   */
+  const selectAllSheet = useCallback((progressive = false) => {
     const current = workbookRef.current
     const sheet = current?.sheets.find((item) => item.id === current.activeSheetId)
     if (!sheet) return
-    setSelection({
-      anchor: { row: 0, col: 0 },
-      focus: { row: Math.max(0, sheet.rowCount - 1), col: Math.max(0, sheet.colCount - 1) },
-    })
-    setEditing(null)
-  }, [])
+    const whole = { top: 0, left: 0, bottom: Math.max(0, sheet.rowCount - 1), right: Math.max(0, sheet.colCount - 1) }
+    const target = progressive === true
+      ? progressiveSelectAll(selectionBounds(selectionRef.current), currentRegionOf(sheet, selectionRef.current.focus), whole)
+      : whole
+    selectRangeKeepingActive(target)
+  }, [selectRangeKeepingActive])
+
+  /**
+   * After Enter or Tab commits an entry (or Tab moves the active cell): inside a multi-cell
+   * selection the active cell steps through the block and wraps (Enter down the columns, Tab
+   * along the rows; Shift reverses). Otherwise Tab moves right and remembers where the row
+   * started, and Enter goes down, back to that column after a Tab run.
+   */
+  const advanceAfterEntry = useCallback((key: 'enter' | 'tab', backwards: boolean) => {
+    const current = selectionRef.current
+    const sheet = workbookRef.current?.sheets.find((item) => item.id === workbookRef.current?.activeSheetId)
+    const bounds = selectionBounds(current)
+    const merges = (sheet?.merges || []).map(mergeBounds).filter((value): value is NonNullable<ReturnType<typeof mergeBounds>> => Boolean(value))
+    const oneCell = (bounds.top === bounds.bottom && bounds.left === bounds.right)
+      || merges.some((merge) => merge.top === bounds.top && merge.bottom === bounds.bottom && merge.left === bounds.left && merge.right === bounds.right)
+    if (!oneCell) {
+      const inside = merges.filter((merge) => merge.bottom >= bounds.top && merge.top <= bounds.bottom && merge.right >= bounds.left && merge.left <= bounds.right)
+      const skip = (row: number, col: number) => hiddenRowSet.has(row) || hiddenColSet.has(col)
+        || inside.some((merge) => row >= merge.top && row <= merge.bottom && col >= merge.left && col <= merge.right && (row !== merge.top || col !== merge.left))
+      const next = stepWithinBounds(bounds, current.focus, key === 'tab' ? 'rows' : 'columns', backwards, skip)
+      tabRunRef.current = null
+      setSelection({ anchor: current.anchor, focus: next, range: bounds })
+      return
+    }
+    const from = current.focus
+    if (key === 'tab') {
+      const to = { row: from.row, col: stepPastHidden(from.col, backwards ? -1 : 1, SHEET_LAST_COL, hiddenColSet) }
+      const run = continueTabRun(tabRunRef.current, from, to)
+      setSelection({ anchor: to, focus: to })
+      tabRunRef.current = run
+      return
+    }
+    const back = backwards ? null : enterAfterTabRun(tabRunRef.current, from)
+    tabRunRef.current = null
+    if (back) {
+      const target = { row: stepPastHidden(from.row, 1, SHEET_LAST_ROW, hiddenRowSet), col: back.col }
+      setSelection({ anchor: target, focus: target })
+      return
+    }
+    moveSelection(backwards ? -1 : 1, 0)
+  }, [hiddenColSet, hiddenRowSet, moveSelection])
 
   /** Qualified absolute reference for the selection, e.g. 'My Sheet'!$A$1:$C$9. */
   const selectionReferenceText = useCallback(() => {
@@ -6531,8 +8237,13 @@ export default function App() {
     if (!target) return false
     const start = { row: Number(match[4]) - 1, col: columnIndex(match[3]) }
     const end = match[5] ? { row: Number(match[6]) - 1, col: columnIndex(match[5]) } : start
+    if (Math.max(start.row, end.row) > SHEET_LAST_ROW || Math.max(start.col, end.col) > SHEET_LAST_COL || Math.min(start.row, end.row) < 0) return false
     if (target.id !== current.activeSheetId) setWorkbook((value) => value ? { ...value, activeSheetId: target.id } : value)
-    setSelection({ anchor: start, focus: end })
+    // The range's first cell is the active one (Go To, a defined name, Ctrl+[), as in Excel.
+    const range = { top: Math.min(start.row, end.row), bottom: Math.max(start.row, end.row), left: Math.min(start.col, end.col), right: Math.max(start.col, end.col) }
+    const first = { row: range.top, col: range.left }
+    tabRunRef.current = null
+    setSelection(range.top === range.bottom && range.left === range.right ? { anchor: first, focus: first } : { anchor: first, focus: first, range })
     setEditing(null)
     return true
   }, [])
@@ -6599,17 +8310,86 @@ export default function App() {
       setNameBoxInvalid(true)
       return false
     }
-    const maxRow = clamp(Math.max(DEFAULT_ROWS, sheet.rowCount + 25), DEFAULT_ROWS, 1_048_576) - 1
-    const maxCol = clamp(Math.max(DEFAULT_COLS, sheet.colCount + 8), DEFAULT_COLS, 16_384) - 1
-    setSelection({
-      anchor: { row: clamp(start.row, 0, maxRow), col: clamp(start.col, 0, maxCol) },
-      focus: { row: clamp(end.row, 0, maxRow), col: clamp(end.col, 0, maxCol) },
-    })
+    // Any address on the sheet works (up to XFD1048576), not just the area drawn so far: the
+    // grid grows to show it. The first cell of a range is the active cell, as in Excel.
+    if (Math.max(start.row, end.row) > SHEET_LAST_ROW || Math.max(start.col, end.col) > SHEET_LAST_COL) {
+      setNameBoxInvalid(true)
+      return false
+    }
+    tabRunRef.current = null
+    const range = { top: Math.min(start.row, end.row), bottom: Math.max(start.row, end.row), left: Math.min(start.col, end.col), right: Math.max(start.col, end.col) }
+    const first = { row: range.top, col: range.left }
+    setSelection(range.top === range.bottom && range.left === range.right
+      ? { anchor: first, focus: first }
+      : { anchor: first, focus: first, range })
     setEditing(null)
     setNameBoxDraft(null)
     setNameBoxInvalid(false)
     return true
   }, [activeSheet, mutateWorkbook, selectReferenceText, selectionReferenceText])
+
+  // A hyperlink's place in this workbook: 'Sheet'!A1, Sheet2!B2:C9, A1, A:C, a defined name
+  // (workbook or sheet scope), a table, or a sheet on its own. The target is selected and
+  // scrolled into view, on its own sheet, as Excel's Place in This Document links do.
+  followLocationRef.current = (raw: string, depth = 0) => {
+    const current = workbookRef.current
+    const location = raw.trim().replace(/^=/, '')
+    if (!current || !location || depth > 4) return false
+    const { sheet: sheetName, reference } = splitLinkLocation(location)
+    // A hidden sheet is not a place a link can show (Excel reports the reference as invalid).
+    const sheetNamed = (name: string) => current.sheets.find((sheet) => sheet.name.toLocaleLowerCase() === name.trim().toLocaleLowerCase() && sheet.state !== 'hidden' && sheet.state !== 'veryHidden')
+    const activeIndex = current.sheets.findIndex((sheet) => sheet.id === current.activeSheetId)
+    const reveal = (sheetId: string, text: string) => {
+      if (sheetId !== current.activeSheetId) activateSheet(sheetId)
+      const sheet = current.sheets.find((item) => item.id === sheetId)!
+      if (!selectReferenceText(`${quoteSheetName(sheet.name)}!${text}`)) return false
+      const first = coordOf(text.replace(/\$/g, '').split(':')[0])
+      if (first) {
+        scrollRequestIdRef.current += 1
+        setScrollRequest({ row: first.row, col: first.col, id: scrollRequestIdRef.current })
+      }
+      return true
+    }
+    const wholeRange = (text: string) => {
+      const columns = /^\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})$/.exec(text)
+      if (columns) return `${columns[1]}1:${columns[2]}${SHEET_LAST_ROW + 1}`
+      const rows = /^\$?(\d{1,7}):\$?(\d{1,7})$/.exec(text)
+      if (rows) return `A${rows[1]}:${columnName(SHEET_LAST_COL)}${rows[2]}`
+      return null
+    }
+    const namedRange = (name: string, sheetIndex: number) => {
+      const wanted = name.toLocaleLowerCase()
+      const names = current.definedNames || []
+      const defined = names.find((item) => item.name.toLocaleLowerCase() === wanted && item.localSheetIndex === sheetIndex)
+        || names.find((item) => item.name.toLocaleLowerCase() === wanted && item.localSheetIndex === undefined)
+        || current.metadata?.definedNames?.find((item) => item.name.toLocaleLowerCase() === wanted)
+      if (!defined) return null
+      const refersTo = 'ranges' in defined && Array.isArray(defined.ranges) ? defined.ranges[0] : (defined as { ranges?: string; formula?: string }).ranges || (defined as { formula?: string }).formula
+      return typeof refersTo === 'string' ? refersTo : null
+    }
+    if (sheetName !== undefined) {
+      const sheet = sheetNamed(sheetName)
+      if (!sheet) return false
+      if (!reference) { if (sheet.id !== current.activeSheetId) activateSheet(sheet.id); return true }
+      const cells = isCellReference(reference) ? reference : wholeRange(reference)
+      if (cells) return reveal(sheet.id, cells)
+      const scoped = namedRange(reference, current.sheets.indexOf(sheet))
+      return scoped ? followLocationRef.current(scoped, depth + 1) : false
+    }
+    if (isCellReference(reference)) return reveal(current.activeSheetId, reference)
+    const whole = wholeRange(reference)
+    if (whole) return reveal(current.activeSheetId, whole)
+    const named = namedRange(reference, activeIndex)
+    if (named) return followLocationRef.current(named, depth + 1)
+    const table = current.sheets.flatMap((sheet) => (sheet.tables || []).map((entry) => ({ sheet, table: entry }))).find((entry) => entry.table.name.toLocaleLowerCase() === reference.toLocaleLowerCase())
+    if (table && table.sheet.state !== 'hidden' && table.sheet.state !== 'veryHidden') return reveal(table.sheet.id, table.table.ref)
+    const sheet = sheetNamed(reference)
+    if (sheet) {
+      if (sheet.id !== current.activeSheetId) activateSheet(sheet.id)
+      return true
+    }
+    return false
+  }
 
   useEffect(() => {
     if (!nameBoxInvalid) return
@@ -6665,7 +8445,12 @@ export default function App() {
     let items: AssistItem[] = []
     if (completion) {
       const prefix = completion.prefix.toUpperCase()
-      items = searchFunctions(completion.prefix, 14).map((info) => ({ kind: 'function' as const, label: info.name, detail: info.description, insertText: `${info.name}(` }))
+      // A complete cell reference (=M2*N2) only offers functions that start with it (LOG1 ->
+      // LOG10), never ones that merely contain it (BIN2DEC), so Enter commits the formula.
+      const cellLike = /^[A-Z]{1,3}[1-9]\d*$/.test(prefix)
+      items = searchFunctions(completion.prefix, 14)
+        .filter((info) => !cellLike || info.name.startsWith(prefix))
+        .map((info) => ({ kind: 'function' as const, label: info.name, detail: info.description, insertText: `${info.name}(` }))
       for (const name of definedNameList) if (name.toUpperCase().startsWith(prefix)) items.push({ kind: 'name', label: name, detail: 'Defined name', insertText: name })
       for (const name of tableNameList) if (name.toUpperCase().startsWith(prefix)) items.push({ kind: 'table', label: name, detail: 'Table', insertText: `${name}[` })
       items = items.slice(0, 24)
@@ -6757,13 +8542,17 @@ export default function App() {
     return true
   }, [updateActiveFormulaDraft])
 
-  const fillSelectionWithDraft = useCallback((draft: string) => {
+  /** Ctrl+Enter: the entry goes into every selected cell; a formula is relative to `origin`. */
+  const fillSelectionWithDraft = useCallback((draft: string, origin: Coord) => {
     const bounds = selectionBounds(selectionRef.current)
-    const origin = coordOf(editingRef.current?.address || '') || { row: bounds.top, col: bounds.left }
+    if (bounds.top === bounds.bottom && bounds.left === bounds.right) { commitCell(addressOf(origin), draft); return }
     if ((bounds.bottom - bounds.top + 1) * (bounds.right - bounds.left + 1) > 100_000) { setToast('That selection is too large to fill at once.'); return }
+    // A filtered list takes the entry in its visible rows only (Excel).
+    const skipRows = filteredOutRows()
     mutateWorkbook((next) => {
       const sheet = next.sheets.find((item) => item.id === next.activeSheetId)!
       for (let row = bounds.top; row <= bounds.bottom; row += 1) {
+        if (skipRows.has(row)) continue
         for (let col = bounds.left; col <= bounds.right; col += 1) {
           const address = addressOf({ row, col })
           const text = draft.startsWith('=') ? `=${shiftFormulaReferences(normalizeFormula(draft), row - origin.row, col - origin.col)}` : draft
@@ -6776,9 +8565,13 @@ export default function App() {
       sheet.colCount = Math.max(sheet.colCount, bounds.right + 1)
     })
     setEditing(null)
-  }, [mutateWorkbook])
+    cancelClipboardModeRef.current()
+  }, [commitCell, filteredOutRows, mutateWorkbook])
 
-  /** App-level keys inside the cell editor. Returns true when the key was handled. */
+  /**
+   * App-level keys inside the cell editor. Returns true when the key was handled, and
+   * 'committed' when it also committed the entry (the grid then takes the keyboard back).
+   */
   const handleEditorKeyDown = useCallback((event: KeyboardEvent<HTMLTextAreaElement>) => {
     const current = editingRef.current
     if (!current) return false
@@ -6817,10 +8610,24 @@ export default function App() {
       setEditing((state) => state ? { ...state, mode: state.mode === 'edit' ? 'enter' : 'edit' } : state)
       return true
     }
+    if (event.key === 'Enter' && event.altKey && !event.ctrlKey && !event.metaKey) {
+      // Alt+Enter starts a new line in the cell, as in Excel (the browser adds none); the
+      // committed entry then wraps.
+      event.preventDefault()
+      pointRef.current = null
+      updateActiveFormulaDraft(`${draft.slice(0, caret)}\n${draft.slice(element.selectionEnd)}`, caret + 1)
+      return true
+    }
     if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.altKey) {
       event.preventDefault()
-      fillSelectionWithDraft(draft)
-      return true
+      // Ctrl+Enter validates like any entry, then fills the selection and stays put.
+      const origin = coordOf(current.address) || selectionRef.current.focus
+      editingRef.current = null
+      const suggestion = autoCompleteRef.current
+      autoCompleteRef.current = null
+      const entry = suggestion && suggestion.address === current.address ? acceptedAutoComplete(draft, suggestion) : draft
+      commitWithValidation(current.address, entry, (accepted) => fillSelectionWithDraft(accepted, origin), true)
+      return 'committed'
     }
     const arrow = event.key === 'ArrowUp' ? [-1, 0] : event.key === 'ArrowDown' ? [1, 0] : event.key === 'ArrowLeft' ? [0, -1] : event.key === 'ArrowRight' ? [0, 1] : null
     if (arrow && current.mode !== 'edit' && !event.altKey) {
@@ -6835,18 +8642,22 @@ export default function App() {
         const inserted = insertReference(draft, caret, bounds, replacing ? point!.span : null)
         pointRef.current = { span: inserted.span, anchor, focus }
         updateActiveFormulaDraft(inserted.text, inserted.caret)
+        // The view follows the pointed cell, so a formula can reach cells off screen.
+        scrollRequestIdRef.current += 1
+        setScrollRequest({ row: focus.row, col: focus.col, id: scrollRequestIdRef.current })
         return true
       }
       if (current.mode === 'enter' && !event.ctrlKey && !event.shiftKey) {
         event.preventDefault()
-        commitCell(current.address, draft)
-        moveSelectionRef.current(arrow[0], arrow[1])
-        document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
-        return true
+        // An arrow commits like Enter: validated, one undo step, then the move. A rejected
+        // entry stays where it is (its alert decides).
+        const move = () => moveSelectionRef.current(arrow[0], arrow[1])
+        if (commitEditor(draft, { afterAccept: move })) move()
+        return 'committed'
       }
     }
     return false
-  }, [acceptAssistItem, assistState, commitCell, fillSelectionWithDraft, updateActiveFormulaDraft])
+  }, [acceptAssistItem, assistState, commitEditor, commitWithValidation, fillSelectionWithDraft, updateActiveFormulaDraft])
 
   const referenceHighlights = useMemo<ReferenceHighlight[]>(() => {
     if (!activeFormulaDraft?.startsWith('=') || !activeSheet) return []
@@ -6869,18 +8680,92 @@ export default function App() {
     return formula ? `=${formula}` : ''
   }, [activeAddress, activeCell, activeSheet, calcEngine])
 
+  /**
+   * Alt+Down (Excel's Pick From Drop-down List): the column block's text entries, or the
+   * cell's own list when it has list validation, in a filterable list under the cell.
+   */
+  const openListFor = useCallback((requested?: string) => {
+    const current = workbookRef.current
+    const sheet = current?.sheets.find((item) => item.id === current.activeSheetId)
+    if (!sheet) return
+    const address = mergeMasterAddress(sheet, requested || addressOf(selectionRef.current.focus))
+    const coord = coordOf(address)
+    if (!coord) return
+    const validation = validationForCell(sheet, address, coord) as Record<string, unknown> | undefined
+    const options = validation?.type === 'list' ? listOptionsFor(validation, address) : []
+    const rect = document.getElementById(`cell-${sheet.id}-${address}`)?.getBoundingClientRect()
+    if (!rect) return
+    setPickList({
+      sheetId: sheet.id,
+      address,
+      items: options.length ? options : pickListEntries(sheet.cells, coord.row, coord.col),
+      label: options.length ? `Choose a value for ${address}` : `Pick from the entries in column ${columnName(coord.col)}`,
+      fromValidation: options.length > 0,
+      anchor: { left: rect.left, top: rect.top, bottom: rect.bottom, width: rect.width },
+      // The cell's list (its arrow, chip, or Alt+Down) opens the searchable dropdown.
+      ...(options.length ? { presentation: dropdownPresentation(validation), current: displayValue(sheet.id, address) } : {}),
+    })
+  }, [displayValue, listOptionsFor])
+  const openPickList = useCallback(() => openListFor(), [openListFor])
+
   const handleGridKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
     if (editing) return
     const control = event.ctrlKey || event.metaKey
     if (event.altKey && event.key === 'Enter' && activeCell?.hyperlink) { event.preventDefault(); openHyperlink(activeCell.hyperlink); return }
+    if (event.altKey && event.key === 'Enter' && activeSheet && activeCell?.formula && hyperlinkFormulaArgument(activeCell.formula)) {
+      event.preventDefault()
+      openHyperlink(`=${activeCell.formula}`, { sheetId: activeSheet.id, address: activeAddress })
+      return
+    }
+    if (event.altKey && !control && !event.shiftKey && event.key === 'ArrowDown') { event.preventDefault(); openPickList(); return }
     if (event.key === ' ' && (control || event.shiftKey)) {
       event.preventDefault()
+      // Whole rows / columns / sheet around the unchanged active cell (the view stays put).
       const bounds = selectionBounds(selection)
       const lastRow = Math.max(0, (activeSheet?.rowCount || 1) - 1)
       const lastCol = Math.max(0, (activeSheet?.colCount || 1) - 1)
-      if (control && event.shiftKey) setSelection({ anchor: { row: 0, col: 0 }, focus: { row: lastRow, col: lastCol } })
-      else if (event.shiftKey) setSelection({ anchor: { row: bounds.top, col: 0 }, focus: { row: bounds.bottom, col: lastCol } })
-      else setSelection({ anchor: { row: 0, col: bounds.left }, focus: { row: lastRow, col: bounds.right } })
+      if (control && event.shiftKey) selectRangeKeepingActive({ top: 0, left: 0, bottom: lastRow, right: lastCol })
+      else if (event.shiftKey) selectRangeKeepingActive({ top: bounds.top, bottom: bounds.bottom, left: 0, right: Math.max(lastCol, bounds.right) })
+      else selectRangeKeepingActive({ top: 0, bottom: Math.max(lastRow, bounds.bottom), left: bounds.left, right: bounds.right })
+      return
+    }
+    // Shift+Backspace: collapse the selection to the active cell.
+    if (event.key === 'Backspace' && event.shiftKey && !control && !event.altKey) {
+      event.preventDefault()
+      setSelection({ anchor: selection.focus, focus: selection.focus })
+      return
+    }
+    // Ctrl+Backspace: bring the active cell back into view.
+    if (event.key === 'Backspace' && control && !event.shiftKey && !event.altKey) {
+      event.preventDefault()
+      scrollRequestIdRef.current += 1
+      setScrollRequest({ row: selection.focus.row, col: selection.focus.col, id: scrollRequestIdRef.current })
+      return
+    }
+    // Ctrl+. : the active cell moves clockwise to the next corner of the selection.
+    if (control && !event.shiftKey && !event.altKey && (event.key === '.' || event.code === 'Period')) {
+      event.preventDefault()
+      const bounds = selectionBounds(selection)
+      const corner = nextSelectionCorner(bounds, selection.focus)
+      setSelection({ anchor: corner.anchor, focus: corner.focus, range: bounds })
+      return
+    }
+    // Ctrl+Shift+8 / Ctrl+* : the current region around the active cell.
+    if (control && !event.altKey && ((event.shiftKey && event.code === 'Digit8') || event.key === '*' || event.code === 'NumpadMultiply')) {
+      event.preventDefault()
+      const region = activeSheet ? currentRegionOf(activeSheet, selection.focus) : null
+      selectRangeKeepingActive(region || { top: selection.focus.row, bottom: selection.focus.row, left: selection.focus.col, right: selection.focus.col })
+      return
+    }
+    // Ctrl+[ : go to the cells the active cell's formula refers to (its direct precedents).
+    if (control && !event.shiftKey && !event.altKey && (event.key === '[' || event.code === 'BracketLeft')) {
+      event.preventDefault()
+      const precedents = activeSheet && activeCell?.formula && calcEngine ? calcEngine.precedentsOf(activeSheet.id, activeAddress) : []
+      const first = precedents[0]
+      const sheetName = first ? workbookRef.current?.sheets.find((sheet) => sheet.id === first.sheetId)?.name : undefined
+      if (!first || !sheetName) { setToast('The active cell has no precedents to go to.'); return }
+      const range = rangeAddress({ top: first.top, bottom: Math.min(first.bottom, SHEET_LAST_ROW), left: first.left, right: Math.min(first.right, SHEET_LAST_COL) })
+      selectReferenceText(`'${sheetName.replace(/'/g, "''")}'!${range}`)
       return
     }
     if (event.key === ' ' && activeSheet && activeCell) {
@@ -6948,7 +8833,7 @@ export default function App() {
     if (event.key === 'Home' && !control) {
       event.preventDefault()
       const target = { row: selection.focus.row, col: hiddenColSet.has(0) ? stepPastHidden(0, 1, 16_383, hiddenColSet) : 0 }
-      setSelection((current) => ({ anchor: event.shiftKey ? current.anchor : target, focus: target }))
+      setSelection({ anchor: event.shiftKey ? selectionExtension(selection).anchor : target, focus: target })
       return
     }
     if (control && event.key.toLocaleLowerCase() === 'd') { event.preventDefault(); fillSelectedRange('down'); return }
@@ -6958,10 +8843,11 @@ export default function App() {
     if (control && event.altKey && event.key.toLocaleLowerCase() === 'v') { event.preventDefault(); setPasteSpecialOpen(true); return }
     if (control && event.shiftKey && event.key.toLocaleLowerCase() === 'v') { event.preventDefault(); void pasteSelection(PASTE_SPECIAL_PRESETS.values); return }
     if (control && event.key.toLocaleLowerCase() === 'v') { event.preventDefault(); void pasteSelection(); return }
-    if (event.key === 'Escape' && cutRange) { event.preventDefault(); setCutRange(null); internalClipboard.current = null; return }
+    // Esc ends copy or cut mode (the marquee goes; a cut no longer moves anything).
+    if (event.key === 'Escape' && clipboardRange) { event.preventDefault(); cancelClipboardMode(); return }
     if (control && event.key.toLocaleLowerCase() === 'a') {
       event.preventDefault()
-      selectAllSheet()
+      selectAllSheet(true)
       return
     }
     if (control && event.key === 'Home') {
@@ -6970,7 +8856,7 @@ export default function App() {
         row: hiddenRowSet.has(0) ? stepPastHidden(0, 1, 1_048_575, hiddenRowSet) : 0,
         col: hiddenColSet.has(0) ? stepPastHidden(0, 1, 16_383, hiddenColSet) : 0,
       }
-      setSelection((current) => ({ anchor: event.shiftKey ? current.anchor : home, focus: home }))
+      setSelection({ anchor: event.shiftKey ? selectionExtension(selection).anchor : home, focus: home })
       return
     }
     if (control && event.key === 'End') {
@@ -6982,7 +8868,7 @@ export default function App() {
         last.row = Math.max(last.row, coord.row)
         last.col = Math.max(last.col, coord.col)
       })
-      setSelection((current) => ({ anchor: event.shiftKey ? current.anchor : last, focus: last }))
+      setSelection({ anchor: event.shiftKey ? selectionExtension(selection).anchor : last, focus: last })
       return
     }
     if (event.key === 'PageUp' || event.key === 'PageDown') {
@@ -7005,9 +8891,10 @@ export default function App() {
     if (event.key === 'ArrowDown') { event.preventDefault(); if (control) jumpSelection(1, 0, event.shiftKey); else moveSelection(1, 0, event.shiftKey); return }
     if (event.key === 'ArrowLeft') { event.preventDefault(); if (control) jumpSelection(0, -1, event.shiftKey); else moveSelection(0, -1, event.shiftKey); return }
     if (event.key === 'ArrowRight') { event.preventDefault(); if (control) jumpSelection(0, 1, event.shiftKey); else moveSelection(0, 1, event.shiftKey); return }
-    if (event.key === 'Tab') { event.preventDefault(); moveSelection(0, event.shiftKey ? -1 : 1); return }
-    if (!control && !event.altKey && event.key.length === 1) { event.preventDefault(); beginEdit(event.key) }
-  }, [activeAddress, activeCell, activeSheet, applyStyle, beginEdit, calcEngine, clearSelection, copySelection, cutRange, editing, fillSelectedRange, hiddenColSet, hiddenRowSet, hideSelectedDimension, insertFunction, jumpSelection, moveSelection, openHyperlink, pasteSelection, selectAllSheet, selection, setBorderPreset, setCellValue, setNumberFormat, switchSheetBy, unhideNearSelection, zoom])
+    // Tab moves within a multi-cell selection (wrapping), else right, starting a Tab run.
+    if (event.key === 'Tab' && !control && !event.altKey) { event.preventDefault(); advanceAfterEntry('tab', event.shiftKey); return }
+    if (!control && !event.altKey && event.key.length === 1) { event.preventDefault(); beginEdit(event.key, { typed: true }) }
+  }, [activeAddress, activeCell, activeSheet, advanceAfterEntry, applyStyle, beginEdit, calcEngine, cancelClipboardMode, clearSelection, clipboardRange, copySelection, editing, fillSelectedRange, hiddenColSet, hiddenRowSet, hideSelectedDimension, insertFunction, jumpSelection, moveSelection, openHyperlink, openPickList, pasteSelection, selectAllSheet, selectRangeKeepingActive, selectReferenceText, selection, setBorderPreset, setCellValue, setNumberFormat, switchSheetBy, unhideNearSelection, zoom])
 
   useEffect(() => {
     const handleKey = (event: globalThis.KeyboardEvent) => {
@@ -7019,10 +8906,11 @@ export default function App() {
         return
       }
       if (control && event.key.toLocaleLowerCase() === 'o') { event.preventDefault(); void openWorkbook(); return }
-      if (control && event.shiftKey && event.key.toLocaleLowerCase() === 'e') { event.preventDefault(); setExportOpen(true); return }
+      if (control && event.shiftKey && event.key.toLocaleLowerCase() === 'e') { event.preventDefault(); if (flushPendingEditsRef.current()) setExportOpen(true); return }
       if (control && event.key.toLocaleLowerCase() === 's') { event.preventDefault(); void saveWorkbook(event.shiftKey); return }
       if (control && event.key.toLocaleLowerCase() === 'p') { event.preventDefault(); openPrintDialog(); return }
-      if (control && event.key.toLocaleLowerCase() === 'z' && !typing) { event.preventDefault(); undo(); return }
+      // Ctrl+Shift+Z redoes, like Ctrl+Y (Sheets and most editors).
+      if (control && event.key.toLocaleLowerCase() === 'z' && !typing) { event.preventDefault(); if (event.shiftKey) redo(); else undo(); return }
       if (control && event.key.toLocaleLowerCase() === 'y' && !typing) { event.preventDefault(); redo(); return }
       if (control && event.key.toLocaleLowerCase() === 'f') { event.preventDefault(); openSearch(); return }
       if (control && event.key.toLocaleLowerCase() === 'h') { event.preventDefault(); openReplace(); return }
@@ -7045,6 +8933,234 @@ export default function App() {
     window.addEventListener('keydown', handleKey)
     return () => window.removeEventListener('keydown', handleKey)
   }, [activeCell, addSheet, applyStyle, clearFormatting, editAnnotation, insertLink, openPrintDialog, openReplace, openSearch, openWorkbook, redo, saveWorkbook, undo])
+
+  // ---- Calculation: F9 / Shift+F9 / Ctrl+Alt+F9, options, circular references ---------------
+  const calculationOptions = useMemo(() => (workbook ? calculationOptionsOf(workbook) : null), [workbook])
+  const recalculate = useCallback((scope: 'changed' | 'sheet' | 'all') => {
+    const engine = engineRef.current
+    const sheetId = workbookRef.current?.activeSheetId
+    if (!engine || !sheetId) return
+    if (scope === 'all') engine.recalculateAll()
+    else if (scope === 'sheet') engine.recalculateSheet(sheetId)
+    else engine.recalculate()
+    setCalcTick((value) => value + 1)
+  }, [])
+
+  const applyCalculationOptions = useCallback((options: CalculationOptions) => {
+    setCalcOptionsOpen(false)
+    mutateWorkbook((next) => {
+      const calcProperties = { ...(withCalculationOptions(next as WorkbookModel, options).metadata?.calcProperties || {}) }
+      if (next.metadata) next.metadata.calcProperties = calcProperties
+      else next.metadata = { calcProperties }
+    })
+    restoreGridFocusRef.current()
+  }, [mutateWorkbook])
+
+  // The engine finds circular references while it calculates: Excel names one in the status bar
+  // (unless iterative calculation is on) and warns when an entry creates a new one.
+  useEffect(() => {
+    const found = calcEngine && !calculationOptions?.iterate ? calcEngine.circularReferences() : []
+    const key = found.map((item) => `${item.sheetId}!${item.address}`).join('|')
+    setCircularRefs((current) => (current.map((item) => `${item.sheetId}!${item.address}`).join('|') === key ? current : found))
+    if (key && !circularNoticeRef.current && dirtyRef.current) {
+      const first = found[0]
+      const sheetName = workbookRef.current?.sheets.find((sheet) => sheet.id === first.sheetId)?.name || ''
+      setToast(`Circular reference in ${quoteSheetName(sheetName)}!${first.address}: a formula refers to its own cell. Click the status bar to go there.`)
+    }
+    circularNoticeRef.current = key
+  })
+
+  // ---- Chart data range picked on the sheet ---------------------------------------------------
+  const startRangePick = useCallback((apply: (rangeText: string) => void) => {
+    const sheetId = workbookRef.current?.activeSheetId
+    if (!sheetId) return
+    setRangePick({ sheetId, apply })
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true }))
+  }, [])
+  const finishRangePick = useCallback((confirm: boolean) => {
+    const pick = rangePickRef.current
+    if (!pick) return
+    setRangePick(null)
+    const sheet = workbookRef.current?.sheets.find((item) => item.id === pick.sheetId)
+    if (confirm && sheet) pick.apply(`${quoteSheetName(sheet.name)}!${rangeAddress(selectionBounds(selectionRef.current))}`)
+    restoreGridFocusRef.current()
+  }, [])
+  useEffect(() => {
+    if (!rangePick) return
+    // While picking, the sheet only selects: Enter applies, Esc cancels, and keys that would
+    // type into or change cells do nothing (the chart editor's own fields still work).
+    const handleKey = (event: globalThis.KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null
+      const onSheet = !target || target === document.body || Boolean(target.closest('.sheet-viewport, .range-pick-bar'))
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); finishRangePick(false); return }
+      if (!onSheet) return
+      if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); finishRangePick(true); return }
+      const navigation = event.key.startsWith('Arrow') || ['Home', 'End', 'PageUp', 'PageDown', 'Shift', 'Control', 'Alt', 'Meta', 'Tab'].includes(event.key)
+        || ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'a')
+      if (!navigation) { event.preventDefault(); event.stopPropagation() }
+    }
+    window.addEventListener('keydown', handleKey, true)
+    return () => window.removeEventListener('keydown', handleKey, true)
+  }, [finishRangePick, rangePick])
+  useEffect(() => {
+    // Picking ends with its sheet or its chart editor.
+    if (rangePick && (workbook?.activeSheetId !== rangePick.sheetId || !chartEditorId)) setRangePick(null)
+  }, [chartEditorId, rangePick, workbook?.activeSheetId])
+
+  // ---- Sort by colour from a column's filter menu ---------------------------------------------
+  const sortFilterColumnByColor = useCallback((key: string, col: number, target: { sortOn: 'fillColor' | 'fontColor'; color: string | null }) => {
+    const sheet = activeSheet
+    const filter = filterTargets.find((item) => item.key === key)
+    if (!sheet || !filter) return
+    // Rows with that colour go to the top; hidden and filtered rows stay where they are.
+    const spec = sortSpecForFilter(filter.state.ref, { key: col - filter.bounds.left, sortOn: target.sortOn, color: target.color, position: 'top' }, { fixedRows: (sheet.hiddenRows || []).map(Number) })
+    if (!spec) return
+    const result = sortRange(sheet, spec, dataHostFor(sheet), shiftFormulaReferences)
+    if (!result.ok) { setToast(result.error); return }
+    if (!result.changed) { setToast('Those rows are already at the top.'); return }
+    mutateWorkbook((next) => {
+      const draft = next.sheets.find((item) => item.id === sheet.id)!
+      applyCellChanges(draft.cells, result.changes)
+      // A colour sort is not an A→Z/Z→A sort of the column: its arrow indicator is cleared.
+      const { sort: _sort, ...state } = filter.state
+      writeFilterState(draft, key, state)
+    })
+    setToast(`Sorted by ${target.sortOn === 'fillColor' ? 'cell' : 'font'} color`)
+  }, [activeSheet, dataHostFor, filterTargets, mutateWorkbook, writeFilterState])
+
+  // ---- Page setup: print area, print titles, page breaks ---------------------------------------
+  const changePageSetup = useCallback((patch: SpreadsheetPageSetupPatch) => {
+    mutateWorkbook((next) => {
+      const sheet = next.sheets.find((item) => item.id === next.activeSheetId)
+      if (sheet) applyPageSetupPatch(sheet as SheetData, patch)
+    })
+  }, [mutateWorkbook])
+  const pageBreakOverlay = useMemo<PageBreakOverlay | null>(() => {
+    if (!showPageBreaks || printOpen || !activeSheet) return null
+    const pages = (previewPageBreaks || []).filter((page) => page.sheetId === activeSheet.id)
+    // Manual breaks ({ id: last row before the break, 1-based }) start a page at row `id`.
+    const manualRows = (Array.isArray(activeSheet.rowBreaks) ? activeSheet.rowBreaks : [])
+      .map((entry) => Math.trunc(Number(entry && typeof entry === 'object' ? (entry as { id?: unknown }).id : entry)))
+      .filter((row) => Number.isFinite(row) && row >= 1)
+    if (!pages.length && !manualRows.length) return null
+    const top = pages.length ? Math.min(...pages.map((page) => page.firstRow)) : 0
+    const bottom = pages.length ? Math.max(...pages.map((page) => page.lastRow)) : Math.max(0, activeSheet.rowCount - 1)
+    const left = pages.length ? Math.min(...pages.map((page) => page.firstColumn)) : 0
+    const right = pages.length ? Math.max(...pages.map((page) => page.lastColumn)) : Math.max(0, activeSheet.colCount - 1)
+    return {
+      rows: [...new Set([...pages.map((page) => page.firstRow), ...manualRows])].filter((row) => row > top).sort((a, b) => a - b),
+      columns: [...new Set(pages.map((page) => page.firstColumn))].filter((col) => col > left).sort((a, b) => a - b),
+      manualRows,
+      top,
+      bottom,
+      left,
+      right,
+    }
+  }, [activeSheet, previewPageBreaks, printOpen, showPageBreaks])
+
+  // View > Page break preview (Excel): the active sheet is laid out as the print dialog would
+  // (its saved page setup), and each page is outlined and numbered on the grid. It follows edits
+  // and page-setup changes; the dashed breaks stay when the preview is turned off, as in Excel.
+  const [pageBreakPreview, setPageBreakPreview] = useState(false)
+  const pagePreviewSheetId = activeSheet?.id
+  // Pages only move when the sheet's layout changes (page setup, print area, sizes, merges,
+  // breaks, the used extent), so a plain value edit inside the used range never re-renders.
+  const pagePreviewLayoutKey = useMemo(() => {
+    if (!pageBreakPreview || !activeSheet) return ''
+    let lastRow = 0
+    let lastColumn = 0
+    for (const address of Object.keys(activeSheet.cells)) {
+      const position = coordOf(address)
+      if (!position) continue
+      if (position.row > lastRow) lastRow = position.row
+      if (position.col > lastColumn) lastColumn = position.col
+    }
+    const printNames = (workbook?.definedNames || []).filter((name) => /^_xlnm\.|^print_/i.test(name.name))
+    return JSON.stringify([
+      activeSheet.id, lastRow, lastColumn, activeSheet.merges, activeSheet.colWidths, activeSheet.rowHeights,
+      activeSheet.hiddenRows, activeSheet.hiddenCols, activeSheet.pageSetup, activeSheet.headerFooter, activeSheet.rowBreaks,
+      activeSheet.rowProperties, activeSheet.columnProperties, activeSheet.properties, printNames,
+      (activeSheet.charts || []).map((chart) => chart.anchor), (activeSheet.images || []).map((image) => image.anchor),
+    ])
+  }, [activeSheet, pageBreakPreview, workbook?.definedNames])
+  useEffect(() => {
+    if (!pageBreakPreview || printOpen || !pagePreviewLayoutKey || !pagePreviewSheetId) return
+    let active = true
+    let timer = 0
+    const refresh = () => {
+      // Never interrupt an entry: wait until the cell editor and the formula bar are closed.
+      if (editingRef.current || formulaBarDirtyRef.current) {
+        timer = window.setTimeout(refresh, 400)
+        return
+      }
+      renderPageBreakPreviewRef.current({ useSavedLayout: true, scope: 'active-sheet', orientation: 'portrait', scaling: 'fit-width', paperSize: 'letter', margins: 'normal', gridlines: gridlinesVisible, headings: false })
+        .then((result) => { if (active) setPreviewPageBreaks(previewPages(result.html)) })
+        .catch((error) => {
+          if (!active) return
+          setPageBreakPreview(false)
+          setToast(`Page break preview is unavailable: ${errorMessage(error)}`)
+        })
+    }
+    timer = window.setTimeout(refresh, 300)
+    return () => { active = false; window.clearTimeout(timer) }
+  }, [gridlinesVisible, pageBreakPreview, pagePreviewLayoutKey, pagePreviewSheetId, printOpen, showFormulas])
+  const pagePreviewOverlay = useMemo<PagePreviewOverlay | null>(() => {
+    if (!pageBreakPreview || printOpen || !activeSheet) return null
+    const pages = (previewPageBreaks || []).filter((page) => page.sheetId === activeSheet.id)
+    if (!pages.length) return null
+    return { pages: pages.map((page) => ({ pageNumber: page.pageNumber, top: page.firstRow, bottom: page.lastRow, left: page.firstColumn, right: page.lastColumn })) }
+  }, [activeSheet, pageBreakPreview, previewPageBreaks, printOpen])
+
+  /**
+   * Drag-and-drop of the selection border (Excel, Sheets): move the block like cut + paste, or
+   * copy it like copy + paste with Ctrl, as one undo step. Excel asks before replacing data.
+   */
+  const moveCells = useCallback(async (source: OverlayBounds, destination: Coord, copy: boolean) => {
+    const current = workbookRef.current
+    const sheet = current?.sheets.find((item) => item.id === current.activeSheetId)
+    if (!current || !sheet) return
+    const transfer = { sheetId: sheet.id, source, destination, mode: copy ? 'copy' as const : 'move' as const }
+    const plan = planCellBlockTransfer(current, transfer)
+    if (plan.error) { setToast(plan.error); return }
+    if (plan.unchanged) return
+    if (plan.overwrites && !(await confirmRef.current('There’s already data here. Do you want to replace it?'))) return
+    let result: ReturnType<typeof transferCellBlock> | null = null
+    mutateWorkbook((next) => { result = transferCellBlock(next, transfer) })
+    const done = result as ReturnType<typeof transferCellBlock> | null
+    if (!done || done.error) { if (done?.error) setToast(done.error); return }
+    if (workbookRef.current === current) return
+    // The selection travels with the block, the active cell at the same place within it.
+    const rowDelta = done.target.top - source.top
+    const colDelta = done.target.left - source.left
+    const before = selectionRef.current
+    const was = selectionBounds(before)
+    const shift = (coord: Coord) => ({ row: coord.row + rowDelta, col: coord.col + colDelta })
+    setSelection(was.top === source.top && was.bottom === source.bottom && was.left === source.left && was.right === source.right
+      ? { anchor: shift(before.anchor), focus: shift(before.focus), ...(before.range ? { range: { ...done.target } } : {}) }
+      : { anchor: { row: done.target.top, col: done.target.left }, focus: { row: done.target.bottom, col: done.target.right } })
+  }, [mutateWorkbook])
+
+  // Help > Keyboard shortcuts (Ctrl+/, as in Sheets); F9 calculates now, Shift+F9 the sheet,
+  // Ctrl+Alt+F9 every formula (Excel).
+  useEffect(() => {
+    const handleKey = (event: globalThis.KeyboardEvent) => {
+      if (event.defaultPrevented || document.querySelector('[aria-modal="true"]')) return
+      const control = event.ctrlKey || event.metaKey
+      const target = event.target
+      const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
+      if (control && !event.altKey && !event.shiftKey && (event.key === '/' || event.code === 'Slash')) {
+        event.preventDefault()
+        setShortcutsOpen(true)
+        return
+      }
+      if (event.key === 'F9' && !typing) {
+        event.preventDefault()
+        recalculate(control && event.altKey ? 'all' : event.shiftKey ? 'sheet' : 'changed')
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [recalculate])
 
   const removeRecent = useCallback((filePath: string) => {
     setRecent((current) => current.filter((item) => item.path !== filePath))
@@ -7097,6 +9213,27 @@ export default function App() {
   const selectedRowCount = bounds.bottom - bounds.top + 1
   const selectedColumnCount = bounds.right - bounds.left + 1
   const hiddenSheets = workbook.sheets.filter((sheet) => sheet.state === 'hidden')
+  const menuPageSetup = pageSetupStateFor(activeSheet, bounds)
+  const circularTarget = circularRefs.find((item) => item.sheetId === activeSheet.id) || circularRefs[0]
+  const circularSheetName = circularTarget ? workbook.sheets.find((sheet) => sheet.id === circularTarget.sheetId)?.name || '' : ''
+  const circularLabel = circularTarget ? (circularTarget.sheetId === activeSheet.id ? circularTarget.address : `${quoteSheetName(circularSheetName)}!${circularTarget.address}`) : ''
+  const goToCircularReference = () => {
+    if (!circularTarget) return
+    followLocationRef.current(`${quoteSheetName(circularSheetName)}!${circularTarget.address}`)
+    // The keyboard goes to the sheet, on the cell, ready to fix the formula.
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true }))
+  }
+  const setCalculationOption = (patch: Partial<CalculationOptions>) => {
+    if (!calculationOptions) return
+    const next = { ...calculationOptions, ...patch }
+    if (next.mode === calculationOptions.mode && next.iterate === calculationOptions.iterate && next.maxIterations === calculationOptions.maxIterations && next.maxChange === calculationOptions.maxChange) return
+    applyCalculationOptions(next)
+  }
+  const toggleAutoComplete = () => setAutoCompleteEnabled((current) => {
+    const next = !current
+    try { localStorage.setItem(AUTOCOMPLETE_KEY, next ? 'on' : 'off') } catch { /* Preference only. */ }
+    return next
+  })
   const menuDefinitions: SpreadsheetMenuDefinition[] = [
     {
       id: 'file',
@@ -7106,8 +9243,61 @@ export default function App() {
         { id: 'file-open', label: 'Open…', shortcut: 'Ctrl+O', icon: <FolderOpen size={13} />, action: () => { void openWorkbook() } },
         { id: 'file-save', label: 'Save', shortcut: 'Ctrl+S', icon: <Save size={13} />, action: () => { void saveWorkbook(false) } },
         { id: 'file-save-as', label: 'Save as…', shortcut: 'Ctrl+Shift+S', action: () => { void saveWorkbook(true) } },
-        { id: 'file-export', label: 'Export As…', shortcut: 'Ctrl+Shift+E', icon: <Download size={13} />, action: () => setExportOpen(true) },
+        { id: 'file-export', label: 'Export As…', shortcut: 'Ctrl+Shift+E', icon: <Download size={13} />, action: () => { if (flushPendingEditsRef.current()) setExportOpen(true) } },
         { id: 'file-print', label: 'Print…', shortcut: 'Ctrl+P', separatorBefore: true, icon: <Printer size={13} />, action: openPrintDialog },
+        {
+          // Excel's Page Layout > Print Area / Print Titles / Breaks, for the active sheet.
+          id: 'file-page-setup', label: 'Page setup', children: [
+            { id: 'print-area-set', label: `Set print area to ${rangeAddress(bounds)}`, disabled: menuPageSetup.printArea === rangeAddress(bounds), action: () => changePageSetup({ printArea: rangeAddress(bounds) }) },
+            { id: 'print-area-clear', label: menuPageSetup.printArea ? `Clear print area (${menuPageSetup.printArea})` : 'Clear print area', disabled: !menuPageSetup.printArea, action: () => changePageSetup({ printArea: null }) },
+            menuPageSetup.printTitlesRow
+              ? { id: 'print-titles-rows-clear', label: `Stop repeating rows ${menuPageSetup.printTitlesRow}`, separatorBefore: true, action: () => changePageSetup({ printTitlesRow: null }) }
+              : { id: 'print-titles-rows', label: selectedRowCount === 1 ? `Repeat row ${bounds.top + 1} on every page` : `Repeat rows ${bounds.top + 1}–${bounds.bottom + 1} on every page`, separatorBefore: true, disabled: selectedRowCount > 50, action: () => changePageSetup({ printTitlesRow: `${bounds.top + 1}:${bounds.bottom + 1}` }) },
+            menuPageSetup.printTitlesColumn
+              ? { id: 'print-titles-columns-clear', label: `Stop repeating columns ${menuPageSetup.printTitlesColumn}`, action: () => changePageSetup({ printTitlesColumn: null }) }
+              : { id: 'print-titles-columns', label: selectedColumnCount === 1 ? `Repeat column ${columnName(bounds.left)} on every page` : `Repeat columns ${columnName(bounds.left)}–${columnName(bounds.right)} on every page`, disabled: selectedColumnCount > 20, action: () => changePageSetup({ printTitlesColumn: `${columnName(bounds.left)}:${columnName(bounds.right)}` }) },
+            menuPageSetup.rowBreaks.includes(bounds.top + 1)
+              ? { id: 'page-break-remove', label: `Remove page break above row ${bounds.top + 1}`, separatorBefore: true, action: () => changePageSetup({ rowBreaks: menuPageSetup.rowBreaks.filter((row) => row !== bounds.top + 1) }) }
+              : { id: 'page-break-insert', label: `Insert page break above row ${bounds.top + 1}`, separatorBefore: true, disabled: bounds.top < 1, action: () => changePageSetup({ rowBreaks: [...menuPageSetup.rowBreaks, bounds.top + 1] }) },
+            { id: 'page-break-reset', label: 'Reset all page breaks', disabled: !menuPageSetup.rowBreaks.length, action: () => changePageSetup({ rowBreaks: [] }) },
+            { id: 'page-setup-more', label: 'Headers, footers and layout…', separatorBefore: true, action: openPrintDialog },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'edit',
+      label: 'Edit',
+      items: [
+        { id: 'edit-undo', label: 'Undo', shortcut: 'Ctrl+Z', icon: <Undo2 size={13} />, disabled: !historyRef.current.length, action: undo },
+        { id: 'edit-redo', label: 'Redo', shortcut: 'Ctrl+Y', icon: <Redo2 size={13} />, disabled: !futureRef.current.length, action: redo },
+        { id: 'edit-cut', label: 'Cut', shortcut: 'Ctrl+X', separatorBefore: true, icon: <Scissors size={13} />, action: () => { void copySelection(true) } },
+        { id: 'edit-copy', label: 'Copy', shortcut: 'Ctrl+C', icon: <Copy size={13} />, action: () => { void copySelection() } },
+        { id: 'edit-paste', label: 'Paste', shortcut: 'Ctrl+V', icon: <ClipboardPaste size={13} />, action: () => { void pasteSelection() } },
+        {
+          id: 'edit-paste-special', label: 'Paste special', children: PASTE_SPECIAL_MENU.map((item) => ({
+            id: `edit-${item.id}`,
+            label: item.label,
+            shortcut: item.shortcut,
+            separatorBefore: item.separatorBefore,
+            disabled: Boolean(item.requiresInternalSource && !internalClipboard.current),
+            action: () => item.opensDialog ? setPasteSpecialOpen(true) : void pasteSelection(item.preset ? PASTE_SPECIAL_PRESETS[item.preset] : undefined),
+          })),
+        },
+        { id: 'edit-clear', label: 'Delete values', shortcut: 'Delete', separatorBefore: true, icon: <Eraser size={13} />, action: clearSelection },
+        { id: 'edit-delete-cells', label: 'Delete cells…', shortcut: 'Ctrl+-', icon: <Trash2 size={13} />, action: () => openShiftDialog('delete') },
+        { id: 'edit-select-all', label: 'Select all', shortcut: 'Ctrl+A', separatorBefore: true, icon: <Grid2X2 size={13} />, action: () => selectAllSheet() },
+        { id: 'edit-find', label: 'Find', shortcut: 'Ctrl+F', separatorBefore: true, icon: <Search size={13} />, action: openSearch },
+        { id: 'edit-replace', label: 'Find and replace', shortcut: 'Ctrl+H', icon: <Replace size={13} />, action: openReplace },
+        {
+          id: 'edit-go-to', label: 'Go to…', shortcut: 'Ctrl+G', action: () => {
+            window.requestAnimationFrame(() => {
+              const nameBox = document.querySelector<HTMLInputElement>('.name-box')
+              nameBox?.focus()
+              nameBox?.select()
+            })
+          },
+        },
       ],
     },
     {
@@ -7120,8 +9310,10 @@ export default function App() {
             { id: 'view-show-formula-bar', label: 'Formula bar', checked: showFormulaBar, action: () => setShowFormulaBar((value) => !value) },
             { id: 'view-show-gridlines', label: 'Gridlines', checked: gridlinesVisible, action: toggleGridlines },
             { id: 'view-show-notes', label: 'Note indicators', checked: showNotes, action: () => setShowNotes((value) => !value) },
+            { id: 'view-show-page-breaks', label: 'Page breaks', checked: showPageBreaks, action: () => setShowPageBreaks((value) => !value) },
           ],
         },
+        { id: 'view-page-break-preview', label: 'Page break preview', checked: pageBreakPreview, action: () => setPageBreakPreview((value) => !value) },
         {
           id: 'view-freeze', label: 'Freeze', icon: <Square size={13} />, children: [
             {
@@ -7156,8 +9348,9 @@ export default function App() {
         { id: 'view-hide-sheet', label: 'Hide current sheet', action: hideActiveSheet },
         { id: 'view-fit-width', label: 'Fit data width', action: () => fitSheetView('width') },
         { id: 'view-fit-sheet', label: 'Fit sheet', action: () => fitSheetView('sheet') },
+        { id: 'view-zoom-selection', label: 'Zoom to selection', icon: <ZoomIn size={13} />, action: () => fitSheetView('selection') },
         {
-          id: 'view-zoom', label: 'Zoom', separatorBefore: true, children: [50, 75, 90, 100, 125, 150, 200].map((percent) => ({
+          id: 'view-zoom', label: 'Zoom', shortcut: 'Ctrl+wheel', separatorBefore: true, children: [50, 75, 90, 100, 125, 150, 200, 300, 400].map((percent) => ({
             id: `zoom-${percent}`,
             label: `${percent}%`,
             checked: Math.round(zoom * 100) === percent,
@@ -7306,7 +9499,7 @@ export default function App() {
         { id: 'data-named-ranges', label: 'Named ranges…', shortcut: 'Ctrl+F3', icon: <Tag size={13} />, action: () => setNameManagerOpen(true) },
         { id: 'data-sort-asc', label: 'Sort range A→Z', separatorBefore: true, icon: <ArrowDownAZ size={13} />, action: () => sortSelectionRange('asc') },
         { id: 'data-sort-desc', label: 'Sort range Z→A', icon: <ArrowUpZA size={13} />, action: () => sortSelectionRange('desc') },
-        { id: 'data-sort-custom', label: 'Custom sort…', action: () => setSortDialogOpen(true) },
+        { id: 'data-sort-custom', label: 'Custom sort…', action: () => { void openSortDialog() } },
         { id: 'data-filter', label: activeFilter ? 'Remove filter' : 'Create a filter', shortcut: 'Ctrl+Shift+L', separatorBefore: true, icon: activeFilter ? <FilterX size={13} /> : <Filter size={13} />, action: toggleFilter },
         { id: 'data-filter-reapply', label: 'Reapply filter', disabled: !filterTargets.length, action: () => reapplyFilter(false) },
         { id: 'data-filter-clear', label: 'Clear filter criteria', disabled: !filterTargets.length, action: () => reapplyFilter(true) },
@@ -7366,17 +9559,97 @@ export default function App() {
             { id: 'audit-precedents', label: 'Trace precedents', action: () => traceCells('precedents') },
             { id: 'audit-dependents', label: 'Trace dependents', action: () => traceCells('dependents') },
             { id: 'audit-remove', label: 'Remove arrows', separatorBefore: true, disabled: !traceState, action: () => setTraceState(null) },
+            { id: 'audit-circular', label: circularTarget ? `Go to circular reference (${circularLabel})` : 'No circular references', separatorBefore: true, disabled: !circularTarget, action: goToCircularReference },
           ],
         },
+        {
+          // Excel's Formulas > Calculation Options; Sheets' Settings > Calculation.
+          id: 'tools-calculation', label: 'Calculation', icon: <Calculator size={13} />, children: [
+            { id: 'calc-automatic', label: 'Automatic', checked: calculationOptions?.mode !== 'manual', action: () => setCalculationOption({ mode: 'automatic' }) },
+            { id: 'calc-manual', label: 'Manual', checked: calculationOptions?.mode === 'manual', action: () => setCalculationOption({ mode: 'manual' }) },
+            { id: 'calc-now', label: 'Calculate now', shortcut: 'F9', separatorBefore: true, action: () => recalculate('changed') },
+            { id: 'calc-sheet', label: 'Calculate sheet', shortcut: 'Shift+F9', action: () => recalculate('sheet') },
+            { id: 'calc-all', label: 'Recalculate everything', shortcut: 'Ctrl+Alt+F9', action: () => recalculate('all') },
+            { id: 'calc-iterative', label: 'Iterative calculation', checked: Boolean(calculationOptions?.iterate), separatorBefore: true, action: () => setCalculationOption({ iterate: !calculationOptions?.iterate }) },
+            { id: 'calc-options', label: 'Calculation options…', action: () => setCalcOptionsOpen(true) },
+          ],
+        },
+        { id: 'tools-autocomplete', label: 'Autocomplete', checked: autoCompleteEnabled, action: toggleAutoComplete },
         { id: 'tools-paste-values', label: 'Paste values only', shortcut: 'Ctrl+Shift+V', action: () => { void pasteSelection(PASTE_SPECIAL_PRESETS.values) } },
         { id: 'tools-find', label: 'Find in this sheet', shortcut: 'Ctrl+F', separatorBefore: true, icon: <Search size={13} />, action: openSearch },
         { id: 'tools-replace', label: 'Find and replace', shortcut: 'Ctrl+H', icon: <Replace size={13} />, action: openReplace },
         { id: 'tools-show-formulas', label: 'Show formulas', shortcut: 'Ctrl+~', checked: showFormulas, icon: <FunctionSquare size={13} />, action: () => setShowFormulas((value) => !value) },
       ],
     },
+    {
+      id: 'help',
+      label: 'Help',
+      items: [
+        { id: 'help-shortcuts', label: 'Keyboard shortcuts', shortcut: 'Ctrl+/', icon: <Keyboard size={13} />, action: () => setShortcutsOpen(true) },
+        { id: 'help-search-menus', label: 'Search the menus', shortcut: 'Alt+/', icon: <Search size={13} />, action: () => setMenuSearchRequest((value) => value + 1) },
+        {
+          id: 'help-about', label: 'About simple_calc', separatorBefore: true, icon: <CircleHelp size={13} />, action: () => {
+            void window.simpleCalc.getVersion().catch(() => '').then((version) => informRef.current('simple_calc', `${version ? `Version ${version}. ` : ''}A spreadsheet editor that keeps your files on this computer: nothing is uploaded.`))
+          },
+        },
+      ],
+    },
+  ]
+  // Commands from the toolbar and the context menus, so the menu search finds them too.
+  const paletteCommands: SpreadsheetMenuDefinition[] = [
+    {
+      id: 'toolbar',
+      label: 'Toolbar',
+      items: [
+        { id: 'palette-paint-format', label: 'Paint format', icon: <Paintbrush size={13} />, action: () => startFormatPainter(false) },
+        { id: 'palette-currency', label: 'Format as currency', action: () => setNumberFormat('$#,##0.00') },
+        { id: 'palette-percent', label: 'Format as percent', action: () => setNumberFormat('0.00%') },
+        { id: 'palette-font-larger', label: 'Increase font size', action: () => applyStyle((style) => { style.font = { ...(style.font || {}), size: clamp((style.font?.size || activeStyle.font?.size || 11) + 1, 1, 409) } }) },
+        { id: 'palette-font-smaller', label: 'Decrease font size', action: () => applyStyle((style) => { style.font = { ...(style.font || {}), size: clamp((style.font?.size || activeStyle.font?.size || 11) - 1, 1, 409) } }) },
+        ...numberFormatMenuItems.map((item) => ({ ...item, id: `palette-${item.id}`, label: `Number format: ${item.label.trim().split(/\s{2,}/)[0]}` })),
+        { id: 'palette-zoom-in', label: 'Zoom in', shortcut: 'Ctrl+wheel', action: () => setZoom((value) => clamp(Math.round((value + 0.1) * 100) / 100, 0.1, 4)) },
+        { id: 'palette-zoom-out', label: 'Zoom out', action: () => setZoom((value) => clamp(Math.round((value - 0.1) * 100) / 100, 0.1, 4)) },
+        { id: 'palette-zoom-reset', label: 'Zoom to 100%', action: () => setZoom(1) },
+      ],
+    },
+    {
+      id: 'cell',
+      label: 'Cell',
+      items: [
+        { id: 'palette-insert-cells', label: 'Insert cells…', shortcut: 'Ctrl+Shift+=', action: () => openShiftDialog('insert') },
+        { id: 'palette-pick-list', label: 'Pick from drop-down list', shortcut: 'Alt+Down', action: openPickList },
+        ...(activeCell?.hyperlink ? [
+          { id: 'palette-open-link', label: 'Open link', shortcut: 'Alt+Enter', action: () => openHyperlink(activeCell.hyperlink!) },
+          { id: 'palette-remove-link', label: 'Remove link', action: () => applyLink({ sheetId: activeSheet.id, address: activeAddress }, null, '') },
+        ] : []),
+      ],
+    },
+    {
+      id: 'sheet',
+      label: 'Sheet',
+      items: [
+        { id: 'palette-rename-sheet', label: 'Rename sheet', icon: <Pencil size={13} />, action: () => { void renameSheet(activeSheet.id) } },
+        { id: 'palette-duplicate-sheet', label: 'Duplicate sheet', icon: <Copy size={13} />, action: duplicateActiveSheet },
+        { id: 'palette-delete-sheet', label: 'Delete sheet', icon: <Trash2 size={13} />, action: () => { void deleteActiveSheet() } },
+        { id: 'palette-next-sheet', label: 'Next sheet', shortcut: 'Ctrl+PageDown', action: () => switchSheetBy(1) },
+        { id: 'palette-previous-sheet', label: 'Previous sheet', shortcut: 'Ctrl+PageUp', action: () => switchSheetBy(-1) },
+      ],
+    },
   ]
   const contextMenuItems: SpreadsheetMenuItem[] = (() => {
     if (!contextMenu) return []
+    if (contextMenu.kind === 'autofill') {
+      // Excel's Auto Fill Options: redo the last fill another way (it is replaced in place).
+      const state = autofillMenu
+      if (!state) return []
+      return state.options.map((mode, index) => ({
+        id: `autofill-${mode}`,
+        label: AUTOFILL_MODE_LABELS[mode as Exclude<AutofillMode, 'auto' | 'toggle'>] || mode,
+        checked: state.applied === mode,
+        separatorBefore: index === 4,
+        action: () => rerunAutofill(mode),
+      }))
+    }
     if (contextMenu.kind === 'image') {
       const imageId = contextMenu.imageId
       const image = activeSheet.images?.find((item) => item.id === imageId)
@@ -7523,6 +9796,15 @@ export default function App() {
         { id: 'context-table-convert', label: 'Convert to range', separatorBefore: true, action: () => convertActiveTable(activeTable.id) },
       ],
     }] : []
+    // Excel's Open / Edit / Remove Hyperlink, and Pick From Drop-down List.
+    const linkItems: SpreadsheetMenuItem[] = activeCell?.hyperlink
+      ? [
+        { id: 'context-open-link', label: 'Open link', shortcut: 'Alt+Enter', separatorBefore: true, icon: <Link size={13} />, action: () => openHyperlink(activeCell.hyperlink!) },
+        { id: 'context-edit-link', label: 'Edit link…', shortcut: 'Ctrl+K', action: () => { void insertLink() } },
+        { id: 'context-remove-link', label: 'Remove link', action: () => applyLink({ sheetId: activeSheet.id, address: activeAddress }, null, '') },
+      ]
+      : [{ id: 'context-insert-link', label: 'Insert link…', shortcut: 'Ctrl+K', separatorBefore: true, icon: <Link size={13} />, action: () => { void insertLink() } }]
+    const pickItem: SpreadsheetMenuItem = { id: 'context-pick-list', label: 'Pick from drop-down list…', shortcut: 'Alt+Down', action: openPickList }
     return [
       ...clipboardItems,
       ...insertRowItems,
@@ -7533,19 +9815,21 @@ export default function App() {
       ...sortItems,
       ...sparklineItems,
       ...tableItems,
+      ...linkItems,
+      pickItem,
       ...formatItems,
     ]
   })()
   return (
     <div className={`app-root workbook-app${immersive ? ' is-fullscreen' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
       {titleBar}
-      <SpreadsheetMenus menus={menuDefinitions} />
+      <SpreadsheetMenus menus={menuDefinitions} extraCommands={paletteCommands} searchRequest={menuSearchRequest} />
       <CommandBar
         leading={<>
           <IconButton label="New spreadsheet" onClick={() => { void newWorkbook() }}><FilePlus2 size={16} /></IconButton>
           <IconButton label="Open spreadsheet (Ctrl+O)" onClick={() => { void openWorkbook() }}><FolderOpen size={16} /></IconButton>
           <button type="button" className="save-command" onClick={() => { void saveWorkbook(false) }} title="Save (Ctrl+S)"><Save size={16} /><span>Save</span></button>
-          <IconButton label="Export As (Ctrl+Shift+E) — XLSX, ODS, CSV, TSV, PDF, or HTML" onClick={() => setExportOpen(true)}><Download size={16} /></IconButton>
+          <IconButton label="Export As (Ctrl+Shift+E) — XLSX, ODS, CSV, TSV, PDF, or HTML" onClick={() => { if (flushPendingEditsRef.current()) setExportOpen(true) }}><Download size={16} /></IconButton>
           <IconButton label="Print (Ctrl+P)" onClick={openPrintDialog}><Printer size={16} /></IconButton>
         </>}
         groups={[
@@ -7567,10 +9851,11 @@ export default function App() {
           },
           {
             id: 'zoom',
-            content: <select className="toolbar-zoom-select" aria-label="Zoom" value={Math.round(zoom * 100)} onChange={(event) => event.target.value === 'fit-width' ? fitSheetView('width') : event.target.value === 'fit-sheet' ? fitSheetView('sheet') : setZoom(Number(event.target.value) / 100)}>
-              {[...new Set([50, 75, 90, 100, 125, 150, 200, Math.round(zoom * 100)])].sort((a, b) => a - b).map((percent) => <option key={percent} value={percent}>{percent}%</option>)}
+            content: <select className="toolbar-zoom-select" aria-label="Zoom" value={Math.round(zoom * 100)} onChange={(event) => event.target.value === 'fit-width' ? fitSheetView('width') : event.target.value === 'fit-sheet' ? fitSheetView('sheet') : event.target.value === 'fit-selection' ? fitSheetView('selection') : setZoom(Number(event.target.value) / 100)}>
+              {[...new Set([50, 75, 90, 100, 125, 150, 200, 300, 400, Math.round(zoom * 100)])].sort((a, b) => a - b).map((percent) => <option key={percent} value={percent}>{percent}%</option>)}
               <option value="fit-width">Fit data width</option>
               <option value="fit-sheet">Fit sheet</option>
+              <option value="fit-selection">Zoom to selection</option>
             </select>,
           },
           {
@@ -7750,7 +10035,7 @@ export default function App() {
               event.preventDefault()
               setNameBoxDraft(null)
               setNameBoxInvalid(false)
-              event.currentTarget.blur()
+              document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
             }
           }}
           onBlur={() => setNameBoxDraft(null)}
@@ -7804,9 +10089,39 @@ export default function App() {
               if (toggled) updateActiveFormulaDraft(toggled.text, toggled.selectionStart, toggled.selectionEnd)
               return
             }
-            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.altKey) { event.preventDefault(); formulaBarDirtyRef.current = null; fillSelectionWithDraft(formulaDraft); document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true }); return }
-            if (event.key === 'Enter' && !event.altKey) { event.preventDefault(); formulaBarDirtyRef.current = null; commitCell(activeAddress, formulaDraft); moveSelection(event.shiftKey ? -1 : 1, 0); document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true }) }
-            else if (event.key === 'Escape') { formulaBarDirtyRef.current = null; setFormulaDraft(rawCellValue(activeCell)); event.currentTarget.blur() }
+            // Alt+Enter starts a new line in the entry, as in Excel (the browser adds none).
+            if (event.key === 'Enter' && event.altKey && !event.ctrlKey && !event.metaKey) {
+              event.preventDefault()
+              const start = event.currentTarget.selectionStart
+              updateActiveFormulaDraft(`${formulaDraft.slice(0, start)}\n${formulaDraft.slice(event.currentTarget.selectionEnd)}`, start + 1)
+              return
+            }
+            // The formula bar commits exactly like the cell editor: validated, then the
+            // keyboard returns to the grid (Esc too, instead of leaving focus on <body>).
+            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.altKey) {
+              event.preventDefault()
+              formulaBarDirtyRef.current = null
+              const origin = selection.focus
+              const address = activeAddress
+              document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
+              commitWithValidation(address, formulaDraft, (accepted) => fillSelectionWithDraft(accepted, origin), true)
+              return
+            }
+            if (event.key === 'Enter' && !event.altKey) {
+              event.preventDefault()
+              formulaBarDirtyRef.current = null
+              const backwards = event.shiftKey
+              const draft = formulaDraft
+              const address = activeAddress
+              document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
+              const advance = () => advanceAfterEntry('enter', backwards)
+              if (commitWithValidation(address, draft, undefined, { afterAccept: advance })) advance()
+            } else if (event.key === 'Escape') {
+              event.preventDefault()
+              formulaBarDirtyRef.current = null
+              setFormulaDraft(rawCellValue(activeCell))
+              document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
+            }
           }}
           onBlur={() => {
             if (formulaInputRef.current === 'bar') {
@@ -7819,7 +10134,7 @@ export default function App() {
             const pending = formulaBarDirtyRef.current
             if (!pending) return
             formulaBarDirtyRef.current = null
-            if (pending.sheetId === workbookRef.current?.activeSheetId) commitCell(pending.address, pending.draft)
+            if (pending.sheetId === workbookRef.current?.activeSheetId) commitWithValidation(pending.address, pending.draft)
           }}
         />
         {(editing && formulaInput !== 'bar' ? editorParts : formulaBarParts) && (
@@ -7847,7 +10162,11 @@ export default function App() {
               }}
             />
             <span className="search-count" aria-live="polite">
-              {searchQuery.trim() ? (searchMatches.length ? `${searchIndex + 1} of ${searchMatches.length}` : 'No matches') : 'Type to search'}
+              {searchQuery.trim()
+                ? (searchMatches.length
+                  ? (searchIndex >= 0 ? `${searchIndex + 1} of ${searchMatches.length}` : `${searchMatches.length} ${searchMatches.length === 1 ? 'match' : 'matches'}`)
+                  : 'No matches')
+                : 'Type to search'}
             </span>
             <button type="button" aria-label="Previous match" title="Previous match (Shift+Enter)" disabled={!searchMatches.length} onClick={() => moveSearch(-1)}>↑</button>
             <button type="button" aria-label="Next match" title="Next match (Enter)" disabled={!searchMatches.length} onClick={() => moveSearch(1)}>↓</button>
@@ -7895,21 +10214,36 @@ export default function App() {
         staleValue={staleValue}
         onSelection={handleGridSelection}
         onBeginEdit={beginEdit}
-        onDraft={(draft) => {
+        onDraft={(draft, input) => {
           pointRef.current = null
           setAssistDismissed(false)
+          if (formulaProblem) setFormulaProblem(null)
+          const completion = autoCompleteFor(editingRef.current?.address, draft, input)
+          if (completion) {
+            // AutoComplete: the rest of a matching column entry, selected so typing replaces it.
+            setEditing((current) => current ? { ...current, draft: completion.text } : current)
+            selectionRequestIdRef.current += 1
+            setEditorSelectionRequest({ start: completion.start, end: completion.text.length, id: selectionRequestIdRef.current })
+            return
+          }
           setEditing((current) => current ? { ...current, draft } : current)
         }}
         onCommitEdit={(direction) => {
-          if (editing && !commitWithValidation(editing.address, editing.draft)) return
-          if (direction === 'down') moveSelection(1, 0)
-          else if (direction === 'up') moveSelection(-1, 0)
-          else if (direction === 'right') moveSelection(0, 1)
-          else if (direction === 'left') moveSelection(0, -1)
+          // Enter/Shift+Enter arrive as down/up, Tab/Shift+Tab as right/left, a blur as none.
+          // Keyed entries are checked for formula problems; a click away enters them as typed.
+          const advance = () => {
+            if (direction === 'down' || direction === 'up') advanceAfterEntry('enter', direction === 'up')
+            else if (direction === 'right' || direction === 'left') advanceAfterEntry('tab', direction === 'left')
+          }
+          if (!commitEditor(undefined, direction !== undefined && { afterAccept: advance })) return
+          advance()
         }}
-        onCancelEdit={() => setEditing(null)}
+        onCancelEdit={() => { editingRef.current = null; setEditing(null) }}
         onFill={autofillSelection}
-        onCellValue={setCellValue}
+        onFillDoubleClick={fillToAdjacentData}
+        autofillOptions={autofillMenu && autofillMenu.sheetId === activeSheet.id ? autofillMenu.filled : null}
+        onAutofillOptions={(position) => setContextMenu({ kind: 'autofill', x: position.x, y: position.y })}
+        onCellValue={setGridCellValue}
         onOpenHyperlink={openHyperlink}
         onColumnResize={resizeColumn}
         onRowResize={resizeRow}
@@ -7942,7 +10276,10 @@ export default function App() {
             : null
         })()}
         invalidCells={invalidCells}
-        cutRange={cutRange && cutRange.sheetId === activeSheet.id ? cutRange : null}
+        clipboardRange={clipboardRange && clipboardRange.sheetId === activeSheet.id ? clipboardRange : null}
+        scrollRequest={scrollRequest}
+        scrollMemory={sheetScrollRef.current}
+        documentKey={documentFile?.documentId}
         renderCharts={activeSheet.charts?.length || activeSheet.images?.length || traceState?.sheetId === activeSheet.id ? (geometry, viewport, geometryVersion) => (<>
           {traceState?.sheetId === activeSheet.id ? <TraceArrowLayer arrows={traceState.arrows} geometry={geometry} /> : null}
           {activeSheet.images?.length ? (
@@ -7974,10 +10311,26 @@ export default function App() {
           /> : null}
         </>) : undefined}
         listOptionsFor={listOptionsFor}
+        onOpenDropdown={openListFor}
+        onMoveCells={moveCells}
+        pagePreview={pagePreviewOverlay}
         sparklineFor={sparklineFor}
         outline={outlineState}
         onOutlineToggle={(axis, group) => updateOutline((sheet) => toggleGroup(sheet, axis, group))}
         onOutlineLevel={(axis, level) => updateOutline((sheet) => showOutlineLevel(sheet, axis, level))}
+        errorTip={(() => {
+          // The selected error cell explains itself (the engine names an unknown function).
+          if (editing || rangePick || !calcEngine) return null
+          const value = calcEngine.getValue(activeSheet.id, activeAddress)
+          if (!isFormulaError(value)) return null
+          const unreadable = value === '#NAME?' || value === '#PARSE!' || String(value) === '#ERROR!'
+          const help = formulaErrorHelp(value, unreadable && activeCell?.formula ? calcEngine.diagnose(activeSheet.id, activeAddress)?.message : null)
+          const coord = coordOf(activeAddress)
+          return help && coord ? { row: coord.row, col: coord.col, ...help } : null
+        })()}
+        editorNote={formulaProblem && editing && formulaProblem.address === editing.address && formulaProblem.sheetId === activeSheet.id ? formulaProblem : null}
+        pageBreaks={pageBreakOverlay}
+        onZoomRequest={setZoom}
       />
       {activePivot && pivotEditorHidden !== activePivot.id && !chartEditorId && (
         <PivotEditorPanel
@@ -8022,6 +10375,7 @@ export default function App() {
             onChange={(next) => updateChart({ ...next, modified: true })}
             onClose={() => setChartEditorId(null)}
             onDelete={() => deleteChart(chart.id)}
+            onPickRange={startRangePick}
           />
         )
       })()}
@@ -8070,15 +10424,17 @@ export default function App() {
                 moveSheet(dragged, workbook.sheets.findIndex((item) => item.id === sheet.id))
               }}
               onDragEnd={() => setTabDropTarget(null)}
-              onClick={() => activateSheet(sheet.id)}
+              onClick={() => {
+                activateSheet(sheet.id)
+                // The keyboard stays on the sheet, as in Excel: arrows and typing work at once.
+                window.requestAnimationFrame(() => {
+                  if (!document.querySelector('[aria-modal="true"]')) document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
+                })
+              }}
               onDoubleClick={() => { void renameSheet(sheet.id) }}
               onContextMenu={(event) => {
                 event.preventDefault()
-                if (workbook.activeSheetId !== sheet.id) {
-                  setWorkbook((current) => current ? { ...current, activeSheetId: sheet.id } : current)
-                  setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
-                  setEditing(null)
-                }
+                if (workbook.activeSheetId !== sheet.id) activateSheet(sheet.id)
                 setContextMenu({ kind: 'sheet-tab', sheetId: sheet.id, x: event.clientX, y: event.clientY })
               }}
               title={sheetProtection(sheet) ? 'Protected sheet · double-click to rename · drag to reorder' : 'Double-click to rename · drag to reorder'}
@@ -8093,7 +10449,10 @@ export default function App() {
       </div>
 
       <footer className="statusbar">
-        <div className="status-left"><span className="ready-dot" /> <span>{dirty ? 'Unsaved changes' : 'Ready'}</span><span className="status-divider" /><span>{workbook.sheets.length} {workbook.sheets.length === 1 ? 'sheet' : 'sheets'}</span>{activeCell?.formula && <><span className="status-divider" /><span>Formula</span></>}{activeProtection && <><span className="status-divider" /><span className="status-protected"><Lock size={11} aria-hidden="true" /> Protected</span></>}</div>
+        <div className="status-left"><span className="ready-dot" /> <span>{dirty ? 'Unsaved changes' : 'Ready'}</span><span className="status-divider" /><span>{workbook.sheets.length} {workbook.sheets.length === 1 ? 'sheet' : 'sheets'}</span>{activeCell?.formula && <><span className="status-divider" /><span>Formula</span></>}{activeProtection && <><span className="status-divider" /><span className="status-protected"><Lock size={11} aria-hidden="true" /> Protected</span></>}
+          {calcEngine?.needsRecalculation && <><span className="status-divider" /><button type="button" className="status-action is-calculate" data-status-calculate title="Manual calculation: formulas have changed. Calculate now (F9)" onMouseDown={(event) => event.preventDefault()} onClick={() => recalculate('changed')}><Calculator size={11} aria-hidden="true" />Calculate</button></>}
+          {circularTarget && <><span className="status-divider" /><button type="button" className="status-action is-warning" data-circular-reference={circularLabel} title="A formula refers to its own cell. Click to go there." onMouseDown={(event) => event.preventDefault()} onClick={goToCircularReference}><CircleAlert size={11} aria-hidden="true" />Circular references: {circularLabel}</button></>}
+        </div>
         <div className="status-right">
           {selectionStats.selected > 1 && (
             <div
@@ -8119,9 +10478,9 @@ export default function App() {
             </div>
           )}
           <div className="zoom-control">
-            <button type="button" aria-label="Zoom out" onClick={() => setZoom((value) => clamp(value - 0.1, 0.1, 2))}><Minus size={13} /></button>
-            <input type="range" min="10" max="200" step="1" value={Math.round(zoom * 100)} aria-label="Zoom" onChange={(event) => setZoom(Number(event.target.value) / 100)} />
-            <button type="button" aria-label="Zoom in" onClick={() => setZoom((value) => clamp(value + 0.1, 0.1, 2))}><Plus size={13} /></button>
+            <button type="button" aria-label="Zoom out" onClick={() => setZoom((value) => clamp(Math.round((value - 0.1) * 100) / 100, 0.1, 4))}><Minus size={13} /></button>
+            <input type="range" min="10" max="400" step="1" value={Math.round(zoom * 100)} aria-label="Zoom" onChange={(event) => setZoom(Number(event.target.value) / 100)} />
+            <button type="button" aria-label="Zoom in" onClick={() => setZoom((value) => clamp(Math.round((value + 0.1) * 100) / 100, 0.1, 4))}><Plus size={13} /></button>
             <span>{Math.round(zoom * 100)}%</span>
           </div>
         </div>
@@ -8131,12 +10490,12 @@ export default function App() {
         <SpreadsheetContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
-          label={contextMenu.kind === 'image' ? 'Picture menu' : contextMenu.kind === 'status' ? 'Status bar statistics' : contextMenu.kind === 'sheet-tab' ? 'Sheet menu' : contextMenu.kind === 'row-header' ? 'Row menu' : contextMenu.kind === 'column-header' ? 'Column menu' : contextMenu.kind === 'corner' ? 'All cells menu' : 'Cell menu'}
+          label={contextMenu.kind === 'autofill' ? 'Auto Fill Options' : contextMenu.kind === 'image' ? 'Picture menu' : contextMenu.kind === 'status' ? 'Status bar statistics' : contextMenu.kind === 'sheet-tab' ? 'Sheet menu' : contextMenu.kind === 'row-header' ? 'Row menu' : contextMenu.kind === 'column-header' ? 'Column menu' : contextMenu.kind === 'corner' ? 'All cells menu' : 'Cell menu'}
           items={contextMenuItems}
           onClose={closeContextMenu}
         />
       )}
-      {textPrompt && <TextPromptDialog key={textPrompt.id} request={textPrompt} onClose={(value) => { setTextPrompt(null); textPrompt.resolve(value) }} />}
+      {textPrompt && <TextPromptDialog key={textPrompt.id} request={textPrompt} onClose={(value) => { setTextPrompt(null); textPrompt.resolve(value); restoreGridFocusRef.current() }} />}
       {formatDialogTab && (
         <FormatCellsDialog
           initialTab={formatDialogTab}
@@ -8165,6 +10524,7 @@ export default function App() {
             sortDirection={target.state.sort?.column === offset ? (target.state.sort.descending ? 'desc' : 'asc') : null}
             onApply={(criteria) => { applyFilterCriteria(target.key, filterMenu.col, criteria); setFilterMenu(null) }}
             onSort={(descending) => { sortFilterColumn(target.key, filterMenu.col, descending); setFilterMenu(null) }}
+            onSortByColor={(choice) => { sortFilterColumnByColor(target.key, filterMenu.col, choice); setFilterMenu(null) }}
             onClose={() => setFilterMenu(null)}
           />
         )
@@ -8219,19 +10579,18 @@ export default function App() {
           onClose={() => { setTableDialog(null); window.requestAnimationFrame(() => document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })) }}
         />
       )}
-      {sortDialogOpen && (() => {
-        const selected = selectionBounds(selection)
-        const region = (selected.top === selected.bottom && selected.left === selected.right ? filterRangeForSelection(activeSheet, selected, selection.focus) : selected) || selected
+      {sortDialog && (() => {
+        const region = sortDialog.region
         const host = dataHostFor(activeSheet)
         return (
           <SortDialog
             rangeLabel={rangeAddress(region)}
-            initialHasHeader={detectHeaderRow(region, host)}
+            initialHasHeader={sortDialog.hasHeader ?? detectHeaderRow(region, host)}
             initialLevels={[{ key: clamp(selection.focus.col - region.left, 0, region.right - region.left) }]}
             labelsFor={(orientation, hasHeader) => sortKeyLabels(region, orientation, hasHeader, host)}
             colorsFor={(orientation, key, sortOn, hasHeader) => sortKeyColors(region, orientation, key, sortOn, hasHeader, host)}
             onSort={runCustomSort}
-            onClose={() => setSortDialogOpen(false)}
+            onClose={() => setSortDialog(null)}
           />
         )
       })()}
@@ -8306,8 +10665,12 @@ export default function App() {
       })()}
       {pasteSpecialOpen && (
         <PasteSpecialDialog
-          sourceLabel={internalClipboard.current ? `${rangeAddress({ top: internalClipboard.current.origin.row, left: internalClipboard.current.origin.col, bottom: internalClipboard.current.origin.row + internalClipboard.current.cells.length - 1, right: internalClipboard.current.origin.col + (internalClipboard.current.cells[0]?.length || 1) - 1 })} on ${internalClipboard.current.sheetName}` : 'Clipboard'}
-          canPasteLink={Boolean(internalClipboard.current)}
+          sourceLabel={internalClipboard.current ? (() => {
+            const clip = internalClipboard.current
+            const bottom = clip.sourceRows ? clip.sourceRows[clip.sourceRows.length - 1] : clip.origin.row + clip.cells.length - 1
+            return `${rangeAddress({ top: clip.origin.row, left: clip.origin.col, bottom, right: clip.origin.col + (clip.cells[0]?.length || 1) - 1 })}${clip.sourceRows ? ' (visible cells)' : ''} on ${clip.sheetName}`
+          })() : 'Clipboard'}
+          canPasteLink={Boolean(internalClipboard.current && !internalClipboard.current.sourceRows)}
           disabledPasteTypes={internalClipboard.current ? [] : ['validation']}
           onCancel={() => setPasteSpecialOpen(false)}
           onPaste={(options) => { setPasteSpecialOpen(false); void pasteSelection(options) }}
@@ -8360,7 +10723,87 @@ export default function App() {
           onClose={() => setPrintOpen(false)}
           onRenderPreview={renderPrintPreview}
           onPrint={printWorkbook}
+          pageSetup={menuPageSetup}
+          onPageSetupChange={changePageSetup}
+          onPreviewPages={setPreviewPageBreaks}
         />
+      )}
+      {linkDialog && linkDialog.sheetId === activeSheet.id && (() => {
+        const cell = activeSheet.cells[linkDialog.address]
+        const initialText = cell?.formula ? '' : displayValue(activeSheet.id, linkDialog.address)
+        return (
+          <InsertLinkDialog
+            initialTarget={cell?.hyperlink || null}
+            initialText={initialText}
+            textLocked={Boolean(cell?.formula)}
+            sheets={workbook.sheets.filter((sheet) => sheet.state !== 'hidden' && sheet.state !== 'veryHidden').map((sheet) => sheet.name)}
+            activeSheet={activeSheet.name}
+            names={[...definedNameList, ...tableNameList]}
+            defaultReference="A1"
+            workbookName={documentFile.name}
+            onApply={(result) => applyLink(linkDialog, result, initialText)}
+            onRemove={cell?.hyperlink ? () => applyLink(linkDialog, null, initialText) : undefined}
+            onClose={() => { setLinkDialog(null); restoreGridFocusRef.current() }}
+          />
+        )
+      })()}
+      {shortcutsOpen && <KeyboardShortcutsDialog onClose={() => { setShortcutsOpen(false); restoreGridFocusRef.current() }} />}
+      {calcOptionsOpen && calculationOptions && (
+        <CalculationOptionsDialog
+          options={calculationOptions}
+          onApply={(options) => { setCalcOptionsOpen(false); setCalculationOption(options); restoreGridFocusRef.current() }}
+          onClose={() => { setCalcOptionsOpen(false); restoreGridFocusRef.current() }}
+        />
+      )}
+      {pickList && pickList.sheetId === activeSheet.id && pickList.presentation && (
+        <ValidationDropdown
+          anchor={pickList.anchor}
+          options={pickList.items}
+          current={pickList.current || ''}
+          presentation={pickList.presentation}
+          label={pickList.label}
+          onPick={(value) => {
+            const list = pickList
+            setPickList(null)
+            pickListOption(list.address, value)
+            restoreGridFocusRef.current()
+          }}
+          onPickMany={(values) => {
+            // Several picks are one entry, "A, B" in list order (Sheets' multiple selections).
+            const list = pickList
+            setPickList(null)
+            const text = joinMultipleSelection(values, list.items)
+            if (text) commitWithValidation(list.address, text)
+            else pickListOption(list.address, '')
+            restoreGridFocusRef.current()
+          }}
+          onClose={() => { setPickList(null); restoreGridFocusRef.current() }}
+        />
+      )}
+      {pickList && pickList.sheetId === activeSheet.id && !pickList.presentation && (
+        <PickListPopover
+          anchor={pickList.anchor}
+          items={pickList.items}
+          label={pickList.label}
+          onPick={(value) => {
+            const list = pickList
+            setPickList(null)
+            if (list.fromValidation) pickListOption(list.address, value)
+            else commitWithValidation(list.address, value)
+            restoreGridFocusRef.current()
+          }}
+          onClose={() => { setPickList(null); restoreGridFocusRef.current() }}
+        />
+      )}
+      {rangePick && (
+        <div className="range-pick-bar" role="region" aria-label="Select a data range">
+          <SquareDashedMousePointer size={15} aria-hidden="true" />
+          <span>Select the data range on the sheet</span>
+          <code className="range-pick-ref" data-range-pick>{rangeAddress(bounds)}</code>
+          <small>Enter to use it · Esc to cancel</small>
+          <button type="button" className="primary-action" onMouseDown={(event) => event.preventDefault()} onClick={() => finishRangePick(true)}>OK</button>
+          <button type="button" className="secondary-action" onMouseDown={(event) => event.preventDefault()} onClick={() => finishRangePick(false)}>Cancel</button>
+        </div>
       )}
       {busy && <div className="busy-overlay"><div className="busy-card"><span className="spinner" />{busy}</div></div>}
       {toast && <div className="toast"><span>{toast}</span><button type="button" aria-label="Dismiss" onClick={() => setToast('')}><X size={13} /></button></div>}

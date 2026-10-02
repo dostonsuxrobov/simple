@@ -3,14 +3,14 @@ const {
   PDFArray,
   PDFDict,
   PDFName,
-  PDFNumber,
   PDFRawStream,
 } = require('pdf-lib')
+const { codedError } = require('./pdf-problems.cjs')
 
-const LATIN1 = new TextDecoder('latin1')
 const IDENTITY = [1, 0, 0, 1, 0, 0]
 const WHITESPACE = new Set([' ', '\t', '\r', '\n', '\f', '\0'])
 const DELIMITERS = new Set(['(', ')', '<', '>', '[', ']', '{', '}', '/', '%'])
+const SPACE = 0x20
 
 function multiplyMatrix(left, right) {
   return [
@@ -57,17 +57,58 @@ function readImageResourceNames(page) {
   return names
 }
 
-function readPageContent(page) {
+function contentStreamBytes(stream) {
+  if (stream instanceof PDFRawStream) return decodePDFRawStream(stream).decode()
+  // Streams created by pdf-lib in this session (drawn overlays) are not raw.
+  if (typeof stream?.getUnencodedContents === 'function') return stream.getUnencodedContents()
+  return null
+}
+
+/**
+ * The page's content as the exact decoded bytes, streams joined by a newline.
+ * Returns null when a stream cannot be decoded, so callers leave the page alone
+ * instead of rewriting it without that stream.
+ */
+function readPageContentBytes(page) {
   const contents = page.node.get(PDFName.of('Contents'))
-  if (!contents) return ''
+  if (!contents) return null
   const resolved = page.doc.context.lookup(contents)
   const streams = resolved instanceof PDFArray
     ? Array.from({ length: resolved.size() }, (_, index) => page.doc.context.lookup(resolved.get(index)))
     : [resolved]
-  return streams
-    .filter((stream) => stream instanceof PDFRawStream)
-    .map((stream) => LATIN1.decode(decodePDFRawStream(stream).decode()))
-    .join('\n')
+  const parts = []
+  for (const stream of streams) {
+    if (!stream) continue
+    let bytes
+    try { bytes = contentStreamBytes(stream) } catch { return null }
+    if (!bytes) return null
+    parts.push(bytes)
+  }
+  if (!parts.length) return null
+  const length = parts.reduce((total, part) => total + part.length, 0) + parts.length - 1
+  const joined = new Uint8Array(length)
+  let offset = 0
+  parts.forEach((part, index) => {
+    if (index) joined[offset++] = 0x0a
+    joined.set(part, offset)
+    offset += part.length
+  })
+  return joined
+}
+
+/**
+ * A one-character-per-byte view of content bytes. Node's 'latin1' is true
+ * ISO-8859-1; WHATWG TextDecoder('latin1') is windows-1252 and would remap
+ * 27 byte values between 0x80 and 0x9F, so string offsets equal byte offsets
+ * only with this conversion.
+ */
+function binaryString(bytes) {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1')
+}
+
+function readPageContent(page) {
+  const bytes = readPageContentBytes(page)
+  return bytes ? binaryString(bytes) : ''
 }
 
 function skipLiteralString(content, index) {
@@ -179,30 +220,91 @@ function listPageImageDraws(page) {
     .map(({ name, rect }) => ({ name, rect }))
 }
 
+function sameBytes(left, right) {
+  if (left.length !== right.length) return false
+  return Buffer.from(left.buffer, left.byteOffset, left.byteLength)
+    .equals(Buffer.from(right.buffer, right.byteOffset, right.byteLength))
+}
+
+/**
+ * Give the page its own /Resources and /XObject dictionaries before deleting
+ * an entry, so pages and forms sharing the original dictionaries keep it.
+ */
+function privateXObjectDictionary(page) {
+  const { context } = page.doc
+  const resources = page.node.Resources()
+  const xobjects = resources?.lookupMaybe(PDFName.of('XObject'), PDFDict)
+  if (!resources || !xobjects) return null
+  const ownResources = resources.clone(context)
+  const ownXObjects = xobjects.clone(context)
+  ownResources.set(PDFName.of('XObject'), ownXObjects)
+  page.node.set(PDFName.of('Resources'), ownResources)
+  return ownXObjects
+}
+
+/**
+ * Forget image resources whose last drawing was removed, so the pixels are not
+ * kept in the saved file. A form XObject without its own /Resources may draw
+ * through the page's resources, so the entries stay in that (rare) case.
+ */
+function dropUnusedImageResources(page, removedNames, remainingContent) {
+  if (!removedNames.size) return 0
+  const resources = page.node.Resources()
+  const xobjects = resources?.lookupMaybe(PDFName.of('XObject'), PDFDict)
+  if (!xobjects) return 0
+  for (const [key] of xobjects.entries()) {
+    const value = xobjects.lookup(key)
+    const dictionary = value instanceof PDFRawStream ? value.dict : value instanceof PDFDict ? value : null
+    if (dictionary?.get(PDFName.of('Subtype'))?.toString() === '/Form' && !dictionary.has(PDFName.of('Resources'))) return 0
+  }
+  const stillDrawn = new Set(walkImageDraws(remainingContent, removedNames).map((hit) => hit.name))
+  const unused = [...removedNames].filter((name) => !stillDrawn.has(name))
+  if (!unused.length) return 0
+  const ownXObjects = privateXObjectDictionary(page)
+  if (!ownXObjects) return 0
+  for (const name of unused) ownXObjects.delete(PDFName.of(name))
+  return unused.length
+}
+
 /**
  * Remove only image-XObject invocations whose painted rectangle matches a
  * selected native image. Shared image resources remain available to every
- * other invocation on the page.
+ * other invocation on the page. All other content bytes are kept exactly:
+ * text in single-byte encodings, CID strings and inline image data included.
  */
 function removePageImageDraws(page, targets, tolerance = 2) {
   if (!Array.isArray(targets) || !targets.length) return 0
-  const content = readPageContent(page)
-  if (!content) return 0
-  const hits = walkImageDraws(content, readImageResourceNames(page))
+  const bytes = readPageContentBytes(page)
+  if (!bytes) return 0
+  const content = binaryString(bytes)
+  const imageNames = readImageResourceNames(page)
+  const hits = walkImageDraws(content, imageNames)
     .filter((hit) => targets.some((target) => rectsMatch(hit.rect, target, tolerance)))
   if (!hits.length) return 0
 
-  const characters = content.split('')
-  for (const hit of hits) {
-    for (let index = hit.start; index < hit.end; index += 1) characters[index] = ' '
+  const edited = Uint8Array.from(bytes)
+  for (const hit of hits) edited.fill(SPACE, hit.start, hit.end)
+  // Bytes outside the blanked operators must survive compression unchanged.
+  for (let index = 0, hit = 0; index < bytes.length; index += 1) {
+    while (hit < hits.length && hits[hit].end <= index) hit += 1
+    const blanked = hit < hits.length && index >= hits[hit].start && index < hits[hit].end
+    if (!blanked && edited[index] !== bytes[index]) {
+      throw codedError('CONTENT_REWRITE_MISMATCH', 'An image could not be removed without changing other page content.')
+    }
   }
-  const stream = page.doc.context.flateStream(characters.join(''))
+  const stream = page.doc.context.flateStream(edited)
+  if (!sameBytes(decodePDFRawStream(stream).decode(), edited)) {
+    throw codedError('CONTENT_REWRITE_MISMATCH', 'An image could not be removed without changing other page content.')
+  }
   page.node.set(PDFName.of('Contents'), page.doc.context.register(stream))
+  dropUnusedImageResources(page, new Set(hits.map((hit) => hit.name)), binaryString(edited))
   return hits.length
 }
 
 module.exports = {
+  binaryString,
   listPageImageDraws,
+  readPageContentBytes,
   removePageImageDraws,
   transformedUnitRect,
 }

@@ -42,6 +42,23 @@ export interface DataValidationModel {
   error?: string
   /** OOXML semantics: true HIDES the in-cell dropdown arrow of a list. */
   showDropDown?: boolean
+  /** Simple's own dropdown options for a list (Sheets' chip style, option colours, multiple picks). */
+  simpleDropdown?: DropdownExtension
+}
+
+/** How a list's in-cell dropdown looks: Excel's arrow on the active cell, or Sheets' chips. */
+export type DropdownDisplayStyle = 'arrow' | 'chip'
+
+/**
+ * Sheets-style dropdown settings kept on a list rule beside the OOXML fields. Excel has no
+ * equivalent, so a rule without them behaves exactly as in Excel.
+ */
+export interface DropdownExtension {
+  style?: DropdownDisplayStyle
+  /** Chip colour per option (matched case-insensitively), as #rgb or #rrggbb. */
+  colors?: Record<string, string>
+  /** Several options per cell, stored as "A, B" (Sheets' "Allow multiple selections"). */
+  multiple?: boolean
 }
 
 export interface ValidationMessage { title: string; text: string; style: ValidationErrorStyle }
@@ -192,7 +209,7 @@ export function literalListItems(formula: unknown): string[] | null {
 }
 
 /** Every entry of a list rule's source, in order (literal items, or the referenced cells). */
-export function listSourceEntries(validation: DataValidationModel, host: DataHost, target: ValidationTarget = { row: 0, col: 0 }): Array<{ value: Scalar; text: string }> {
+export function listSourceEntries(validation: DataValidationModel, host: DataHost, target: ValidationTarget = { row: 0, col: 0 }): Array<{ value: Scalar; text: string; numFmt?: string }> {
   if (validation.type !== 'list') return []
   const source = validation.formulae?.[0]
   const literal = literalListItems(source)
@@ -207,16 +224,36 @@ export function listSourceEntries(validation: DataValidationModel, host: DataHos
   const { sheet, ref } = splitSheetPrefix(shifted)
   const bounds = sheet === null ? parseRange(ref) : null
   if (!bounds) return []
-  const entries: Array<{ value: Scalar; text: string }> = []
+  const entries: Array<{ value: Scalar; text: string; numFmt?: string }> = []
   const cells = (bounds.bottom - bounds.top + 1) * (bounds.right - bounds.left + 1)
   if (cells > MAX_REFERENCE_CELLS) return []
   for (let row = bounds.top; row <= bounds.bottom; row += 1) {
     for (let col = bounds.left; col <= bounds.right; col += 1) {
       const value = host.valueAt(row, col)
-      entries.push({ value: value ?? null, text: host.displayAt(row, col) })
+      const cell = host.cellAt?.(row, col)
+      const numFmt = cell?.numFmt || cell?.style?.numFmt
+      entries.push({ value: value ?? null, text: host.displayAt(row, col), ...(numFmt ? { numFmt } : {}) })
     }
   }
   return entries
+}
+
+/**
+ * What picking `option` from a cell's dropdown stores, as Excel and Sheets treat a pick like
+ * typing the entry: for a list read from cells, that cell's own value (a number, date or
+ * logical, with its number format), so a formatted "$10.00" or "1/15/2026" never becomes text;
+ * for a literal list ("1,2,3"), the item as typed (`literal`: the caller parses it like an entry).
+ * Null when the option is not in the list.
+ */
+export function listEntryForOption(validation: unknown, option: string, host: DataHost, target?: ValidationTarget): { value: Scalar; text: string; numFmt?: string; literal: boolean } | null {
+  const model = asValidation(validation)
+  if (!model || model.type !== 'list') return null
+  const literal = literalListItems(model.formulae?.[0]) !== null
+  const key = foldText(option)
+  for (const entry of listSourceEntries(model, host, target)) {
+    if (foldText(entry.text) === key) return { ...entry, literal }
+  }
+  return null
 }
 
 /**
@@ -243,6 +280,100 @@ export function listOptionsForValidation(validation: unknown, host: DataHost, ta
 export function hasInCellDropdown(validation: unknown): boolean {
   const model = asValidation(validation)
   return Boolean(model && model.type === 'list' && model.showDropDown !== true)
+}
+
+// ---------------------------------------------------------------------------------------------
+// In-cell dropdown presentation
+// ---------------------------------------------------------------------------------------------
+
+/** What the grid needs to draw a list's dropdown and its picker. */
+export interface DropdownPresentation {
+  style: DropdownDisplayStyle
+  /** Chip colours keyed by folded option text. */
+  colors: ReadonlyMap<string, string>
+  multiple: boolean
+}
+
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i
+const NO_COLORS: ReadonlyMap<string, string> = new Map()
+const presentationCache = new WeakMap<object, DropdownPresentation>()
+
+/**
+ * The rule's dropdown style: Excel's arrow on the active cell unless the rule carries Simple's
+ * Sheets-style settings (chips, option colours, multiple picks). Invalid colours are ignored.
+ */
+export function dropdownPresentation(validation: unknown): DropdownPresentation {
+  const extension = validation && typeof validation === 'object' ? (validation as DataValidationModel).simpleDropdown : undefined
+  if (!extension || typeof extension !== 'object') return { style: 'arrow', colors: NO_COLORS, multiple: false }
+  const cached = presentationCache.get(extension)
+  if (cached) return cached
+  const colors = new Map<string, string>()
+  for (const [option, color] of Object.entries(extension.colors || {})) {
+    if (typeof color === 'string' && HEX_COLOR.test(color.trim()) && option.trim()) colors.set(foldText(option.trim()), color.trim().toLowerCase())
+  }
+  const presentation: DropdownPresentation = {
+    style: extension.style === 'chip' ? 'chip' : 'arrow',
+    colors: colors.size ? colors : NO_COLORS,
+    multiple: extension.multiple === true,
+  }
+  presentationCache.set(extension, presentation)
+  return presentation
+}
+
+/** The chip colour for an option, if the rule defines one. */
+export function dropdownOptionColor(presentation: DropdownPresentation, option: string): string | undefined {
+  return presentation.colors.size ? presentation.colors.get(foldText(option.trim())) : undefined
+}
+
+/** Dark or light text, whichever reads better on a chip colour. */
+export function chipTextColor(background: string): string {
+  const hex = background.replace('#', '')
+  const full = hex.length === 3 ? hex.split('').map((digit) => digit + digit).join('') : hex
+  const channel = (offset: number) => {
+    const value = parseInt(full.slice(offset, offset + 2), 16) / 255
+    return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+  }
+  if (!/^[0-9a-f]{6}$/i.test(full)) return '#222421'
+  const luminance = 0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+  return luminance > 0.36 ? '#222421' : '#ffffff'
+}
+
+/** The picks in a multiple-selection cell ("A, B" -> ["A", "B"]), blanks and repeats dropped. */
+export function splitMultipleSelection(text: string): string[] {
+  const seen = new Set<string>()
+  const picks: string[] = []
+  for (const part of String(text ?? '').split(',')) {
+    const item = part.trim()
+    const key = foldText(item)
+    if (!item || seen.has(key)) continue
+    seen.add(key)
+    picks.push(item)
+  }
+  return picks
+}
+
+/**
+ * The cell text for a set of picks: in list order (as Sheets keeps them), with any value that
+ * is no longer in the list kept at the end so nothing typed earlier is dropped.
+ */
+export function joinMultipleSelection(picks: readonly string[], options: readonly string[]): string {
+  const chosen = new Map(picks.map((pick) => [foldText(pick.trim()), pick.trim()] as const).filter(([key]) => key))
+  const ordered: string[] = []
+  for (const option of options) {
+    const key = foldText(option)
+    if (!chosen.has(key)) continue
+    ordered.push(option)
+    chosen.delete(key)
+  }
+  return [...ordered, ...chosen.values()].join(', ')
+}
+
+/** Adds or removes one option in a multiple-selection cell's text. */
+export function toggleMultipleSelection(current: string, option: string, options: readonly string[]): string {
+  const picks = splitMultipleSelection(current)
+  const key = foldText(option.trim())
+  const next = picks.some((pick) => foldText(pick) === key) ? picks.filter((pick) => foldText(pick) !== key) : [...picks, option]
+  return joinMultipleSelection(next, options)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -346,11 +477,17 @@ export function validateValue(validation: unknown, rawInput: string | undefined,
       const valueKind = scalarKind(parsedValue)
       const folded = foldText(valueKind === 'text' ? String(parsedValue) : raw)
       const number = valueKind === 'number' ? parsedValue as number : null
-      for (const entry of entries) {
-        if (number !== null && typeof entry.value === 'number' && Math.abs(entry.value - number) < 1e-9) return { ok: true }
-        if (foldText(entry.text) === folded) return { ok: true }
-        if (typeof entry.value === 'string' && foldText(entry.value) === folded) return { ok: true }
-        if (typeof entry.value === 'boolean' && folded === (entry.value ? 'true' : 'false')) return { ok: true }
+      const listed = (text: string, value: number | null) => entries.some((entry) => (
+        (value !== null && typeof entry.value === 'number' && Math.abs(entry.value - value) < 1e-9) ||
+        foldText(entry.text) === text ||
+        (typeof entry.value === 'string' && foldText(entry.value) === text) ||
+        (typeof entry.value === 'boolean' && text === (entry.value ? 'true' : 'false'))
+      ))
+      if (listed(folded, number)) return { ok: true }
+      // A rule that allows several picks accepts any comma-separated set of its options.
+      if (model.simpleDropdown?.multiple === true && valueKind === 'text') {
+        const parts = splitMultipleSelection(String(parsedValue))
+        if (parts.length > 1 && parts.every((part) => listed(foldText(part), parseNumberText(part)))) return { ok: true }
       }
       return failure(model, host)
     }

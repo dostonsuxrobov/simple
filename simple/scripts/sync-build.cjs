@@ -5,6 +5,7 @@ const fs = require('node:fs/promises')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const esbuild = require('esbuild')
+const { syncShared } = require('./sync-shared.cjs')
 
 const ROOT = path.resolve(__dirname, '..')
 const WORKSPACE = path.resolve(ROOT, '..')
@@ -159,11 +160,42 @@ async function stageMode(mode, lockHash) {
   }
 }
 
+/**
+ * Bundles the launcher's Combine worker into modules/shared/combine-worker.cjs
+ * and records the hash of every file esbuild read for it (launcher, shared
+ * I/O and workspace sources), so verify.cjs notices any change that would
+ * make the bundled worker stale.
+ * @returns {Promise<{combineInputs: Record<string, string>, combineWorkerHash: string}>}
+ */
+async function bundleCombineWorker() {
+  const outfile = path.join(MODULES_ROOT, 'shared', 'combine-worker.cjs')
+  const result = await esbuild.build({
+    entryPoints: [path.join(ROOT, 'launcher', 'combine-worker.cjs')],
+    outfile,
+    bundle: true, platform: 'node', format: 'cjs', target: 'node22', legalComments: 'none',
+    metafile: true,
+  })
+  const inputs = Object.keys(result.metafile.inputs)
+    .map((input) => path.resolve(process.cwd(), input))
+    .filter((input) => !input.split(path.sep).includes('node_modules'))
+    .sort()
+  const combineInputs = {}
+  for (const input of inputs) combineInputs[path.relative(ROOT, input).replaceAll('\\', '/')] = await sha256File(input)
+  return { combineInputs, combineWorkerHash: await sha256File(outfile) }
+}
+
 async function readManifest() {
   try { return JSON.parse(await fs.readFile(path.join(MODULES_ROOT, 'manifest.json'), 'utf8')) } catch { return { modules: {} } }
 }
 
 async function main() {
+  // A workspace whose vendored shared I/O code drifted from simple/shared must not ship.
+  const sharedIo = syncShared({ check: true })
+  if (!sharedIo.ok) {
+    console.error(sharedIo.message)
+    process.exitCode = 1
+    return
+  }
   await fs.access(SHARED_PNG)
   await fs.access(SHARED_ICO)
   await fs.mkdir(MODULES_ROOT, { recursive: true })
@@ -174,27 +206,25 @@ async function main() {
     try { await fs.access(path.join(sourceRoot, 'package.json')) } catch { throw new Error(`Missing ${mode} source at ${sourceRoot}`) }
   }
 
-  const lockEntries = await Promise.all(modes.map(async (mode) => [mode, await ensureDependencies(sourceRoots[mode])]))
-  const lockHashes = Object.fromEntries(lockEntries)
+  const combineOnly = process.argv.includes('--combine-only')
   const previous = await readManifest()
-  const results = await Promise.all(modes.map(async (mode) => [mode, await stageMode(mode, lockHashes[mode])]))
-  const modules = { ...(previous.modules || {}), ...Object.fromEntries(results) }
-  await esbuild.build({
-    entryPoints: [path.join(ROOT, 'launcher', 'combine-worker.cjs')],
-    outfile: path.join(MODULES_ROOT, 'shared', 'combine-worker.cjs'),
-    bundle: true, platform: 'node', format: 'cjs', target: 'node22', legalComments: 'none',
-  })
-  const combineSources = ['launcher/combine-worker.cjs', 'launcher/combine-service.cjs', 'launcher/legacy-sheet-preview.cjs', '../simple_doc_source/electron/office-converter.cjs', '../simple_pdf_source/electron/image-to-pdf.cjs']
-  const combineSourceHashes = Object.fromEntries(await Promise.all(combineSources.map(async (file) => [file, await sha256File(path.join(ROOT, file))])))
+  let modules = previous.modules || {}
+  if (!combineOnly) {
+    const lockEntries = await Promise.all(modes.map(async (mode) => [mode, await ensureDependencies(sourceRoots[mode])]))
+    const lockHashes = Object.fromEntries(lockEntries)
+    const results = await Promise.all(modes.map(async (mode) => [mode, await stageMode(mode, lockHashes[mode])]))
+    modules = { ...modules, ...Object.fromEntries(results) }
+  }
+  const combine = await bundleCombineWorker()
   const manifest = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     modules,
-    shared: { combineSourceHashes, combineWorkerHash: await sha256File(path.join(MODULES_ROOT, 'shared', 'combine-worker.cjs')) },
+    shared: combine,
   }
   await fs.writeFile(path.join(MODULES_ROOT, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
   await fs.rm(path.join(ROOT, '.stage'), { recursive: true, force: true })
-  console.log(`\nSynchronized ${modes.join(', ')} into ${MODULES_ROOT}`)
+  console.log(combineOnly ? `\nRebuilt the Combine worker in ${MODULES_ROOT}` : `\nSynchronized ${modes.join(', ')} into ${MODULES_ROOT}`)
 }
 
 main().catch((error) => {

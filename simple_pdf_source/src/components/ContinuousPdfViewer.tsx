@@ -4,9 +4,18 @@ import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { GripVertical } from 'lucide-react'
 import type { ActiveSearchMatch, DisplayRotation, PageObjectEdit, PageTextEdit, PdfOverlay, PdfRect, ToolMode } from '../types'
 import { isImportableTransferFile, pageDropEdge, pageDropInsertIndex, type PageDropEdge } from '../lib/pageTransfer'
-import { textCaretAtPoint, wordTextSliceAtPoint } from '../lib/textSelection'
-import type { TextCaretPoint } from '../lib/textSelection'
-import { PdfPage } from './PdfPage'
+import {
+  collectSelectedPdfText,
+  joinSelectedPageTexts,
+  plainTextFromTextContentItems,
+  textCaretAtPoint,
+  wordTextSliceAtPoint,
+} from '../lib/textSelection'
+import type { PdfTextContentItemLike, TextCaretPoint } from '../lib/textSelection'
+import { getPageTextContent } from '../lib/pdf'
+import { isTypingTarget } from '../lib/utils'
+import { PdfPage, type PendingEditAt } from './PdfPage'
+import type { ScanPreparation } from '../lib/ocr/scanEdit'
 
 interface PageSize {
   width: number
@@ -48,10 +57,26 @@ interface ContinuousPdfViewerProps {
   onPlaceSignature: (pageIndex: number, point: { x: number; y: number }, displayRotation: DisplayRotation) => void
   onNavigate: (pageIndex: number) => void
   onFormChange: (name: string, value: string | boolean) => void
+  /** A click in Edit mode landed on a scanned page without text. */
+  onRequestOcrOffer?: (pageIndex: number, point: { x: number; y: number }, client: { x: number; y: number }) => void
+  /** Open the text at this point once the page's (new) text is ready. */
+  pendingEditAt?: PendingEditAt | null
+  onPendingEditAtHandled?: (token: number) => void
+  /** An edit of scanned text finished preparing (patch, words, matched style). */
+  onScanEditPrepared?: (key: string, result: ScanPreparation) => void
 }
 
 const PAGE_VERTICAL_CHROME = 40
 const POINTER_TEXT_TOOLS: ToolMode[] = ['select', 'edit', 'highlight', 'underline', 'strikeout']
+// An idle selection keeps the pages between its ends mounted (unmounting
+// nodes inside a live Range makes Chromium repaint it elsewhere), but only up
+// to this span; longer selections keep just their end pages, and copy fills
+// the pages in between from getTextContent().
+const MAX_PROTECTED_SELECTION_PAGES = 12
+// A page change requested by a click inside the viewer (editing, signing, the
+// page handle) never scrolls a page that is already on screen.
+const QUIET_PAGE_CHANGE_MS = 1500
+const NAVIGATION_SUPPRESS_MS = 700
 
 interface PageScopedHandlers {
   onPageReady: (size: PageSize) => void
@@ -69,24 +94,69 @@ function selectionNodeIsPdfText(root: HTMLElement, node: Node | null) {
   return Boolean(element?.closest('.text-layer'))
 }
 
-function closestCenteredPage(
-  entries: Map<number, IntersectionObserverEntry>,
-  root: HTMLElement,
-) {
-  const rootCenter = root.getBoundingClientRect().top + root.clientHeight / 2
-  return [...entries.entries()]
-    .map(([index, entry]) => {
-      const bounds = entry.target.getBoundingClientRect()
-      return { index, distance: Math.abs(bounds.top + bounds.height / 2 - rootCenter) }
-    })
-    .sort((a, b) => a.distance - b.distance)[0]?.index
+function slotPageIndex(node: Node | null) {
+  const element = node instanceof Element ? node : node?.parentElement
+  const slot = element?.closest<HTMLElement>('.continuous-page-slot')
+  const index = Number(slot?.dataset.pageIndex)
+  return slot && Number.isInteger(index) ? index : undefined
+}
+
+/** Pages an idle native selection needs mounted to stay intact. */
+function selectionProtectedPages(root: HTMLElement) {
+  const selection = window.getSelection()
+  if (!selection || selection.isCollapsed || selection.rangeCount < 1) return new Set<number>()
+  const ends = [selection.anchorNode, selection.focusNode]
+    .filter((node): node is Node => Boolean(node && root.contains(node)))
+    .map(slotPageIndex)
+    .filter((index): index is number => index !== undefined)
+  if (!ends.length) return new Set<number>()
+  const first = Math.min(...ends)
+  const last = Math.max(...ends)
+  if (last - first + 1 > MAX_PROTECTED_SELECTION_PAGES) return new Set(ends)
+  return new Set(Array.from({ length: last - first + 1 }, (_, offset) => first + offset))
+}
+
+function slotIntersectsViewport(root: HTMLElement, slot: HTMLElement | undefined) {
+  if (!slot) return false
+  const bounds = root.getBoundingClientRect()
+  const rect = slot.getBoundingClientRect()
+  return rect.bottom > bounds.top + 1 && rect.top < bounds.bottom - 1 && rect.height > 0
+}
+
+/**
+ * The page the user is looking at: the first page at the very top of the
+ * document, the last page at the very bottom, otherwise the page occupying
+ * the most viewport height (ties go to the upper page).
+ */
+function mostVisiblePage(root: HTMLElement, slots: HTMLElement[], pageCount: number) {
+  const maxScroll = root.scrollHeight - root.clientHeight
+  if (maxScroll > 1 && pageCount > 0) {
+    if (root.scrollTop <= 1) return 0
+    if (root.scrollTop >= maxScroll - 1) return pageCount - 1
+  }
+  const bounds = root.getBoundingClientRect()
+  let best: number | undefined
+  let bestVisible = 0
+  const ordered = slots
+    .map((slot) => ({ slot, index: Number(slot.dataset.pageIndex) }))
+    .filter(({ index }) => Number.isInteger(index))
+    .sort((a, b) => a.index - b.index)
+  for (const { slot, index } of ordered) {
+    const rect = slot.getBoundingClientRect()
+    const visible = Math.min(rect.bottom, bounds.bottom) - Math.max(rect.top, bounds.top)
+    if (visible > bestVisible + 0.5) {
+      best = index
+      bestVisible = visible
+    }
+  }
+  return best
 }
 
 export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
   const {
     pdf, viewerRef, currentPage, selectedPages, zoom, rotations, tool, overlays, formValues,
     textEdit, objectEdit, activeSearchMatch, selectingObjectRegion, onCurrentPage,
-    onSelectPage, onPageDragStart, onImportPagesAt,
+    onSelectPage, onPageDragStart, onImportPagesAt, pendingEditAt,
   } = props
   const [mountedPages, setMountedPages] = useState<Set<number>>(() => new Set([currentPage]))
   // Page sizes are cached at scale 1 (unzoomed CSS pixels) so a zoom change
@@ -102,15 +172,22 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
   const propsRef = useRef(props)
   const pageHandlersRef = useRef(new Map<number, PageScopedHandlers>())
   const previousRotationsRef = useRef<Record<number, number>>(rotations)
-  const centeredEntriesRef = useRef(new Map<number, IntersectionObserverEntry>())
+  const quietPageChangesRef = useRef(new Map<number, number>())
+  const visiblePagesRef = useRef(new Set<number>())
   const renderIntersectingPagesRef = useRef(new Set<number>())
-  const nativeTextSelectionActiveRef = useRef(false)
+  // True only while a pointer drag is selecting text; an idle selection left
+  // behind never freezes page tracking or pruning.
+  const pointerSelectionActiveRef = useRef(false)
   const suppressObserverUntilRef = useRef(0)
+  const suppressionTimerRef = useRef(0)
+  const evaluateCurrentPageRef = useRef<((onlyWhenCurrentHidden?: boolean) => void) | null>(null)
+  const copyGenerationRef = useRef(0)
   const basePageSizesRef = useRef(basePageSizes)
   const renderedPagesRef = useRef(new Set<number>())
   const layoutAnchorRef = useRef<{ pageIndex: number; offset: number } | null>(null)
   const layoutSignatureRef = useRef('')
   const layoutPdfRef = useRef(pdf)
+  const stopLayoutAnchorRef = useRef<(() => void) | null>(null)
 
   currentPageRef.current = currentPage
   pinnedPagesRef.current = [textEdit?.pageIndex, objectEdit?.pageIndex, activeSearchMatch?.pageIndex]
@@ -150,17 +227,66 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
     layoutSignatureRef.current = layoutSignature
   }
 
+  // Programmatic scrolls briefly pause page tracking. When the pause ends,
+  // catch the indicator up if the current page has left the screen meanwhile.
+  const suppressPageTracking = (milliseconds: number) => {
+    suppressObserverUntilRef.current = performance.now() + milliseconds
+    window.clearTimeout(suppressionTimerRef.current)
+    suppressionTimerRef.current = window.setTimeout(() => evaluateCurrentPageRef.current?.(true), milliseconds + 20)
+  }
+  const suppressPageTrackingRef = useRef(suppressPageTracking)
+  suppressPageTrackingRef.current = suppressPageTracking
+  useEffect(() => () => window.clearTimeout(suppressionTimerRef.current), [])
+
   useLayoutEffect(() => {
     const anchor = layoutAnchorRef.current
     if (!anchor) return
     layoutAnchorRef.current = null
     const root = viewerRef.current
-    const slot = slotsRef.current.get(anchor.pageIndex)
-    if (!root || !slot) return
-    suppressObserverUntilRef.current = performance.now() + 700
-    const rootBounds = root.getBoundingClientRect()
-    const slotBounds = slot.getBoundingClientRect()
-    root.scrollTop += slotBounds.top - rootBounds.top + anchor.offset * slotBounds.height
+    if (!root || !slotsRef.current.get(anchor.pageIndex)) return
+    suppressPageTrackingRef.current(NAVIGATION_SUPPRESS_MS)
+    const applyAnchor = () => {
+      const slot = slotsRef.current.get(anchor.pageIndex)
+      if (!slot) return
+      const rootBounds = root.getBoundingClientRect()
+      const slotBounds = slot.getBoundingClientRect()
+      const delta = slotBounds.top - rootBounds.top + anchor.offset * slotBounds.height
+      if (Math.abs(delta) >= 1) root.scrollTop += delta
+    }
+    applyAnchor()
+    // Rendered pages adopt the new size a commit or two later (and the
+    // geometry read here can still predate this commit), which used to leave
+    // the view several pages away from where the user was reading. Hold the
+    // anchor for a few frames until the layout settles, unless the user
+    // scrolls or navigates meanwhile.
+    let frame = 0
+    let active = true
+    const until = performance.now() + 600
+    const stop = () => {
+      if (!active) return
+      active = false
+      window.cancelAnimationFrame(frame)
+      root.removeEventListener('wheel', stop)
+      root.removeEventListener('pointerdown', stop, true)
+      window.removeEventListener('keydown', stop, true)
+      if (stopLayoutAnchorRef.current === stop) stopLayoutAnchorRef.current = null
+    }
+    const tick = () => {
+      if (!active) return
+      if (performance.now() > until) {
+        stop()
+        return
+      }
+      applyAnchor()
+      frame = window.requestAnimationFrame(tick)
+    }
+    stopLayoutAnchorRef.current?.()
+    stopLayoutAnchorRef.current = stop
+    root.addEventListener('wheel', stop, { passive: true })
+    root.addEventListener('pointerdown', stop, true)
+    window.addEventListener('keydown', stop, true)
+    frame = window.requestAnimationFrame(tick)
+    return stop
   }, [pdf, zoom, rotations, viewerRef])
 
   useEffect(() => {
@@ -229,10 +355,11 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
   useEffect(() => {
     setMountedPages(new Set([currentPage]))
     setPageSizes({})
-    centeredEntriesRef.current.clear()
+    visiblePagesRef.current.clear()
     renderIntersectingPagesRef.current.clear()
     reportedFromScrollRef.current.clear()
-    nativeTextSelectionActiveRef.current = false
+    quietPageChangesRef.current.clear()
+    pointerSelectionActiveRef.current = false
   }, [pdf])
 
   useEffect(() => {
@@ -241,38 +368,35 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
     let selectingWithPointer = false
     let settleFrame = 0
 
-    const currentSelectionBelongsToViewer = () => {
-      const selection = window.getSelection()
-      return Boolean(selection && !selection.isCollapsed && selection.rangeCount
-        && (selectionNodeIsPdfText(root, selection.anchorNode) || selectionNodeIsPdfText(root, selection.focusNode)))
-    }
-
-    const finishSelection = () => {
-      if (!nativeTextSelectionActiveRef.current) return
-      nativeTextSelectionActiveRef.current = false
-      const centeredIndex = closestCenteredPage(centeredEntriesRef.current, root)
-      const pageToKeep = centeredIndex ?? currentPageRef.current
+    // Drop pages that are off screen and no longer hold an end (or, for short
+    // selections, the middle) of the native selection.
+    const prunePages = () => {
+      if (pointerSelectionActiveRef.current) return
+      const protectedPages = selectionProtectedPages(root)
       setMountedPages((current) => {
         const next = new Set([...current].filter((index) => (
           renderIntersectingPagesRef.current.has(index)
-          || index === pageToKeep
+          || index === currentPageRef.current
           || pinnedPagesRef.current.includes(index)
+          || protectedPages.has(index)
         )))
-        if (!next.size) next.add(pageToKeep)
+        if (!next.size) next.add(currentPageRef.current)
         return next.size === current.size && [...next].every((index) => current.has(index)) ? current : next
       })
-      if (centeredIndex !== undefined && centeredIndex !== currentPageRef.current) {
-        reportedFromScrollRef.current.set(centeredIndex, performance.now())
-        onCurrentPage(centeredIndex)
-      }
     }
 
     const syncSelectionState = () => {
-      if (selectingWithPointer || currentSelectionBelongsToViewer()) {
-        nativeTextSelectionActiveRef.current = true
-      } else {
-        finishSelection()
-      }
+      const dragging = selectingWithPointer || root.dataset.pointerSelectingText === 'true'
+      const wasDragging = pointerSelectionActiveRef.current
+      pointerSelectionActiveRef.current = dragging
+      if (dragging) return
+      prunePages()
+      // Page tracking paused for the drag; catch up with where it ended.
+      if (wasDragging) evaluateCurrentPageRef.current?.()
+    }
+    const scheduleSync = () => {
+      window.cancelAnimationFrame(settleFrame)
+      settleFrame = window.requestAnimationFrame(syncSelectionState)
     }
 
     const handlePointerDown = (event: PointerEvent) => {
@@ -280,26 +404,75 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
       selectingWithPointer = target instanceof Element
         && root.contains(target)
         && Boolean(target.closest('.text-layer'))
-      if (selectingWithPointer) nativeTextSelectionActiveRef.current = true
+      if (selectingWithPointer) pointerSelectionActiveRef.current = true
     }
     const handlePointerFinished = () => {
       selectingWithPointer = false
-      window.cancelAnimationFrame(settleFrame)
-      settleFrame = window.requestAnimationFrame(syncSelectionState)
+      scheduleSync()
     }
 
-    document.addEventListener('selectionchange', syncSelectionState)
+    document.addEventListener('selectionchange', scheduleSync)
     document.addEventListener('pointerdown', handlePointerDown, true)
     document.addEventListener('pointerup', handlePointerFinished, true)
     document.addEventListener('pointercancel', handlePointerFinished, true)
     return () => {
       window.cancelAnimationFrame(settleFrame)
-      document.removeEventListener('selectionchange', syncSelectionState)
+      document.removeEventListener('selectionchange', scheduleSync)
       document.removeEventListener('pointerdown', handlePointerDown, true)
       document.removeEventListener('pointerup', handlePointerFinished, true)
       document.removeEventListener('pointercancel', handlePointerFinished, true)
     }
-  }, [pdf, viewerRef, onCurrentPage])
+  }, [pdf, viewerRef])
+
+  // Clicking anywhere in the document gives it keyboard focus (as Acrobat
+  // does), even where a tool cancels the pointerdown default, so page keys
+  // and tool shortcuts work again after using the search, page or zoom boxes.
+  useEffect(() => {
+    const root = viewerRef.current
+    if (!root) return
+    const focusDocument = (event: PointerEvent) => {
+      const active = document.activeElement
+      if (active === root || (active instanceof Node && root.contains(active))) return
+      const target = event.target
+      if (target instanceof Element
+        && target.closest('input, textarea, select, button, a[href], [contenteditable="true"]')) return
+      root.focus({ preventScroll: true })
+    }
+    root.addEventListener('pointerdown', focusDocument, true)
+    return () => root.removeEventListener('pointerdown', focusDocument, true)
+  }, [viewerRef])
+
+  // Copy builds the text itself: text-layer spans are absolutely positioned,
+  // so the native serialisation glues lines and words together, and pages
+  // outside the virtualised window are not in the DOM at all.
+  useEffect(() => {
+    const root = viewerRef.current
+    if (!root) return
+    const handleCopy = (event: ClipboardEvent) => {
+      if (event.defaultPrevented || isTypingTarget(document.activeElement)) return
+      const selection = window.getSelection()
+      if (!selection || selection.isCollapsed || selection.rangeCount < 1) return
+      const pages = collectSelectedPdfText(root, selection.getRangeAt(0))
+      if (!pages) return
+      const missing = pages.some((page) => page.text === null)
+      const available = joinSelectedPageTexts(pages.map((page) => page.text))
+      if (!available && !missing) return
+      event.preventDefault()
+      event.clipboardData?.setData('text/plain', available)
+      const generation = ++copyGenerationRef.current
+      if (!missing) return
+      void Promise.all(pages.map(async (page) => {
+        if (page.text !== null) return page.text
+        const content = await getPageTextContent(await pdf.getPage(page.pageIndex + 1))
+        return plainTextFromTextContentItems(content.items as PdfTextContentItemLike[])
+      })).then((texts) => {
+        if (generation !== copyGenerationRef.current) return
+        return navigator.clipboard?.writeText(joinSelectedPageTexts(texts))
+      }).catch(() => {})
+    }
+    document.addEventListener('copy', handleCopy)
+    return () => document.removeEventListener('copy', handleCopy)
+  }, [pdf, viewerRef])
 
   useEffect(() => {
     const root = viewerRef.current
@@ -492,8 +665,10 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
         // Never yield to Chromium's native line-inference drag while a text
         // tool is active; a missed press behaves like a click on whitespace.
         event.preventDefault()
+        // Also clears a Select All, whose ends sit on the page container.
         if (!event.shiftKey && !selection.isCollapsed
-          && (selectionNodeIsPdfText(root, selection.anchorNode) || selectionNodeIsPdfText(root, selection.focusNode))) {
+          && (selectionNodeIsPdfText(root, selection.anchorNode) || selectionNodeIsPdfText(root, selection.focusNode)
+            || Boolean(selection.anchorNode && root.contains(selection.anchorNode)))) {
           selection.removeAllRanges()
         }
         return
@@ -531,7 +706,7 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
       } catch {
         return
       }
-      nativeTextSelectionActiveRef.current = true
+      pointerSelectionActiveRef.current = true
       gesture = {
         pointerId: event.pointerId,
         mode,
@@ -593,6 +768,7 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
     }
 
     const renderObserver = new IntersectionObserver((entries) => {
+      let protectedPages: Set<number> | null = null
       setMountedPages((current) => {
         const next = new Set(current)
         for (const entry of entries) {
@@ -603,49 +779,72 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
             next.add(index)
           } else {
             renderIntersectingPagesRef.current.delete(index)
-            // Removing any node between a native Selection's anchor and focus
-            // makes Chromium repaint the grey selection at a different range
-            // (or collapse it completely) — and a shift-click may yet extend
-            // the selection across pages scrolled past in between. Keep every
-            // traversed page mounted until the user clears that selection,
-            // then prune in one pass (finishSelection).
-            if (!nativeTextSelectionActiveRef.current
-              && index !== currentPageRef.current
-              && !pinnedPagesRef.current.includes(index)) next.delete(index)
+            // Removing nodes between a native Selection's anchor and focus
+            // makes Chromium repaint the grey selection at a different range,
+            // so a live drag keeps every traversed page and an idle selection
+            // keeps its own page span (bounded). Everything else is released.
+            if (pointerSelectionActiveRef.current
+              || index === currentPageRef.current
+              || pinnedPagesRef.current.includes(index)) continue
+            protectedPages ??= selectionProtectedPages(root)
+            if (!protectedPages.has(index)) next.delete(index)
           }
         }
         return next.size === current.size && [...next].every((index) => current.has(index)) ? current : next
       })
     }, { root, rootMargin: '1100px 0px', threshold: 0 })
 
-    const currentObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        const index = Number((entry.target as HTMLElement).dataset.pageIndex)
-        if (!Number.isInteger(index)) continue
-        if (entry.isIntersecting) centeredEntriesRef.current.set(index, entry)
-        else centeredEntriesRef.current.delete(index)
-      }
-      const index = closestCenteredPage(centeredEntriesRef.current, root)
-      if (index === undefined) return
-      if (nativeTextSelectionActiveRef.current) return
+    const evaluateCurrentPage = (onlyWhenCurrentHidden = false) => {
+      if (pointerSelectionActiveRef.current) return
       if (performance.now() < suppressObserverUntilRef.current) return
-      if (!Number.isInteger(index) || index === currentPageRef.current) return
+      if (onlyWhenCurrentHidden && slotIntersectsViewport(root, slotsRef.current.get(currentPageRef.current))) return
+      const visible = [...visiblePagesRef.current]
+        .map((index) => slotsRef.current.get(index))
+        .filter((slot): slot is HTMLElement => Boolean(slot))
+      const index = mostVisiblePage(root, visible.length ? visible : [...slotsRef.current.values()], pdf.numPages)
+      if (index === undefined || !Number.isInteger(index) || index === currentPageRef.current) return
       const now = performance.now()
       for (const [reportedIndex, reportedAt] of reportedFromScrollRef.current) {
         if (now - reportedAt > 1500) reportedFromScrollRef.current.delete(reportedIndex)
       }
       reportedFromScrollRef.current.set(index, now)
       onCurrentPage(index)
-    }, { root, rootMargin: '-42% 0px -42% 0px', threshold: 0 })
+    }
+    evaluateCurrentPageRef.current = evaluateCurrentPage
+
+    const visibleObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const index = Number((entry.target as HTMLElement).dataset.pageIndex)
+        if (!Number.isInteger(index)) continue
+        if (entry.isIntersecting) visiblePagesRef.current.add(index)
+        else visiblePagesRef.current.delete(index)
+      }
+      evaluateCurrentPage()
+    }, { root, threshold: 0 })
+
+    // Scrolling within the same set of visible pages changes which one
+    // dominates without any intersection change, so track scroll as well.
+    let scrollFrame = 0
+    const handleScroll = () => {
+      if (scrollFrame) return
+      scrollFrame = window.requestAnimationFrame(() => {
+        scrollFrame = 0
+        evaluateCurrentPage()
+      })
+    }
+    root.addEventListener('scroll', handleScroll, { passive: true })
 
     for (const slot of slotsRef.current.values()) {
       renderObserver.observe(slot)
-      currentObserver.observe(slot)
+      visibleObserver.observe(slot)
     }
     return () => {
+      window.cancelAnimationFrame(scrollFrame)
+      root.removeEventListener('scroll', handleScroll)
       renderObserver.disconnect()
-      currentObserver.disconnect()
-      centeredEntriesRef.current.clear()
+      visibleObserver.disconnect()
+      visiblePagesRef.current.clear()
+      if (evaluateCurrentPageRef.current === evaluateCurrentPage) evaluateCurrentPageRef.current = null
     }
   }, [pdf, viewerRef, onCurrentPage])
 
@@ -656,19 +855,52 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
       next.add(currentPage)
       return next
     })
+    const now = performance.now()
     const reportedAt = reportedFromScrollRef.current.get(currentPage)
     if (reportedAt !== undefined) {
       reportedFromScrollRef.current.delete(currentPage)
-      if (performance.now() - reportedAt <= 1500) return
+      if (now - reportedAt <= 1500) return
     }
-    suppressObserverUntilRef.current = performance.now() + 700
-    const centerPage = () => {
-      if (nativeTextSelectionActiveRef.current) return
-      slotsRef.current.get(currentPage)?.scrollIntoView({ block: 'center', behavior: 'auto' })
+    const root = viewerRef.current
+    const quietAt = quietPageChangesRef.current.get(currentPage)
+    quietPageChangesRef.current.clear()
+    // Editing, signing or selecting on a page that is already on screen only
+    // makes it current; scrolling would move the clicked spot away.
+    if (quietAt !== undefined && now - quietAt <= QUIET_PAGE_CHANGE_MS
+      && root && slotIntersectsViewport(root, slotsRef.current.get(currentPage))) return
+    stopLayoutAnchorRef.current?.()
+    suppressPageTrackingRef.current(NAVIGATION_SUPPRESS_MS)
+    // Navigation shows the page from its top, as Acrobat does; centring hid
+    // the heading of every page taller than the window.
+    const alignPage = () => {
+      if (pointerSelectionActiveRef.current) return
+      const viewer = viewerRef.current
+      const slot = slotsRef.current.get(currentPage)
+      if (!viewer || !slot) return
+      if (currentPage === 0) {
+        viewer.scrollTop = 0
+        return
+      }
+      const offset = slot.getBoundingClientRect().top - viewer.getBoundingClientRect().top
+      if (Math.abs(offset) >= 1) viewer.scrollTop += offset
     }
-    centerPage()
-    const settleTimer = window.setTimeout(centerPage, 220)
-    return () => window.clearTimeout(settleTimer)
+    alignPage()
+    // A search hit centres itself once its geometry is ready (PdfPage); a
+    // second, late page alignment would push hits near page edges off screen.
+    if (propsRef.current.activeSearchMatch?.pageIndex === currentPage) return
+    // Re-align once placeholders above have settled, unless the user has
+    // already moved on (wheel, keys such as a quick second PageDown, clicks).
+    const settleTimer = window.setTimeout(alignPage, 220)
+    const cancelSettle = () => window.clearTimeout(settleTimer)
+    root?.addEventListener('wheel', cancelSettle, { passive: true })
+    root?.addEventListener('pointerdown', cancelSettle, true)
+    window.addEventListener('keydown', cancelSettle, true)
+    return () => {
+      cancelSettle()
+      root?.removeEventListener('wheel', cancelSettle)
+      root?.removeEventListener('pointerdown', cancelSettle, true)
+      window.removeEventListener('keydown', cancelSettle, true)
+    }
   }, [currentPage])
 
   const pageIndices = useMemo(() => Array.from({ length: pdf.numPages }, (_, index) => index), [pdf])
@@ -676,18 +908,36 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
   // PdfPage is memoized. Route every callback through refs with a stable
   // identity so mountedPages/currentPage/dropTarget churn (and parent
   // re-renders) only re-render the slots whose data actually changed.
+  const markQuietPageChange = (pageIndex: number) => {
+    if (pageIndex !== currentPageRef.current) quietPageChangesRef.current.set(pageIndex, performance.now())
+  }
+  const markQuietPageChangeRef = useRef(markQuietPageChange)
+  markQuietPageChangeRef.current = markQuietPageChange
+
   const sharedHandlers = useMemo(() => ({
-    onRequestTextEdit: (edit: PageTextEdit) => propsRef.current.onRequestTextEdit(edit),
+    onRequestTextEdit: (edit: PageTextEdit) => {
+      markQuietPageChangeRef.current(edit.pageIndex)
+      propsRef.current.onRequestTextEdit(edit)
+    },
     onTextEditChange: (edit: PageTextEdit) => propsRef.current.onTextEditChange(edit),
     onCommitTextEdit: () => propsRef.current.onCommitTextEdit(),
     onCancelTextEdit: () => propsRef.current.onCancelTextEdit(),
-    onRequestObjectEdit: (edit: PageObjectEdit) => propsRef.current.onRequestObjectEdit(edit),
+    onRequestObjectEdit: (edit: PageObjectEdit) => {
+      markQuietPageChangeRef.current(edit.pageIndex)
+      propsRef.current.onRequestObjectEdit(edit)
+    },
     onObjectEditChange: (edit: PageObjectEdit) => propsRef.current.onObjectEditChange(edit),
     onCommitObjectEdit: () => propsRef.current.onCommitObjectEdit(),
     onCancelObjectEdit: () => propsRef.current.onCancelObjectEdit(),
     onObjectRegionSelected: () => propsRef.current.onObjectRegionSelected(),
     onNavigate: (pageIndex: number) => propsRef.current.onNavigate(pageIndex),
     onFormChange: (name: string, value: string | boolean) => propsRef.current.onFormChange(name, value),
+    onRequestOcrOffer: (pageIndex: number, point: { x: number; y: number }, client: { x: number; y: number }) => {
+      markQuietPageChangeRef.current(pageIndex)
+      propsRef.current.onRequestOcrOffer?.(pageIndex, point, client)
+    },
+    onPendingEditAtHandled: (token: number) => propsRef.current.onPendingEditAtHandled?.(token),
+    onScanEditPrepared: (key: string, result: ScanPreparation) => propsRef.current.onScanEditPrepared?.(key, result),
   }), [])
 
   const pageHandlersFor = (index: number): PageScopedHandlers => {
@@ -708,7 +958,10 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
         onInk: (points) => propsRef.current.onInk(index, points),
         onRectangle: (rect) => propsRef.current.onRectangle(index, rect),
         onCrop: (rect) => propsRef.current.onCrop(index, rect),
-        onPlaceSignature: (point, displayRotation) => propsRef.current.onPlaceSignature(index, point, displayRotation),
+        onPlaceSignature: (point, displayRotation) => {
+          markQuietPageChangeRef.current(index)
+          propsRef.current.onPlaceSignature(index, point, displayRotation)
+        },
       }
       pageHandlersRef.current.set(index, handlers)
     }
@@ -783,6 +1036,7 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
               onPointerDown={(event) => event.stopPropagation()}
               onClick={(event) => {
                 event.stopPropagation()
+                markQuietPageChange(index)
                 onSelectPage(index, event)
               }}
               onDragStart={(event) => {
@@ -827,6 +1081,10 @@ export function ContinuousPdfViewer(props: ContinuousPdfViewerProps) {
                 onPlaceSignature={pageHandlers.onPlaceSignature}
                 onNavigate={sharedHandlers.onNavigate}
                 onFormChange={sharedHandlers.onFormChange}
+                onRequestOcrOffer={sharedHandlers.onRequestOcrOffer}
+                pendingEditAt={pendingEditAt?.pageIndex === index ? pendingEditAt : null}
+                onPendingEditAtHandled={sharedHandlers.onPendingEditAtHandled}
+                onScanEditPrepared={sharedHandlers.onScanEditPrepared}
               />
             ) : (
               <div className="continuous-page-placeholder" style={{ width: size.width, height: size.height }} aria-hidden="true" />

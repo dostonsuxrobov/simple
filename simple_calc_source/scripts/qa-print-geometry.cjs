@@ -4,8 +4,11 @@ const fs = require('node:fs/promises')
 const path = require('node:path')
 const os = require('node:os')
 if (!process.versions.electron) {
-  const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE
+  // The Chromium profile is created and removed here: Windows keeps it locked until Electron exits.
+  const profileRoot = require('node:fs').mkdtempSync(path.join(os.tmpdir(), 'calc-print-geometry-'))
+  const env = { ...process.env, SIMPLE_CALC_QA_PROFILE: profileRoot }; delete env.ELECTRON_RUN_AS_NODE
   const result = require('node:child_process').spawnSync(require('electron'), [__filename, ...process.argv.slice(2)], { env, stdio: 'inherit', windowsHide: true })
+  try { require('node:fs').rmSync(profileRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }) } catch {}
   process.exit(result.status ?? 1)
 }
 const { app, BrowserWindow } = require('electron')
@@ -15,7 +18,7 @@ const { workbookPayloadFromPath } = require('../electron/workbooks.cjs')
 const SSF = require('xlsx').SSF
 let window, profile
 ;(async () => {
-  profile = await fs.mkdtemp(path.join(os.tmpdir(), 'calc-print-geometry-'))
+  profile = process.env.SIMPLE_CALC_QA_PROFILE || await fs.mkdtemp(path.join(os.tmpdir(), 'calc-print-geometry-'))
   app.setPath('userData', profile)
   await app.whenReady()
   window = new BrowserWindow({ show: false, width: 1250, height: 1600, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
@@ -58,6 +61,6 @@ let window, profile
   console.log(`Print geometry passed: ${geometry.length} mixed-paper pages, full-width thin and thick merged borders inside the printable rectangle; digit width ${digitWidth}.`)
 })().catch(error => { console.error(error); process.exitCode = 1 }).finally(async () => {
   window?.destroy()
-  if (profile) await fs.rm(profile, { recursive: true, force: true }).catch(() => {})
+  if (profile && !process.env.SIMPLE_CALC_QA_PROFILE) await fs.rm(profile, { recursive: true, force: true }).catch(() => {})
   app.exit(process.exitCode || 0)
 })

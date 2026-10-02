@@ -388,6 +388,160 @@ async function verifyLegacyForm() {
   assert.equal(createSpreadsheetPrintDocument(source).pageCount, 2, 'invalid font measurements safely fall back to the current grid metric')
 }
 
-verifyLegacyForm().then(() => {
-  console.log('Print layout QA passed: real legacy form and Normal-font widths, scopes, exact paper pages, saved print areas, header/footer fields and escaping, source scale vs fit, saved margins, mixed paper sizes, page breaks, orientation, scaling, headings, gridlines, merges, hidden dimensions, and size limits.')
-}).catch((error) => { console.error(error); process.exitCode = 1 })
+// ---------------------------------------------------------------------------
+// Print dialog controls (CALC-013/014): custom scale, fit to pages, fit rows,
+// custom margins, page ranges, the native job, title columns, manual breaks,
+// whole-column/row print areas.
+// ---------------------------------------------------------------------------
+function rangesOf(result) {
+  return [...result.html.matchAll(/data-row-range="([^"]*)" data-column-range="([^"]*)"/g)].map((match) => `${match[1]}|${match[2]}`)
+}
+
+function tallRequest(options = {}, extras = {}, rows = 120) {
+  const cells = {}
+  for (let row = 1; row <= rows; row += 1) cells[`A${row}`] = { value: row }
+  const tall = sheet('tall', 'Tall', cells, extras)
+  return request({ scaling: 'actual', margins: 'normal', ...options }, {
+    workbook: { version: 1, name: 'Tall.xlsx', activeSheetId: 'tall', sheets: [tall] },
+    displayValues: {},
+  })
+}
+
+{
+  const actual = createSpreadsheetPrintDocument(tallRequest())
+  assert.deepEqual(rangesOf(actual), ['1:47|A:A', '48:94|A:A', '95:120|A:A'])
+  assert.equal(actual.totalPages, 3)
+
+  const half = createSpreadsheetPrintDocument(tallRequest({ scaling: 'custom', scalePercent: 50 }))
+  assert.equal(half.pageCount, 2, 'a 50% custom scale fits twice the rows on a page')
+  assert.match(half.html, /data-scale="0\.5000"/)
+  assert.match(half.html, /data-scaling="custom"/)
+  const large = createSpreadsheetPrintDocument(tallRequest({ scaling: 'custom', scalePercent: 150 }))
+  assert.match(large.html, /data-scale="1\.5000"/, 'custom scale may enlarge, as Excel allows up to 400%')
+  assert.ok(large.pageCount > actual.pageCount)
+  const clamped = createSpreadsheetPrintDocument(tallRequest({ scaling: 'custom', scalePercent: 5000 }))
+  assert.match(clamped.html, /data-scale="4\.0000"/, 'custom scale is limited to 400%')
+
+  const rowsOnOnePage = createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-height' }))
+  assert.equal(rowsOnOnePage.pageCount, 1, 'fit all rows on one page')
+  assert.ok(rowsOnOnePage.minimumScale < 0.5)
+
+  const oneByTwo = createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-pages', fitWidth: 1, fitHeight: 2 }))
+  assert.equal(oneByTwo.pageCount, 2, 'fit to 1 page wide by 2 tall')
+  assert.ok(oneByTwo.minimumScale > 0.7 && oneByTwo.minimumScale < 0.9)
+  const automatic = createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-pages', fitWidth: 0, fitHeight: 0 }))
+  assert.equal(automatic.pageCount, actual.pageCount, 'automatic by automatic is actual size')
+  const oneByOne = createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-pages', fitWidth: 1, fitHeight: 1 }))
+  const fitSheet = createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-sheet' }))
+  assert.equal(oneByOne.pageCount, 1, 'fit to 1 x 1 pages is one page')
+  assert.equal(oneByOne.minimumScale, fitSheet.minimumScale, 'fit to 1 x 1 pages scales like Fit sheet on one page')
+
+  const roomy = createSpreadsheetPrintDocument(tallRequest({ margins: 'custom', customMargins: { top: 2, right: 1, bottom: 2, left: 1.25 } }))
+  assert.match(roomy.html, /--margin-top:192\.00px/)
+  assert.match(roomy.html, /--margin-left:120\.00px/)
+  assert.match(roomy.html, /--header-top:19\.20px/, 'the header keeps its default distance inside a custom top margin')
+  assert.equal(roomy.pageCount, 4, 'larger custom margins leave room for fewer rows')
+  assert.throws(() => createSpreadsheetPrintDocument(tallRequest({ margins: 'custom', customMargins: { top: 6, right: 1, bottom: 6, left: 1 } })), /These margins leave no room for cells/)
+  const fallback = createSpreadsheetPrintDocument(tallRequest({ margins: 'custom', customMargins: { top: 'x', right: 1, bottom: 1, left: 1 } }))
+  assert.match(fallback.html, /--margin-top:48\.00px/, 'invalid custom margins fall back to Normal')
+
+  const middle = createSpreadsheetPrintDocument(tallRequest({ pageRange: { from: 2, to: 2 } }))
+  assert.equal(middle.pageCount, 1)
+  assert.equal(middle.totalPages, 3)
+  assert.deepEqual(rangesOf(middle), ['48:94|A:A'], 'the range prints the preview\'s own page 2')
+  assert.match(middle.html, /data-page-number="2"/)
+  assert.match(middle.html, /data-total-pages="3" data-first-page="2"/)
+  const toEnd = createSpreadsheetPrintDocument(tallRequest({ pageRange: { from: 2 } }))
+  assert.equal(toEnd.pageCount, 2)
+  const numbered = createSpreadsheetPrintDocument(tallRequest({ pageRange: { from: 3, to: 9 } }, { headerFooter: { oddFooter: '&CPage &P of &N' } }))
+  assert.match(numbered.html, />Page 3 of 3</, 'a range keeps the printout\'s page numbers and total')
+  assert.throws(() => createSpreadsheetPrintDocument(tallRequest({ pageRange: { from: 4 } })), /This printout has 3 pages\. Choose pages from 1 to 3\./)
+  assert.throws(() => createSpreadsheetPrintDocument(tallRequest({ pageRange: { from: 3, to: 2 } })), /last page to print comes before the first/)
+
+  assert.deepEqual(actual.printJob, { copies: 1, collate: true }, 'without a printer choice the job goes to the Windows default')
+  const job = createSpreadsheetPrintDocument(tallRequest({ printer: { deviceName: '  Office Laser  ', copies: 3, collate: false } })).printJob
+  assert.deepEqual(job, { copies: 3, collate: false, deviceName: 'Office Laser' })
+  assert.deepEqual(createSpreadsheetPrintDocument(tallRequest({ printer: { deviceName: 'Bad\u0000Name', copies: 5000 } })).printJob, { copies: 999, collate: true }, 'unsafe names and huge copy counts never reach the spooler')
+  const saved = createSpreadsheetPrintDocument(tallRequest({ useSavedLayout: true, scaling: 'custom', scalePercent: 50, margins: 'custom', customMargins: { top: 2, right: 2, bottom: 2, left: 2 } }))
+  assert.match(saved.html, /--margin-top:48\.00px/, 'a saved layout ignores hidden manual margins')
+  assert.match(saved.html, /data-scaling="fit-width"/, 'a saved layout without a scale uses the default, not a hidden manual scale')
+}
+
+{
+  const breaks = [{ id: 10, max: 16383, man: 1 }, 60]
+  assert.deepEqual(rangesOf(createSpreadsheetPrintDocument(tallRequest({}, { rowBreaks: breaks }))), ['1:10|A:A', '11:57|A:A', '58:60|A:A', '61:107|A:A', '108:120|A:A'], 'manual breaks start new pages at actual size')
+  assert.deepEqual(rangesOf(createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-width' }, { rowBreaks: breaks }))).slice(0, 2), ['1:10|A:A', '11:57|A:A'], 'row breaks also apply to Fit all columns on one page')
+  assert.equal(createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-sheet' }, { rowBreaks: breaks })).pageCount, 1, 'Fit sheet on one page ignores manual breaks')
+  assert.equal(createSpreadsheetPrintDocument(tallRequest({ scaling: 'fit-height' }, { rowBreaks: breaks })).pageCount, 1, 'Fit all rows on one page ignores row breaks')
+  const titled = createSpreadsheetPrintDocument(tallRequest({}, { rowBreaks: [{ id: 30 }], pageSetup: { printTitlesRow: '1:1' } }))
+  assert.deepEqual(rangesOf(titled).slice(0, 2), ['1:30|A:A', '1:76|A:A'], 'a break restarts the page under the repeated title row')
+  const bodies = [...titled.html.matchAll(/data-body-rows="([^"]*)" data-body-columns="([^"]*)"/g)].map((match) => `${match[1]}|${match[2]}`)
+  assert.deepEqual(bodies.slice(0, 2), ['1:30|1:1', '31:76|1:1'], 'each page reports its own rows after the repeated titles (where the breaks fall)')
+  const columnBreak = createSpreadsheetPrintDocument(request({ scaling: 'actual' }, {
+    workbook: { version: 1, name: 'Wide.xlsx', activeSheetId: 'wide', sheets: [sheet('wide', 'Wide', { A1: { value: 'a' }, F1: { value: 'f' } }, { colBreaks: [{ id: 3 }] })] },
+    displayValues: {},
+  }))
+  assert.deepEqual(rangesOf(columnBreak), ['1:1|A:C', '1:1|D:F'], 'column breaks start a new page to the right')
+}
+
+{
+  const cells = { A1: { value: 'Key' } }
+  for (let col = 1; col < 30; col += 1) cells[`${columnLetter(col)}1`] = { value: col }
+  const wide = sheet('wide', 'Wide', cells, { pageSetup: { printTitlesColumn: '$A:$A' } })
+  const result = createSpreadsheetPrintDocument(request({ scaling: 'actual' }, {
+    workbook: { version: 1, name: 'Wide.xlsx', activeSheetId: 'wide', sheets: [wide] },
+    displayValues: {},
+  }))
+  assert.deepEqual(rangesOf(result), ['1:1|A:K', '1:1|A:U', '1:1|A:AD'], 'the title column leads every page across')
+  assert.equal(result.warnings.length, 0, 'title columns are printed, not reported as unsupported')
+  assert.equal((result.html.match(/data-address="A1"/g) || []).length, 3)
+  assert.equal(createSpreadsheetPrintDocument(request({ scope: 'selection', scaling: 'actual' }, {
+    workbook: { version: 1, name: 'Wide.xlsx', activeSheetId: 'wide', sheets: [wide] },
+    displayValues: {},
+    selection: { top: 0, bottom: 0, left: 20, right: 22 },
+  })).html.includes('data-address="A1"'), false, 'printing a selection never adds title columns')
+  wide.pageSetup.printTitlesColumn = 'A:Z'
+  wide.colWidths = Object.fromEntries(Array.from({ length: 26 }, (_, index) => [String(index + 1), 20]))
+  assert.throws(() => createSpreadsheetPrintDocument(request({ scaling: 'actual' }, {
+    workbook: { version: 1, name: 'Wide.xlsx', activeSheetId: 'wide', sheets: [wide] },
+    displayValues: {},
+  })), /repeated heading columns fill the page/)
+}
+
+{
+  // Whole-column and whole-row print areas ($A:$B, $2:$3) print to the used extent (calc-file-io-objects-5).
+  const used = { A1: { value: 1 }, C5: { value: 2 } }
+  const area = (printArea, extra = {}) => createSpreadsheetPrintDocument(request({ scaling: 'actual' }, {
+    workbook: { version: 1, name: 'Area.xlsx', activeSheetId: 'area', sheets: [sheet('area', 'Area', used, { pageSetup: { printArea, ...extra } })] },
+    displayValues: {},
+  }))
+  assert.deepEqual(rangesOf(area("'Area'!$A:$B")), ['1:5|A:B'])
+  assert.deepEqual(rangesOf(area('$2:$3')), ['2:3|A:C'])
+  assert.deepEqual(rangesOf(area('A1:B1000', { printAreaWhole: { 'A1:B1000': '$A:$B' } })), ['1:5|A:B'], 'an imported whole-column area is not 1000 blank rows')
+  // Review F7: rows added after opening are part of the whole-column area.
+  assert.deepEqual(rangesOf(area('A1:B3', { printAreaWhole: { 'A1:B3': '$A:$B' } })), ['1:5|A:B'], 'rows added after opening still print')
+  assert.deepEqual(rangesOf(area('A2:B3', { printAreaWhole: { 'A2:B3': '$2:$3' } })), ['2:3|A:C'], 'columns added after opening still print')
+  const explicit = area('A1:B1000')
+  assert.deepEqual(rangesOf(explicit).slice(0, 2), ['1:47|A:B', '48:94|A:B'], 'an explicit bounded area still prints as typed')
+  assert.equal(explicit.printedCells, 2000)
+  assert.throws(() => area('A:B:C'), /saved print area is not a supported cell range/)
+}
+
+function columnLetter(index) {
+  let value = index + 1
+  let label = ''
+  while (value > 0) {
+    const remainder = (value - 1) % 26
+    label = String.fromCharCode(65 + remainder) + label
+    value = Math.floor((value - 1) / 26)
+  }
+  return label
+}
+
+verifyLegacyForm()
+  .then(() => require('./qa-print-visuals.cjs').run())
+  .then(() => require('./qa-print-dialog.cjs').run())
+  .then(() => {
+    console.log('Print layout QA passed: real legacy form and Normal-font widths, scopes, exact paper pages, saved print areas, header/footer fields and escaping, source scale vs fit, saved margins, mixed paper sizes, page breaks, orientation, scaling, headings, gridlines, merges, hidden dimensions, size limits, custom scale, fit to pages, fit rows, custom margins, page ranges, printer jobs, title columns, manual breaks and whole-column print areas.')
+  })
+  .catch((error) => { console.error(error); process.exitCode = 1 })

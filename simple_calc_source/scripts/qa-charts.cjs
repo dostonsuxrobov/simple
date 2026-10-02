@@ -677,10 +677,53 @@ async function testOfficeConversion(saved) {
   return `${chartObjects} charts imported by LibreOffice; LibreOffice XLSX: ${reimported}`
 }
 
+/** Chart titles per sheet of a saved package: { sheetName: [title, ...] }. */
+async function chartTitlesBySheet(bytes) {
+  const payload = await workbookPayloadFromBytes('titles.xlsx', bytes)
+  return Object.fromEntries(payload.workbook.sheets.map((sheet) => [sheet.name, (sheet.charts || []).map((chart) => `${chart.title}|${(chart.series[0] || {}).valuesRef || chart.unsupportedKind}`)]))
+}
+
+/**
+ * calc-file-io-objects-1: an imported chart is only copied from a base package whose part
+ * still holds that chart. With a stale base (part numbers reassigned by an earlier save) a
+ * supported chart is regenerated from the model, and a chart that cannot be regenerated is
+ * reported instead of being replaced by another chart.
+ */
+async function testStaleBase() {
+  const anchor = { from: { row: 5, col: 1, rowOffsetEmu: 0, colOffsetEmu: 0 }, to: { row: 15, col: 6, rowOffsetEmu: 0, colOffsetEmu: 0 } }
+  const sheet = (id, name) => ({ id, name, rowCount: 3, colCount: 2, merges: [], colWidths: {}, rowHeights: {}, cells: { A1: { value: 'x' }, B1: { value: 1 }, B2: { value: 2 }, B3: { value: 3 } } })
+  const second = sheet('sheet-2', 'Sheet2')
+  second.charts = [{ id: 'cA', type: 'column', title: 'Chart A', anchor, series: [{ id: 's', valuesRef: 'Sheet2!B1:B3' }] }]
+  const original = await serializeWorkbook({ version: 1, name: 't', activeSheetId: 'sheet-1', sheets: [sheet('sheet-1', 'Sheet1'), second], metadata: {} }, 'xlsx')
+  const model = (await workbookPayloadFromBytes('t.xlsx', original)).workbook
+  model.sheets[0].charts = [{ id: 'cN', type: 'line', title: 'Chart N', anchor, series: [{ id: 's', valuesRef: 'Sheet1!B1:B3' }] }]
+  const first = await serializeWorkbook(model, 'xlsx', { baseBytes: original })
+  assert.deepEqual(await chartTitlesBySheet(first), { Sheet1: ['Chart N|Sheet1!$B$1:$B$3'], Sheet2: ['Chart A|Sheet2!$B$1:$B$3'] })
+  model.sheets[0].cells.C1 = { value: 'edit' }
+  // The merge base the app keeps (the imported package) and a stale one both give the right charts.
+  for (const baseBytes of [original, first]) {
+    assert.deepEqual(await chartTitlesBySheet(await serializeWorkbook(model, 'xlsx', { baseBytes })), { Sheet1: ['Chart N|Sheet1!$B$1:$B$3'], Sheet2: ['Chart A|Sheet2!$B$1:$B$3'] })
+  }
+  // A chart that can only be byte-copied (waterfall) is never swapped for another part.
+  const fixture = await buildFixture()
+  const payload = await workbookPayloadFromBytes('charts.xlsx', fixture)
+  const stale = await JSZip.loadAsync(fixture)
+  stale.file('xl/charts/chartEx1.xml', CHART_WATERFALL.replace('<cx:v>Bridge</cx:v>', '<cx:v>Someone else</cx:v>'))
+  const warnings = []
+  const saved = await serializeWorkbook(payload.workbook, 'xlsx', { baseBytes: await stale.generateAsync({ type: 'nodebuffer' }), warnings })
+  const titles = await chartTitlesBySheet(saved)
+  assert.ok(!JSON.stringify(titles).includes('Someone else'), 'a different chart is not copied in')
+  assert.ok(warnings.some((warning) => /waterfall/.test(warning) && /Bridge/.test(warning)), 'the user is told the chart could not be kept')
+  const kept = await chartTitlesBySheet(await serializeWorkbook(payload.workbook, 'xlsx', { baseBytes: fixture }))
+  assert.ok(kept.Data.some((entry) => entry.startsWith('Bridge|')), 'with its own package the waterfall chart is kept')
+}
+
 async function main() {
   const lib = loadTsLibraries()
   await testImportAndRoundTrip(lib)
   process.stdout.write('  import + byte-exact / regenerated round trips: ok\n')
+  await testStaleBase()
+  process.stdout.write('  stale base package guard: ok\n')
   const { saved, charts, model } = await testNewCharts(lib)
   process.stdout.write('  new charts (9 types) export + reimport: ok\n')
   testRenderer(lib)

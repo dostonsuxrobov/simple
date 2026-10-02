@@ -7,20 +7,29 @@ const os = require('node:os')
 const path = require('node:path')
 const {
   SUPPORTED_EXTENSIONS,
-  workbookPayloadFromPath,
-  workbookPayloadFromBytes,
+  importWorkbookPath,
+  importWorkbookBytes,
   serializeWorkbook,
+  delimitedDialectFor,
+  supportedOrExtensionless,
 } = require('./workbooks.cjs')
 const { createSpreadsheetPrintDocument } = require('./spreadsheet-print.cjs')
-const { createSpreadsheetExport, exportFilter, normalizeExportFormat } = require('./spreadsheet-export.cjs')
-const { directPrintOptions, ensurePrinterInstalled, printFailureMessage } = require('./default-printer.cjs')
-const { EDITABLE_SAVE_FORMATS, saveFormat, unchangedSourceBytes, assertSourceUnchanged } = require('./workbook-save.cjs')
+const { createSpreadsheetExport, exportFilter, normalizeExportFormat, exportLosses } = require('./spreadsheet-export.cjs')
+const { ensurePrinterInstalled, printFailureMessage, printOptionsForDocument, registerPrinterHandlers } = require('./default-printer.cjs')
+const { saveFilters, hasOriginalBytes, unchangedSourceBytes, assertSourceUnchanged, saveDocument } = require('./workbook-save.cjs')
+const { officeEngineAvailable } = require('./office-converter.cjs')
+const { registerSharedIo, bridgeArguments } = require('./simple-io/io-ipc.cjs')
+const { sweep } = require('./simple-io/io-core.cjs')
+const { safeWriteFile } = require('./simple-io/safe-write.cjs')
+const guard = require('./simple-io/document-guard.cjs')
+const stores = require('./simple-io/stores.cjs')
+const officeEngine = require('./simple-io/office-engine.cjs')
+
+const IO_MODULE = 'calc'
 
 app.setName('simple_calc')
 
 const MAX_OPEN_BYTES = 512 * 1024 * 1024
-const RICH_OOXML_FORMATS = new Set(['xlsx', 'xlsm', 'xltx', 'xltm', 'xlam'])
-const closeApprovedWindows = new WeakSet()
 const documentsByWebContents = new Map()
 let isQuitting = false
 
@@ -47,7 +56,8 @@ function extensionOf(filePath) {
 
 function assertSupportedPath(filePath) {
   if (typeof filePath !== 'string' || !filePath.trim()) throw new Error('A workbook path is required.')
-  if (!SUPPORTED_EXTENSIONS.has(extensionOf(filePath))) throw new Error('This spreadsheet format is not supported.')
+  // Files without an extension are opened by content (CSV exports often have none).
+  if (!supportedOrExtensionless(filePath)) throw new Error('This spreadsheet format is not supported.')
   return path.resolve(filePath)
 }
 
@@ -59,23 +69,6 @@ function workbookFilters() {
     { name: 'Delimited text', extensions: ['csv', 'tsv', 'txt'] },
     { name: 'All files', extensions: ['*'] },
   ]
-}
-
-function saveFilters(preferred = 'xlsx') {
-  const filters = [
-    { name: 'Excel workbook', extensions: ['xlsx'] },
-    { name: 'Excel 97–2003 workbook', extensions: ['xls'] },
-    { name: 'OpenDocument spreadsheet', extensions: ['ods'] },
-    { name: 'Comma-separated values', extensions: ['csv'] },
-    { name: 'Tab-separated values', extensions: ['tsv'] },
-  ]
-  if (!EDITABLE_SAVE_FORMATS.has(preferred)) filters.push({ name: `${preferred.toUpperCase()} original file`, extensions: [preferred] })
-  return filters.sort((left, right) => Number(right.extensions.includes(preferred)) - Number(left.extensions.includes(preferred)))
-}
-
-function formatForPath(filePath, fallback = 'xlsx') {
-  const ext = extensionOf(filePath).slice(1)
-  return EDITABLE_SAVE_FORMATS.has(ext) || ext === fallback ? ext : fallback
 }
 
 function safeSuggestedName(value, format = 'xlsx') {
@@ -96,13 +89,35 @@ function documentStore(event) {
   return store
 }
 
-function rememberDocument(event, payload, sourcePath = null, sourceSnapshot = null) {
+/**
+ * A window shows one document at a time. When it opens or creates another one, the source
+ * bytes held by the previous records (merge base, dropped-file bytes) are released so memory
+ * does not grow with every file opened; the records themselves stay valid.
+ */
+function releaseReplacedDocuments(event) {
+  for (const record of documentStore(event).values()) {
+    if (record.saving) continue
+    record.mergeBase = null
+    if (record.sourceSnapshot && Buffer.isBuffer(record.sourceSnapshot.bytes) && record.path) delete record.sourceSnapshot.bytes
+  }
+}
+
+/**
+ * Register an opened document. `mergeBase` is the OOXML package the model was imported from;
+ * it stays the base of every XLSX save of this document (see workbook-save.cjs), so imported
+ * charts, pictures and worksheets are always copied from their own original parts.
+ */
+function rememberDocument(event, payload, sourcePath = null, sourceSnapshot = null, extras = {}) {
   const documentId = crypto.randomUUID()
+  const metadata = payload.workbook && payload.workbook.metadata
+  releaseReplacedDocuments(event)
   documentStore(event).set(documentId, {
     path: sourcePath,
     sourceFormat: payload.sourceFormat,
     originalName: payload.name,
     sourceSnapshot,
+    mergeBase: Buffer.isBuffer(extras.mergeBase) ? extras.mergeBase : null,
+    dialect: metadata && metadata.dialect && typeof metadata.dialect === 'object' ? metadata.dialect : null,
   })
   return { ...payload, documentId, path: sourcePath }
 }
@@ -112,40 +127,20 @@ async function readWorkbookPath(event, requestedPath) {
   const info = await fs.stat(filePath)
   if (!info.isFile()) throw new Error('The selected item is not a file.')
   if (info.size > MAX_OPEN_BYTES) throw new Error('This workbook is larger than the 512 MB safety limit.')
-  const payload = await workbookPayloadFromPath(filePath)
-  return rememberDocument(event, payload, filePath, {
+  const imported = await importWorkbookPath(filePath)
+  return rememberDocument(event, imported.payload, filePath, {
     path: filePath,
-    size: info.size,
-    modified: info.mtimeMs,
-  })
+    size: imported.stat.size,
+    modified: imported.stat.mtimeMs,
+  }, { mergeBase: imported.mergeBase })
 }
 
-async function sourcePackageBytes(record) {
-  if (!record || !RICH_OOXML_FORMATS.has(record.sourceFormat)) return null
-  return unchangedSourceBytes(record)
-}
-
+// Every user-visible write goes through the shared verified write: temp file in the
+// same folder, flush, read-back check, then replace with retries while another
+// program (Excel, a backup tool, an antivirus scan) holds the file.
 async function atomicWrite(targetPath, data) {
   const bytes = data && data.data && !Buffer.isBuffer(data) ? data.data : data
-  const directory = path.dirname(targetPath)
-  const temporaryPath = path.join(directory, `.${path.basename(targetPath)}.${crypto.randomUUID()}.tmp`)
-  try {
-    await fs.writeFile(temporaryPath, bytes)
-    await fs.rename(temporaryPath, targetPath).catch(async (error) => {
-      if (!['EEXIST', 'EPERM'].includes(error.code)) throw error
-      const backupPath = `${temporaryPath}.previous`
-      await fs.rename(targetPath, backupPath)
-      try {
-        await fs.rename(temporaryPath, targetPath)
-        await fs.rm(backupPath, { force: true })
-      } catch (replaceError) {
-        await fs.rename(backupPath, targetPath).catch(() => {})
-        throw replaceError
-      }
-    })
-  } finally {
-    await fs.rm(temporaryPath, { force: true }).catch(() => {})
-  }
+  await safeWriteFile(targetPath, bytes)
 }
 
 async function renderPrintDocumentToPdf(printDocument, directory) {
@@ -206,23 +201,16 @@ async function printSpreadsheet(input, owner) {
     })
     printWindow.removeMenu()
     await printWindow.loadFile(htmlPath)
-    await ensurePrinterInstalled(printWindow.webContents)
+    // The printer, copies and collation chosen in the print dialog (printDocument.printJob);
+    // without a choice the job goes to the Windows default printer.
+    await ensurePrinterInstalled(printWindow.webContents, printDocument.printJob)
     const outcome = await new Promise((resolve, reject) => {
-      printWindow.webContents.print(directPrintOptions({
-        printBackground: true,
-        color: true,
-        landscape: printDocument.options.orientation === 'landscape',
-        margins: { marginType: 'none' },
-        pageSize: printDocument.options.paperSize === 'a4' ? 'A4' : printDocument.options.paperSize === 'legal' ? 'Legal' : 'Letter',
-        scaleFactor: 100,
-        pagesPerSheet: 1,
-        collate: true,
-      }), (success, failureReason) => {
+      printWindow.webContents.print(printOptionsForDocument(printDocument), (success, failureReason) => {
         if (success) {
           resolve({ printed: true, canceled: false })
           return
         }
-        reject(new Error(printFailureMessage(failureReason)))
+        reject(new Error(printFailureMessage(failureReason, printDocument.printJob)))
       })
     })
     return {
@@ -268,8 +256,12 @@ function createWindow(openPath = null) {
       nodeIntegration: false,
       sandbox: true,
       devTools: !app.isPackaged,
+      additionalArguments: bridgeArguments(IO_MODULE),
     },
   })
+  // Save / Don't Save / Cancel on every close path, never closing during a save,
+  // and crash/hang/sign-out handling.
+  guard.installWindowGuard(browserWindow)
 
   browserWindow.removeMenu()
   browserWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
@@ -287,11 +279,6 @@ function createWindow(openPath = null) {
   })
   browserWindow.on('maximize', () => browserWindow.webContents.send('window:maximized', true))
   browserWindow.on('unmaximize', () => browserWindow.webContents.send('window:maximized', false))
-  browserWindow.on('close', (event) => {
-    if (isQuitting || closeApprovedWindows.has(browserWindow)) return
-    event.preventDefault()
-    browserWindow.webContents.send('window:close-requested')
-  })
   browserWindow.webContents.on('destroyed', () => documentsByWebContents.delete(browserWindow.webContents.id))
   return browserWindow
 }
@@ -304,9 +291,12 @@ function registerIpc() {
   // Rich clipboard (HTML plus Excel's XML Spreadsheet flavour, which carries formulas).
   registerClipboardHandlers(ipcMain, { assertTrustedSender })
   registerProtectionHandlers(ipcMain, { assertTrustedSender })
+  // The print dialog's printer list (workbook:list-printers).
+  registerPrinterHandlers(ipcMain, { assertTrustedSender })
   ipcMain.handle('workbook:create', (event) => {
     assertTrustedSender(event)
     const documentId = crypto.randomUUID()
+    releaseReplacedDocuments(event)
     documentStore(event).set(documentId, { path: null, sourceFormat: 'xlsx', originalName: 'Untitled.xlsx' })
     return { documentId }
   })
@@ -314,6 +304,11 @@ function registerIpc() {
   ipcMain.handle('workbook:new-window', async (event, requestedPath = null) => {
     assertTrustedSender(event)
     let selectedPath = requestedPath
+    // A path sent by the page comes from a link in a workbook: network shares are never opened
+    // that way (reading one connects to another machine and can send it the Windows sign-in).
+    if (typeof selectedPath === 'string' && /^[\\/]{2}/.test(selectedPath.trim()) && !/^[\\/]{2}[?.][\\/][a-z]:[\\/]/i.test(selectedPath.trim())) {
+      throw new Error('Links to network locations are not opened. Use File > Open to open that file.')
+    }
     if (!selectedPath) {
       const result = await dialog.showOpenDialog(callingWindow(event), {
         title: 'Open a spreadsheet', properties: ['openFile'], filters: workbookFilters(),
@@ -344,9 +339,26 @@ function registerIpc() {
     if (!input || typeof input.name !== 'string' || !input.data) throw new Error('Invalid dropped workbook.')
     const bytes = Buffer.from(input.data)
     if (bytes.byteLength > MAX_OPEN_BYTES) throw new Error('This workbook is larger than the 512 MB safety limit.')
-    if (!SUPPORTED_EXTENSIONS.has(extensionOf(input.name))) throw new Error('This spreadsheet format is not supported.')
-    const payload = await workbookPayloadFromBytes(input.name, bytes)
-    return rememberDocument(event, payload, null, { bytes: Buffer.from(bytes), size: bytes.length })
+    if (!supportedOrExtensionless(input.name)) throw new Error('This spreadsheet format is not supported.')
+    const imported = await importWorkbookBytes(input.name, bytes)
+    // The dropped bytes are both the original (for an unchanged copy) and the merge base.
+    return rememberDocument(event, imported.payload, null, { bytes: imported.mergeBase || Buffer.from(bytes), size: bytes.length }, { mergeBase: imported.mergeBase })
+  })
+
+  // What this machine can write: without the local document engine, XLS/ODS saves of edited
+  // files go to an .xlsx next to the original, and XLS/ODS exports use the basic writers.
+  ipcMain.handle('workbook:capabilities', async (event) => {
+    assertTrustedSender(event)
+    return { officeEngine: await officeEngineAvailable() }
+  })
+
+  // Features a basic XLS/ODS export would lose (empty when nothing is lost or the engine is present).
+  ipcMain.handle('workbook:export-check', async (event, input) => {
+    assertTrustedSender(event)
+    if (!input || !input.workbook) throw new Error('Invalid export request.')
+    const format = normalizeExportFormat(input.format)
+    const officeEngine = await officeEngineAvailable()
+    return { format, officeEngine, losses: exportLosses(input.workbook, format, { officeEngine }), confirmationRequired: format === 'xls' && !officeEngine }
   })
 
   ipcMain.handle('workbook:save', async (event, input) => {
@@ -359,51 +371,22 @@ function registerIpc() {
     if (record.saving) throw new Error('This workbook is already saving. Please wait for it to finish.')
     record.saving = true
     try {
-      let requestedFormat = saveFormat(input, record)
-      const canOverwrite = !input.saveAs && record.path && extensionOf(record.path) === `.${requestedFormat}`
-      let targetPath = canOverwrite ? record.path : null
-      if (!targetPath) {
-        const result = await dialog.showSaveDialog(callingWindow(event), {
-          title: input.saveAs ? 'Save spreadsheet as' : 'Save spreadsheet',
-          defaultPath: record.path ? path.join(path.dirname(record.path), safeSuggestedName(input.suggestedName || record.originalName, requestedFormat)) : safeSuggestedName(input.suggestedName || record.originalName, requestedFormat),
-          filters: saveFilters(requestedFormat),
-        })
-        if (result.canceled || !result.filePath) return null
-        requestedFormat = formatForPath(result.filePath, requestedFormat)
-        targetPath = result.filePath.toLowerCase().endsWith(`.${requestedFormat}`)
-          ? result.filePath
-          : `${result.filePath}.${requestedFormat}`
-      }
-
-      const originalCopy = requestedFormat === record.sourceFormat && input.sourceUnmodified === true
-      const baseBytes = originalCopy ? await unchangedSourceBytes(record, true) : requestedFormat === 'xlsx'
-        ? await sourcePackageBytes(record).catch((error) => { if (input.saveAs) return null; throw error }) : null
-      const bytes = originalCopy
-        ? baseBytes
-        : await serializeWorkbook(input.workbook, requestedFormat, {
-            baseBytes,
-            sourceFormat: record.sourceFormat,
+      const officeEngine = await officeEngineAvailable()
+      return await saveDocument(record, input, {
+        officeEngine,
+        serialize: serializeWorkbook,
+        writeFile: atomicWrite,
+        dialectFor: delimitedDialectFor,
+        backupDirectory: path.join(app.getPath('userData'), 'workbook-backups'),
+        chooseSavePath: async ({ format, suggestedName, directory, saveAs }) => {
+          const result = await dialog.showSaveDialog(callingWindow(event), {
+            title: saveAs ? 'Save spreadsheet as' : 'Save spreadsheet',
+            defaultPath: directory ? path.join(directory, safeSuggestedName(suggestedName, format)) : safeSuggestedName(suggestedName, format),
+            filters: saveFilters(format, { officeEngine }),
           })
-      const overwritesSource = record.path && path.resolve(targetPath).toLowerCase() === path.resolve(record.path).toLowerCase()
-      if (overwritesSource) await assertSourceUnchanged(record)
-      // Legacy edits pass through a real Office converter. Keep the original binary
-      // once per open document so unmodelled legacy features remain recoverable.
-      if (overwritesSource && ['xls', 'ods'].includes(record.sourceFormat) && !originalCopy && !record.backupPath) {
-        const originalBytes = await unchangedSourceBytes(record, true)
-        const backupDirectory = path.join(app.getPath('userData'), 'workbook-backups')
-        await fs.mkdir(backupDirectory, { recursive: true })
-        const backupPath = path.join(backupDirectory, `${path.basename(record.path, path.extname(record.path))}-${crypto.randomUUID()}.${record.sourceFormat}`)
-        await fs.writeFile(backupPath, originalBytes, { flag: 'wx' })
-        record.backupPath = backupPath
-        await assertSourceUnchanged(record)
-      }
-      await atomicWrite(path.resolve(targetPath), bytes)
-      record.path = path.resolve(targetPath)
-      record.sourceFormat = requestedFormat
-      record.originalName = path.basename(targetPath)
-      const info = await fs.stat(record.path)
-      record.sourceSnapshot = { path: record.path, size: info.size, modified: info.mtimeMs }
-      return { path: record.path, name: record.originalName, format: requestedFormat, backupPath: record.backupPath }
+          return result.canceled || !result.filePath ? null : result.filePath
+        },
+      })
     } finally {
       record.saving = false
     }
@@ -415,21 +398,40 @@ function registerIpc() {
     const record = documentStore(event).get(input.documentId)
     if (!record) throw new Error('This workbook is no longer attached to this window.')
     const requestedFormat = normalizeExportFormat(input.format)
+    const officeEngine = ['xls', 'ods'].includes(requestedFormat) ? await officeEngineAvailable() : true
+    const acceptLoss = input.acceptLoss === true || input.valuesOnly === true
+    // Ask before the file name is chosen: a values-only XLS needs the user's consent.
+    if (requestedFormat === 'xls' && !officeEngine && !acceptLoss) {
+      const losses = exportLosses(input.workbook, 'xls', { officeEngine })
+      throw new Error(`Excel 97-2003 export without the document engine keeps values only${losses.length ? ` and would lose: ${losses.join('; ')}` : ''}. Export as XLSX to keep everything.`)
+    }
     const result = await dialog.showSaveDialog(callingWindow(event), {
       title: `Export spreadsheet as ${requestedFormat.toUpperCase()}`,
-      defaultPath: safeSuggestedName(input.suggestedName || record.originalName, requestedFormat),
+      defaultPath: record.path ? path.join(path.dirname(record.path), safeSuggestedName(input.suggestedName || record.originalName, requestedFormat)) : safeSuggestedName(input.suggestedName || record.originalName, requestedFormat),
       filters: exportFilter(requestedFormat),
     })
     if (result.canceled || !result.filePath) return null
     const targetPath = path.resolve(result.filePath.toLowerCase().endsWith(`.${requestedFormat}`)
       ? result.filePath
       : `${result.filePath}.${requestedFormat}`)
-    const baseBytes = requestedFormat === 'xlsx' ? await sourcePackageBytes(record) : null
-    const generated = requestedFormat === 'xlsx' && record.sourceFormat === 'xlsx' && input.sourceUnmodified === true && baseBytes
-      ? { format: requestedFormat, printDocument: null, bytes: baseBytes }
+    const overwritesSource = Boolean(record.path) && targetPath.toLowerCase() === path.resolve(record.path).toLowerCase()
+    // Exporting over the document's own file must not discard changes made outside Simple
+    // (a file that no longer exists has nothing to lose).
+    if (overwritesSource) await assertSourceUnchanged(record).catch((error) => { if (error && error.code !== 'ENOENT') throw error })
+    // An unedited XLSX is exported as the current file; otherwise the model is written over the
+    // package it was imported from (never over a file a previous save produced).
+    const unchangedBytes = requestedFormat === 'xlsx' && record.sourceFormat === 'xlsx' && input.sourceUnmodified === true && hasOriginalBytes(record)
+      ? await unchangedSourceBytes(record).catch(() => null)
+      : null
+    const notes = []
+    const generated = unchangedBytes
+      ? { format: requestedFormat, printDocument: null, bytes: unchangedBytes }
       : await createSpreadsheetExport(input, requestedFormat, {
-          baseBytes,
+          baseBytes: requestedFormat === 'xlsx' ? record.mergeBase : null,
           sourceFormat: record.sourceFormat,
+          officeEngine,
+          acceptLoss,
+          warnings: notes,
         })
     let bytes = generated.bytes
     let temporaryDirectory = null
@@ -443,12 +445,19 @@ function registerIpc() {
     } finally {
       if (temporaryDirectory) await fs.rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {})
     }
+    if (overwritesSource) {
+      // The document's own file was replaced: refresh the snapshot so the next save does not
+      // report a change made outside Simple.
+      const info = await fs.stat(targetPath)
+      record.sourceSnapshot = { path: record.path, size: info.size, modified: info.mtimeMs }
+    }
     return {
       path: targetPath,
       name: path.basename(targetPath),
       format: requestedFormat,
       sheets: generated.printDocument?.sheetCount,
       cells: generated.printDocument?.printedCells,
+      ...(notes.length ? { notes: [...new Set(notes)] } : {}),
     }
   })
 
@@ -473,8 +482,16 @@ function registerIpc() {
   })
   ipcMain.handle('shell:open-external', async (event, target) => {
     assertTrustedSender(event)
-    if (typeof target !== 'string' || target.length > 8_192) throw new Error('Invalid link.')
-    const url = new URL(target)
+    if (typeof target !== 'string' || !target.trim() || target.length > 8_192) throw new Error('This link is empty or too long to open.')
+    // Places in the workbook ("#Sheet2!A1") are followed by the window itself; anything that is
+    // not a web or email address is refused with a message instead of a URL TypeError.
+    if (target.trim().startsWith('#')) throw new Error('This link points to a place in the workbook, not a web page.')
+    let url
+    try {
+      url = new URL(target.trim())
+    } catch {
+      throw new Error(`This link isn’t a valid web address: ${target.trim().slice(0, 200)}`)
+    }
     if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) throw new Error('Only web and email links can be opened.')
     await shell.openExternal(url.toString())
   })
@@ -491,7 +508,7 @@ function registerIpc() {
     assertTrustedSender(event)
     const browserWindow = callingWindow(event)
     if (!browserWindow) return
-    closeApprovedWindows.add(browserWindow)
+    // The window guard asks the page again; after Save or Discard it reports no changes.
     browserWindow.close()
   })
 }
@@ -515,6 +532,16 @@ else {
   app.whenReady().then(async () => {
     await cleanupStalePrintDirectories()
     registerIpc()
+    registerSharedIo({
+      ipcMain,
+      module: IO_MODULE,
+      guard,
+      stores,
+      officeEngine,
+      openInWindow: (filePath) => { createWindow(filePath); return true },
+    })
+    // Finish or undo any save a crash interrupted before workbooks open.
+    await sweep().catch((error) => console.error('[simple-io] sweep failed', error))
     const incoming = supportedPaths(process.argv)
     if (incoming.length) incoming.forEach((filePath) => createWindow(filePath))
     else createWindow()

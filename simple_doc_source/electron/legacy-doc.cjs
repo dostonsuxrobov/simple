@@ -3,6 +3,9 @@ const JSZip = require('jszip')
 const WordExtractor = require('word-extractor')
 const { MAX_FILE_BYTES, validateDocxBytes } = require('./docx-files.cjs')
 const { findOfficeConverter, convertOfficeBytes } = require('./office-converter.cjs')
+const { buildFlowDocx, flowText } = require('./simple-docx.cjs')
+const { parseRtf } = require('./rtf-import.cjs')
+const { htmlToFlow, mhtToFlow, sniffMarkup, word2003ToFlow } = require('./html-import.cjs')
 
 const OLE_COMPOUND_FILE_SIGNATURE = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
 const MINIMUM_OLE_FILE_BYTES = 512
@@ -232,6 +235,59 @@ async function buildEditableDocx(parts, options = {}) {
   return validateDocxBytes(bytes)
 }
 
+const LEGACY_CONTENT_LABELS = Object.freeze({
+  rtf: 'Rich Text (RTF)',
+  html: 'web page (HTML)',
+  mht: 'single-file web page (MHT)',
+  word2003: 'Word 2003 XML',
+})
+
+/**
+ * Identify what a ".doc" file really contains. Word itself opens RTF, HTML,
+ * web archives and Word 2003 XML saved with a .doc name, so Simple does too.
+ */
+function sniffLegacyDocContent(data) {
+  const bytes = toBytes(data)
+  if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4b) return 'docx'
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(OLE_COMPOUND_FILE_SIGNATURE)) return 'ole'
+  let offset = 0
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) offset = 3
+  while (offset < bytes.length && offset < 4096 && /\s/.test(String.fromCharCode(bytes[offset]))) offset += 1
+  if (bytes.subarray(offset, offset + 5).toString('latin1') === '{\\rtf') return 'rtf'
+  return sniffMarkup(bytes)
+}
+
+/** Convert RTF/HTML/MHT/Word 2003 XML content into an editable DOCX. */
+async function convertMarkupDocument(bytes, kind, options = {}) {
+  const label = LEGACY_CONTENT_LABELS[kind]
+  const notice = `This .doc file contains a ${label} document. Simple opened it directly; saving creates a .docx file and leaves the original unchanged.`
+  if (kind === 'rtf' && !options.Extractor) {
+    // A local Office engine reads RTF with full fidelity when one is already installed.
+    try {
+      const executable = options.convertOffice ? null : await findOfficeConverter()
+      if (executable || options.convertOffice) {
+        const converted = await (options.convertOffice || convertOfficeBytes)({ bytes, inputExtension: 'rtf', outputExtension: 'docx', filter: 'MS Word 2007 XML' }, { executable })
+        return { data: validateDocxBytes(converted), conversionMethod: kind, sourceFormat: kind, warnings: [notice] }
+      }
+    } catch { /* The native reader below still opens the document. */ }
+  }
+  let flow
+  try {
+    if (kind === 'rtf') flow = parseRtf(bytes)
+    else if (kind === 'mht') flow = mhtToFlow(bytes)
+    else if (kind === 'word2003') flow = word2003ToFlow(bytes)
+    else flow = htmlToFlow(bytes)
+  } catch (error) {
+    throw new Error(`Simple Docs could not read this ${label} document. ${error instanceof Error ? error.message : ''}`.trim(), { cause: error })
+  }
+  const hasObjects = flow.blocks.some((block) => block.type === 'table' || block.runs?.some((run) => run.image))
+  if (!flow.blocks.length || (!flowText(flow.blocks).trim() && !hasObjects)) {
+    throw new Error(`This ${label} document has no readable content.`)
+  }
+  const data = await buildFlowDocx(flow, { title: flow.title || String(options.title || '').replace(/\.doc$/i, '') })
+  return { data, conversionMethod: kind, sourceFormat: kind, warnings: [notice, ...(flow.warnings || [])] }
+}
+
 function actionableImportError(error) {
   const message = error instanceof Error ? error.message : String(error || '')
   if (/password|encrypted|encryption/i.test(message)) {
@@ -248,6 +304,12 @@ async function convertLegacyDocToDocx(data, options = {}) {
       data: docxBytes,
       warnings: ['This .doc filename contained a modern DOCX document. Simple Docs opened its original editable content and will save it with the correct .docx extension.'],
     }
+  }
+
+  const content = sniffLegacyDocContent(inputBytes)
+  if (content && content !== 'ole' && content !== 'docx') {
+    if (inputBytes.byteLength > MAX_FILE_BYTES) throw new Error('This legacy .doc file exceeds the 256 MB safe-open limit.')
+    return convertMarkupDocument(inputBytes, content, options)
   }
 
   const bytes = validateLegacyDocBytes(inputBytes)
@@ -284,7 +346,7 @@ async function convertLegacyDocToDocx(data, options = {}) {
     data: converted,
     conversionMethod: 'text',
     warnings: [
-      'Text-only import: original formatting, images, tables, and page layout were not preserved. Install LibreOffice or open a DOCX copy to keep the document structure.',
+      'Text-only import: this Word 97–2003 file’s formatting, images, tables and page layout cannot be read on this computer, so only its text was recovered. Saving creates a separate .docx file and leaves the original .doc unchanged. Formatted import uses a local Office engine (such as LibreOffice) only when one is already installed.',
       ...(conversionWarning ? [conversionWarning] : []),
       ...(supplementaryPartCount ? ['Headers, footers, notes, comments, or text boxes were appended as editable sections.'] : []),
       ...result.warnings,
@@ -293,12 +355,15 @@ async function convertLegacyDocToDocx(data, options = {}) {
 }
 
 module.exports = {
+  LEGACY_CONTENT_LABELS,
   MINIMUM_OLE_FILE_BYTES,
   OLE_COMPOUND_FILE_SIGNATURE,
   buildEditableDocx,
   convertLegacyDocToDocx,
+  convertMarkupDocument,
   normalizeLegacyText,
   readLegacyDocumentParts,
+  sniffLegacyDocContent,
   validateLegacyDocBytes,
   visibleSupplementaryParts,
 }

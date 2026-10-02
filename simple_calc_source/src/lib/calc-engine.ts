@@ -1,10 +1,11 @@
 import type { CellData, CellScalar, DefinedName, SheetData, WorkbookModel } from '../spreadsheet-types'
 import {
+  diagnoseFormula,
   evaluateFormulaDetailed,
   formulaMayReturnArray,
   isFormulaError,
 } from './formulas'
-import type { FormulaEvaluationHooks, FormulaRangeBounds, FormulaResult, FormulaTableInfo } from './formulas'
+import type { FormulaDiagnostic, FormulaEvaluationHooks, FormulaRangeBounds, FormulaResult, FormulaTableInfo } from './formulas'
 
 /**
  * Workbook calculation engine.
@@ -20,6 +21,69 @@ const MAX_COLUMNS = 16_384
 const FALLBACK_ERRORS = new Set(['#NAME?', '#PARSE!', '#ERROR!'])
 
 type Key = string
+
+/**
+ * Excel's calculation options (File > Options > Formulas), kept in the workbook's
+ * `metadata.calcProperties` (the file's <calcPr>) so they travel with the file.
+ */
+export interface CalculationOptions {
+  /** 'automatic' recalculates dependents on every change; 'manual' waits for recalculate() (F9). */
+  mode: 'automatic' | 'manual'
+  /** Resolve circular references by iteration instead of reporting them as #CIRC!. */
+  iterate: boolean
+  /** Most iterations per recalculation (Excel's default is 100). */
+  maxIterations: number
+  /** Iteration stops once no value in the cycle changes by more than this (default 0.001). */
+  maxChange: number
+}
+
+export const DEFAULT_CALCULATION_OPTIONS: CalculationOptions = { mode: 'automatic', iterate: false, maxIterations: 100, maxChange: 0.001 }
+
+function flagValue(value: unknown) {
+  return value === true || value === 1 || value === '1' || (typeof value === 'string' && value.toLowerCase() === 'true')
+}
+
+/** The calculation options stored in a workbook (defaults for anything missing). */
+export function calculationOptionsOf(workbook: WorkbookModel): CalculationOptions {
+  const properties = workbook.metadata?.calcProperties || {}
+  const count = properties.iterateCount === true ? 1 : Number(properties.iterateCount)
+  const delta = Number(properties.iterateDelta)
+  return {
+    mode: String(properties.calcMode || '').toLowerCase() === 'manual' ? 'manual' : 'automatic',
+    iterate: flagValue(properties.iterate),
+    maxIterations: Number.isFinite(count) && count >= 1 ? Math.min(32_767, Math.trunc(count)) : DEFAULT_CALCULATION_OPTIONS.maxIterations,
+    maxChange: Number.isFinite(delta) && delta >= 0 ? delta : DEFAULT_CALCULATION_OPTIONS.maxChange,
+  }
+}
+
+/** A copy of the workbook with calculation options written to `metadata.calcProperties`. */
+export function withCalculationOptions(workbook: WorkbookModel, options: Partial<CalculationOptions>): WorkbookModel {
+  const next = { ...calculationOptionsOf(workbook), ...options }
+  const calcProperties: Record<string, unknown> = {
+    ...(workbook.metadata?.calcProperties || {}),
+    calcMode: next.mode === 'manual' ? 'manual' : 'auto',
+    iterate: next.iterate,
+    iterateCount: next.maxIterations,
+    iterateDelta: next.maxChange,
+  }
+  return { ...workbook, metadata: { ...(workbook.metadata || {}), calcProperties } }
+}
+
+/**
+ * Imported formulas from a workbook file that Excel reads as legacy (pre-dynamic-array)
+ * formulas carry `implicitIntersection: true`; they are intersected instead of spilling.
+ */
+type EngineCell = CellData & { implicitIntersection?: boolean }
+
+function isLegacyFormula(cell: CellData | undefined) {
+  return Boolean(cell?.formula) && (cell as EngineCell).implicitIntersection === true && cell!.formulaType !== 'array'
+}
+
+function iterationChange(before: CellScalar | undefined, after: CellScalar | undefined) {
+  if (Object.is(before, after)) return 0
+  if (typeof before === 'number' && typeof after === 'number') return Math.abs(after - before)
+  return Infinity
+}
 
 interface Rect {
   sheetId: string
@@ -198,10 +262,36 @@ export class CalculationEngine {
    */
   private override: { key: Key; sheetId: string; row: number; col: number; value: CellScalar; bypass: Set<Key> } | null = null
   private revision = 0
+  private options: CalculationOptions
+  /** Changes a manual-mode workbook has not recalculated yet. */
+  private pendingRects: Rect[] = []
+  private pendingKeys = new Set<Key>()
+  private pendingVolatile = false
+  private pendingAll = false
+  /** Formula cells found on a circular reference, in the order they were found. */
+  private circular = new Set<Key>()
+  /** Circular cells awaiting iteration, and each one's value from the previous iteration. */
+  private iterationPending = new Set<Key>()
+  private iterationValues = new Map<Key, CellScalar>()
+  private iterating = false
+  /** Formulas whose result relies on array evaluation where a legacy formula would intersect. */
+  private arrayEvaluated = new Set<Key>()
 
   constructor(workbook: WorkbookModel) {
     this.workbook = workbook
+    this.options = calculationOptionsOf(workbook)
     this.indexSheets()
+  }
+
+  /** The workbook's calculation options (mode, iteration). */
+  get calculationOptions(): CalculationOptions {
+    return { ...this.options }
+  }
+
+  /** Manual calculation mode has changes that recalculate() has not applied yet ("Calculate"). */
+  get needsRecalculation() {
+    return this.options.mode === 'manual' &&
+      (this.pendingRects.length > 0 || this.pendingKeys.size > 0 || this.pendingVolatile || this.pendingAll)
   }
 
   /** Current revision number; increases whenever any cached value may have changed. */
@@ -241,6 +331,14 @@ export class CalculationEngine {
     this.spillReady.clear()
     this.usedRanges.clear()
     this.sortedCells.clear()
+    this.circular.clear()
+    this.iterationPending.clear()
+    this.iterationValues.clear()
+    this.arrayEvaluated.clear()
+    this.pendingRects = []
+    this.pendingKeys.clear()
+    this.pendingVolatile = false
+    this.pendingAll = false
   }
 
   /**
@@ -259,11 +357,24 @@ export class CalculationEngine {
       previous.metadata?.definedNames !== next.metadata?.definedNames
     const previousById = new Map(previous.sheets.map((sheet) => [sheet.id, sheet]))
     this.indexSheets()
+    let releasePending = false
+    if (previous.metadata?.calcProperties !== next.metadata?.calcProperties) {
+      const options = calculationOptionsOf(next)
+      const iterationChanged = options.iterate !== this.options.iterate ||
+        options.maxIterations !== this.options.maxIterations || options.maxChange !== this.options.maxChange
+      releasePending = this.options.mode === 'manual' && options.mode === 'automatic'
+      this.options = options
+      if (iterationChanged) {
+        this.resetAll()
+        return
+      }
+    }
     if (structural) {
       this.resetAll()
       return
     }
 
+    const manual = this.options.mode === 'manual'
     const changedRects: Rect[] = []
     let anyChange = false
     for (const sheet of next.sheets) {
@@ -275,8 +386,11 @@ export class CalculationEngine {
       }
       if (old.merges !== sheet.merges) this.invalidateSpillAnchors(sheet.id, changedRects)
       if (old.hiddenRows !== sheet.hiddenRows || old.filteredRows !== sheet.filteredRows) {
+        // SUBTOTAL/AGGREGATE formulas anywhere in the workbook that read this sheet's rows.
         for (const key of [...this.visibilityKeys]) {
-          if (key.startsWith(`${sheet.id}!`)) this.invalidateFormula(key, changedRects)
+          if (!key.startsWith(`${sheet.id}!`) && !this.deps.get(key)?.some((rect) => rect.sheetId === sheet.id)) continue
+          if (manual) this.pendingKeys.add(key)
+          else this.invalidateFormula(key, changedRects)
         }
         anyChange = true
       }
@@ -287,9 +401,80 @@ export class CalculationEngine {
       const addresses = sheetHint && sheetHint !== 'all' ? sheetHint : this.diffCells(old.cells, sheet.cells)
       for (const address of addresses) this.cellChanged(sheet, old.cells[address], sheet.cells[address], address, changedRects)
     }
+    if (releasePending) {
+      // Switching back to automatic calculation applies everything manual mode held back.
+      this.applyPending(changedRects)
+      return
+    }
     if (!anyChange && !changedRects.length) return
+    if (manual) {
+      // Manual calculation: the edited formulas themselves recalculate; their dependents and
+      // volatile functions wait for recalculate() (F9).
+      this.pendingVolatile = true
+      if (this.pendingRects.length + changedRects.length > 50_000) this.pendingAll = true
+      else this.pendingRects.push(...changedRects)
+      return
+    }
     for (const key of [...this.volatileKeys]) this.invalidateFormula(key, changedRects)
     this.propagate(changedRects)
+  }
+
+  /**
+   * F9: recalculate everything changed since the last calculation (manual mode) and every
+   * volatile function (NOW, RAND, OFFSET, ...) and circular reference.
+   */
+  recalculate() {
+    if (this.stack.length) return
+    this.revision += 1
+    this.applyPending([])
+  }
+
+  private applyPending(extraRects: Rect[]) {
+    if (this.pendingAll) {
+      this.resetAll()
+      return
+    }
+    const rects = [...this.pendingRects, ...extraRects]
+    this.pendingRects = []
+    this.pendingVolatile = false
+    for (const key of this.pendingKeys) this.invalidateFormula(key, rects)
+    this.pendingKeys.clear()
+    for (const key of [...this.volatileKeys]) this.invalidateFormula(key, rects)
+    this.propagate(rects)
+  }
+
+  /** Ctrl+Alt+F9: discard every calculated value and calculate the whole workbook again. */
+  recalculateAll() {
+    if (this.stack.length) return
+    this.revision += 1
+    this.resetAll()
+  }
+
+  /**
+   * Shift+F9: recalculate the formulas on one sheet. In manual mode other sheets keep their
+   * values until recalculate().
+   */
+  recalculateSheet(sheetId: string) {
+    if (this.stack.length) return
+    this.revision += 1
+    const rects: Rect[] = []
+    for (const key of [...this.values.keys()]) {
+      if (key.startsWith(`${sheetId}!`)) this.invalidateFormula(key, rects)
+    }
+    this.spillReady.delete(sheetId)
+    if (this.options.mode !== 'manual') this.propagate(rects)
+  }
+
+  /**
+   * Formula cells found on circular references (each cell of a cycle, in the order found), as
+   * Excel lists under Formulas > Error Checking > Circular References. Only calculated cells
+   * are known; calculateAll() first for a complete list.
+   */
+  circularReferences(): Array<{ sheetId: string; address: string }> {
+    return [...this.circular].map((key) => {
+      const separator = key.indexOf('!')
+      return { sheetId: key.slice(0, separator), address: key.slice(separator + 1) }
+    })
   }
 
   private diffCells(previous: SheetData['cells'], next: SheetData['cells']) {
@@ -309,7 +494,7 @@ export class CalculationEngine {
     const key = `${sheet.id}!${address}`
     const candidates = this.candidates.get(sheet.id)
     if (candidates) {
-      if (after?.formula && formulaMayReturnArray(after.formula)) candidates.add(address)
+      if (after?.formula && !isLegacyFormula(after) && formulaMayReturnArray(after.formula)) candidates.add(address)
       else candidates.delete(address)
     }
     if (after && (after.formula || after.value !== undefined)) {
@@ -489,6 +674,8 @@ export class CalculationEngine {
     this.removeDependencies(key)
     this.volatileKeys.delete(key)
     this.visibilityKeys.delete(key)
+    this.circular.delete(key)
+    this.arrayEvaluated.delete(key)
     this.clearSpill(key, changedRects)
     this.spillAttempts.delete(key)
     const separator = key.indexOf('!')
@@ -527,6 +714,7 @@ export class CalculationEngine {
     return this.sheetById.get(reference) || this.sheetByName.get(reference.toLocaleLowerCase())
   }
 
+  /** Extent of a sheet's cells and spilled arrays (whole-column/row references stop here). */
   private usedRangeOf(sheet: SheetData) {
     let used = this.usedRanges.get(sheet.id)
     if (!used) {
@@ -537,6 +725,13 @@ export class CalculationEngine {
         if (!coord) continue
         if (coord.row + 1 > maxRow) maxRow = coord.row + 1
         if (coord.col + 1 > maxCol) maxCol = coord.col + 1
+      }
+      // Spilled members are not cells, but A:A and 1:1 must still reach them.
+      const prefix = `${sheet.id}!`
+      for (const [key, spill] of this.spills) {
+        if (!key.startsWith(prefix)) continue
+        if (spill.bottom + 1 > maxRow) maxRow = spill.bottom + 1
+        if (spill.right + 1 > maxCol) maxCol = spill.right + 1
       }
       used = { maxRow, maxCol }
       this.usedRanges.set(sheet.id, used)
@@ -584,8 +779,8 @@ export class CalculationEngine {
     if (!set) {
       set = new Set()
       for (const address in sheet.cells) {
-        const formula = sheet.cells[address]?.formula
-        if (formula && formulaMayReturnArray(formula)) set.add(address)
+        const cell = sheet.cells[address]
+        if (cell?.formula && !isLegacyFormula(cell) && formulaMayReturnArray(cell.formula)) set.add(address)
       }
       this.candidates.set(sheet.id, set)
     }
@@ -653,16 +848,22 @@ export class CalculationEngine {
     return this.valueOf(sheet, normalized)
   }
 
-  private hooksFor(sheet: SheetData, coord: CellCoordinate): FormulaEvaluationHooks {
+  private hooksFor(sheet: SheetData, coord: CellCoordinate, legacy = false): FormulaEvaluationHooks {
     return {
       currentCell: { row: coord.row + 1, column: coord.col + 1 },
+      // The resolver returns calculated values: a text "=..." is text, never a formula.
+      resolverReturnsValues: true,
+      ...(legacy ? { implicitIntersection: true } : {}),
       getUsedRange: (reference) => {
         const target = this.resolveSheet(reference)
-        return target ? this.usedRangeOf(target) : null
+        if (!target) return null
+        this.ensureSpills(target)
+        return this.usedRangeOf(target)
       },
       forEachCellInRange: (reference, bounds, visit) => {
         const target = this.resolveSheet(reference)
         if (!target) return
+        this.ensureSpills(target)
         const coordinates = this.sortedCoordinates(target)
         // Binary search the first populated row inside the bounds.
         let low = 0
@@ -688,6 +889,22 @@ export class CalculationEngine {
           visit(row, column)
         }
         if (pending) visit(pending[0], pending[1])
+        // Spilled array members are not stored cells; visit the ones inside the bounds too.
+        const prefix = `${target.id}!`
+        for (const [key, spill] of this.spills) {
+          if (!key.startsWith(prefix)) continue
+          const top = Math.max(spill.top + 1, bounds.startRow)
+          const bottom = Math.min(spill.bottom + 1, bounds.endRow)
+          const left = Math.max(spill.left + 1, bounds.startColumn)
+          const right = Math.min(spill.right + 1, bounds.endColumn)
+          for (let row = top; row <= bottom; row += 1) {
+            for (let column = left; column <= right; column += 1) {
+              if (target.cells[cellAddress(row - 1, column - 1)]) continue
+              if (override && override.sheetId === target.id && override.row + 1 === row && override.col + 1 === column) continue
+              visit(row, column)
+            }
+          }
+        }
       },
       resolveDefinedName: (name, sheetId) => this.definedNameValue(name, sheetId),
       isFormulaCell: (reference, address) => Boolean(this.resolveSheet(reference)?.cells[address.replace(/\$/g, '').toUpperCase()]?.formula),
@@ -746,8 +963,21 @@ export class CalculationEngine {
     const visitingIndex = this.stackIndex.get(key)
     if (visitingIndex !== undefined) {
       // A speculative spill probe that loops back outside itself must not cache anything.
-      if (this.speculativeRoot >= 0 && visitingIndex < this.speculativeRoot) this.discardFrom = Math.min(this.discardFrom, this.speculativeRoot)
-      return '#CIRC!'
+      if (this.speculativeRoot >= 0 && visitingIndex < this.speculativeRoot) {
+        this.discardFrom = Math.min(this.discardFrom, this.speculativeRoot)
+        return '#CIRC!'
+      }
+      // A real circular reference: every formula from the re-entered cell up the stack is on it.
+      if (!this.override) {
+        for (let index = visitingIndex; index < this.stack.length; index += 1) {
+          this.circular.add(this.stack[index].key)
+          if (this.options.iterate) this.iterationPending.add(this.stack[index].key)
+        }
+      }
+      if (!this.options.iterate) return '#CIRC!'
+      // Iterative calculation: the cycle reads the value from the previous iteration.
+      if (this.iterationValues.has(key)) return this.iterationValues.get(key) ?? null
+      return typeof cell.result === 'number' ? cell.result : 0
     }
     const coord = parseCellAddress(address)
     if (!coord) return '#REF!'
@@ -756,7 +986,7 @@ export class CalculationEngine {
     this.stack.push(frame)
     let result
     try {
-      result = evaluateFormulaDetailed(cell.formula!, sheet.id, this.resolver, this.hooksFor(sheet, coord))
+      result = evaluateFormulaDetailed(cell.formula!, sheet.id, this.resolver, this.hooksFor(sheet, coord, isLegacyFormula(cell)))
     } catch {
       result = { value: '#ERROR!' as FormulaResult }
     } finally {
@@ -781,6 +1011,8 @@ export class CalculationEngine {
     if (frame.volatile) this.volatileKeys.add(key)
     if (frame.visibility) this.visibilityKeys.add(key)
     if (stale) this.stale.add(key)
+    if (result.arrayEvaluation) this.arrayEvaluated.add(key)
+    else this.arrayEvaluated.delete(key)
     this.clearSpill(key)
     this.spillAttempts.delete(key)
 
@@ -803,6 +1035,12 @@ export class CalculationEngine {
             if (row === coord.row && col === coord.col) continue
             this.spillCover.set(`${sheet.id}!${cellAddress(row, col)}`, key)
           }
+        }
+        // Whole-column/row references (A:A, 1:1) must reach the spilled cells.
+        const used = this.usedRanges.get(sheet.id)
+        if (used) {
+          used.maxRow = Math.max(used.maxRow, region.bottom + 1)
+          used.maxCol = Math.max(used.maxCol, region.right + 1)
         }
         // Formulas that read these cells before the array spilled here saw blanks.
         this.propagate([region])
@@ -893,7 +1131,54 @@ export class CalculationEngine {
     if (!this.stack.length && this.spillReady.size < this.workbook.sheets.length) {
       for (const candidate of this.workbook.sheets) this.ensureSpills(candidate)
     }
+    const value = this.valueOf(sheet, address)
+    if (!this.iterationPending.size || this.stack.length || this.iterating) return value
+    this.settleIterations()
     return this.valueOf(sheet, address)
+  }
+
+  /**
+   * Iterative calculation (Excel's "Enable iterative calculation"): recalculate the cells of
+   * the circular references found by the last evaluation, each pass reading the previous
+   * pass's values, until no value changes by more than maxChange or maxIterations is reached.
+   */
+  private settleIterations() {
+    if (this.iterating || this.stack.length || !this.iterationPending.size) return
+    this.iterating = true
+    try {
+      const members = new Set(this.iterationPending)
+      this.iterationPending.clear()
+      // The evaluation that found the cycle was the first pass.
+      for (let pass = 1; pass < this.options.maxIterations; pass += 1) {
+        const before = new Map<Key, CellScalar>()
+        for (const key of members) {
+          const value = this.values.get(key) ?? null
+          before.set(key, value)
+          this.iterationValues.set(key, value)
+        }
+        const rects: Rect[] = []
+        for (const key of members) this.invalidateFormula(key, rects)
+        this.propagate(rects)
+        let change = 0
+        for (const key of members) change = Math.max(change, iterationChange(before.get(key), this.valueAtKey(key)))
+        for (const key of this.iterationPending) members.add(key)
+        this.iterationPending.clear()
+        if (change <= this.options.maxChange) break
+      }
+      for (const key of members) {
+        this.iterationValues.set(key, this.values.get(key) ?? null)
+        // Circular cells take part in every recalculation, as in Excel.
+        if (this.values.has(key)) this.volatileKeys.add(key)
+      }
+    } finally {
+      this.iterating = false
+    }
+  }
+
+  private valueAtKey(key: Key): CellScalar {
+    const separator = key.indexOf('!')
+    const sheet = this.sheetById.get(key.slice(0, separator))
+    return sheet ? this.valueOf(sheet, key.slice(separator + 1)) : null
   }
 
   /**
@@ -951,6 +1236,19 @@ export class CalculationEngine {
     return this.stale.has(`${sheetId}!${address}`)
   }
 
+  /**
+   * Why a formula (a cell's, or `formula` as if entered on the sheet) cannot be calculated as
+   * written: a syntax problem with its position and a repaired suggestion, or an unknown
+   * function or name. Null when it is fine.
+   */
+  diagnose(sheetId: string, address: string, formula?: string): FormulaDiagnostic | null {
+    const text = formula ?? this.sheetById.get(sheetId)?.cells[address]?.formula
+    if (!text) return null
+    return diagnoseFormula(text.startsWith('=') ? text : `=${text}`, {
+      isDefinedName: (name) => this.definedNameValue(name, sheetId) !== undefined,
+    })
+  }
+
   /** Anchor address of the dynamic array covering a cell, if any (including the anchor itself). */
   spillAnchorOf(sheetId: string, address: string): string | null {
     const key = `${sheetId}!${address}`
@@ -1005,13 +1303,20 @@ export class CalculationEngine {
         if (cell?.formula) this.evaluateFormulaCell(sheet, address, cell)
       }
     }
+    this.settleIterations()
   }
 
   /**
    * A copy of the workbook with formula results, spill metadata, and spilled member values
    * written into the cells, ready for saving/exporting. Unchanged sheets keep identity.
    */
-  withResults(): WorkbookModel {
+  withResults(options: { forSave?: boolean } = {}): WorkbookModel {
+    // Saving or exporting recalculates a manual-mode workbook first, as Excel does ("Recalculate
+    // workbook before saving", <calcPr calcOnSave>, on by default), so files never carry stale
+    // results. Printing and previews (forSave false) show the values on screen.
+    const calcOnSave = this.workbook.metadata?.calcProperties?.calcOnSave
+    const recalculateOnSave = !(calcOnSave !== undefined && calcOnSave !== null && calcOnSave !== '' && !flagValue(calcOnSave))
+    if (options.forSave !== false && this.needsRecalculation && recalculateOnSave) this.recalculate()
     this.calculateAll()
     let changed = false
     const sheets = this.workbook.sheets.map((sheet) => {
@@ -1041,6 +1346,13 @@ export class CalculationEngine {
             if (next.formulaRange !== range || next.formulaType !== 'array' || !next.dynamicFormula) dirty = true
             next.formulaType = 'array'
             next.formulaRange = range
+            next.dynamicFormula = true
+          } else if (this.arrayEvaluated.has(key) && !isLegacyFormula(cell) && cell.formulaType !== 'shared' && (cell.formulaType !== 'array' || cell.dynamicFormula)) {
+            // =SUM(A1:A3*2) relies on array evaluation; saved as a plain formula Excel would
+            // implicitly intersect A1:A3, so it is saved as a one-cell array formula.
+            if (next.formulaRange !== address || next.formulaType !== 'array' || !next.dynamicFormula) dirty = true
+            next.formulaType = 'array'
+            next.formulaRange = address
             next.dynamicFormula = true
           } else if (cell.dynamicFormula || (cell.formulaType === 'array' && cell.formulaRange && parseRange(cell.formulaRange) && (() => {
             const bounds = parseRange(cell.formulaRange!)!

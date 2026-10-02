@@ -42,7 +42,7 @@ export interface DataHost {
    * Resolve a list-validation source: an A1 range (optionally sheet-qualified), a defined name or
    * a formula such as OFFSET/INDIRECT. Returns the cells row-major, or null when unresolvable.
    */
-  resolveReference?(reference: string, origin: { row: number; col: number }): Array<{ value: Scalar; text: string }> | null
+  resolveReference?(reference: string, origin: { row: number; col: number }): Array<{ value: Scalar; text: string; numFmt?: string }> | null
   /** Reference shifting (for custom formulas written relative to a range's top-left). */
   shiftFormula?: ShiftFormula
   /** Clock used by relative date filters (tests pin it). */

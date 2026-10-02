@@ -8,6 +8,7 @@ const ExcelJS = require('exceljs')
 const XLSX = require('xlsx')
 const { extractLegacyBiffStyles } = require('../electron/legacy-biff-styles.cjs')
 const { serializeWorkbook, workbookPayloadFromPath } = require('../electron/workbooks.cjs')
+const { findOfficeConverter } = require('../electron/office-converter.cjs')
 
 const FIXTURE_PATH = path.join(__dirname, 'fixtures', 'schedule_template.xls')
 const FIXTURE_SHA256 = '0b7c348b35dc5624ae134c09043708b85b980648c89bfda587522f4f9c0c8787'
@@ -71,7 +72,9 @@ async function main() {
 
   const opened = await workbookPayloadFromPath(FIXTURE_PATH)
   assert.equal(opened.sourceFormat, 'xls')
-  assert.equal(opened.requiresSaveAs, false)
+  // Without the document engine an edited .xls is saved as an .xlsx next to the original.
+  const officeEngine = Boolean(await findOfficeConverter())
+  assert.equal(opened.requiresSaveAs, !officeEngine)
   assert.equal(opened.workbook.sheets.length, 1)
   assert.equal(opened.stats.formulas, 2)
 

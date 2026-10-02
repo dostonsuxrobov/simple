@@ -1,5 +1,5 @@
 const { createSpreadsheetPrintDocument } = require('./spreadsheet-print.cjs')
-const { serializeWorkbook } = require('./workbooks.cjs')
+const { serializeWorkbook, nativeExportLosses } = require('./workbooks.cjs')
 
 const EXPORT_FORMATS = new Set(['xlsx', 'xls', 'ods', 'csv', 'tsv', 'pdf', 'html'])
 const TABULAR_FORMATS = new Set(['xlsx', 'xls', 'ods', 'csv', 'tsv'])
@@ -27,6 +27,16 @@ function exportFilter(format) {
   return [{ name: labels[normalized], extensions: [normalized] }]
 }
 
+/**
+ * What an export to `format` would lose. XLS and ODS are written by the basic SheetJS writers
+ * when the document engine is absent (XLS keeps values only); with the engine nothing is listed.
+ */
+function exportLosses(workbook, format, options = {}) {
+  const normalized = normalizeExportFormat(format)
+  if (!['xls', 'ods'].includes(normalized) || options.officeEngine) return []
+  return nativeExportLosses(workbook, normalized)
+}
+
 async function createSpreadsheetExport(input, format, serializationOptions = {}) {
   if (!input || typeof input !== 'object' || !input.workbook || typeof input.workbook !== 'object') {
     throw new Error('Invalid spreadsheet export request.')
@@ -49,5 +59,6 @@ module.exports = {
   TABULAR_FORMATS,
   createSpreadsheetExport,
   exportFilter,
+  exportLosses,
   normalizeExportFormat,
 }

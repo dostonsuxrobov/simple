@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { CircleAlert, Download, FileSpreadsheet, X } from 'lucide-react'
 import type { SpreadsheetExportFormat, SpreadsheetPrintOptions } from '../spreadsheet-types'
+import { CustomLayoutFields, layoutOptionsOf } from './SpreadsheetPrintDialog'
+import type { PrintMarginChoice, PrintScalingChoice, SpreadsheetPrintJobOptions } from './SpreadsheetPrintDialog'
+import './print-dialog.css'
 
 interface SpreadsheetExportDialogProps {
   sheetCount: number
@@ -35,7 +38,7 @@ export function SpreadsheetExportDialog({
   onExport,
 }: SpreadsheetExportDialogProps) {
   const [format, setFormat] = useState<SpreadsheetExportFormat>('pdf')
-  const [options, setOptions] = useState<SpreadsheetPrintOptions>({
+  const [options, setOptions] = useState<SpreadsheetPrintJobOptions>({
     useSavedLayout: true,
     scope: 'workbook',
     orientation: 'portrait',
@@ -47,9 +50,12 @@ export function SpreadsheetExportDialog({
   })
   const [exporting, setExporting] = useState(false)
   const [error, setError] = useState('')
+  const [layoutError, setLayoutError] = useState('')
   const firstChoiceRef = useRef<HTMLButtonElement>(null)
   const pageFormat = format === 'pdf' || format === 'html'
   const activeSheetOnly = format === 'csv' || format === 'tsv'
+  // Custom scale and margin fields only matter for page formats with a manual layout.
+  const inputProblem = pageFormat && !options.useSavedLayout ? layoutError : ''
 
   useEffect(() => {
     firstChoiceRef.current?.focus()
@@ -64,10 +70,12 @@ export function SpreadsheetExportDialog({
   }, [exporting, onClose])
 
   const submit = async () => {
+    if (inputProblem) return
     setExporting(true)
     setError('')
     try {
-      if (await onExport(format, options)) onClose()
+      // The print engine validates the extended layout choices (custom scale, margins, fit to pages).
+      if (await onExport(format, layoutOptionsOf(options) as unknown as SpreadsheetPrintOptions)) onClose()
       else setExporting(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
@@ -151,10 +159,13 @@ export function SpreadsheetExportDialog({
               </label>
               <label>
                 <span>Scaling</span>
-                <select aria-label="Export scaling" disabled={options.useSavedLayout} value={options.scaling} onChange={(event) => setOptions((current) => ({ ...current, scaling: event.target.value as SpreadsheetPrintOptions['scaling'] }))}>
+                <select aria-label="Export scaling" disabled={options.useSavedLayout} value={options.scaling} onChange={(event) => setOptions((current) => ({ ...current, scaling: event.target.value as PrintScalingChoice }))}>
                   <option value="fit-width">Fit all columns on one page</option>
+                  <option value="fit-height">Fit all rows on one page</option>
                   <option value="fit-sheet">Fit sheet on one page</option>
                   <option value="actual">Actual size</option>
+                  <option value="custom">Custom scale…</option>
+                  <option value="fit-pages">Fit to pages…</option>
                 </select>
               </label>
               <label>
@@ -167,12 +178,14 @@ export function SpreadsheetExportDialog({
               </label>
               <label>
                 <span>Margins</span>
-                <select aria-label="Export margins" disabled={options.useSavedLayout} value={options.margins} onChange={(event) => setOptions((current) => ({ ...current, margins: event.target.value as SpreadsheetPrintOptions['margins'] }))}>
+                <select aria-label="Export margins" disabled={options.useSavedLayout} value={options.margins} onChange={(event) => setOptions((current) => ({ ...current, margins: event.target.value as PrintMarginChoice }))}>
                   <option value="normal">Normal</option>
                   <option value="narrow">Narrow</option>
                   <option value="wide">Wide</option>
+                  <option value="custom">Custom…</option>
                 </select>
-              </label></>}
+              </label>
+              <CustomLayoutFields scaling={options.scaling} margins={options.margins} customMargins={options.customMargins} onChange={setOptions} onProblemChange={setLayoutError} /></>}
             </div>
             {!options.useSavedLayout && <fieldset className="print-options" disabled={exporting}>
               <legend>Sheet details</legend>
@@ -185,12 +198,13 @@ export function SpreadsheetExportDialog({
         {activeSheetOnly && sheetCount > 1 && <div className="print-warning"><CircleAlert size={15} aria-hidden="true" /><span>This format exports only the active sheet. Other sheets, formatting, merges, formulas, charts, and images are not included.</span></div>}
         {format === 'ods' && <div className="export-note">OpenDocument keeps all worksheets, values, formulas, and common styles. Excel-only features may be simplified.</div>}
         {pageFormat && compatibilityWarning && <div className="print-warning"><CircleAlert size={15} aria-hidden="true" /><span>Floating charts, drawings, or images may not appear. Cell values and formatting are included.</span></div>}
+        {inputProblem && <div className="print-error" role="alert">{inputProblem}</div>}
         {error && <div className="print-error" role="alert">{error}</div>}
 
         <div className="prompt-actions print-actions">
           <span className="prompt-hint">The export is a separate file and does not change the open workbook.</span>
           <button type="button" className="secondary-action" disabled={exporting} onClick={onClose}>Cancel</button>
-          <button type="button" className="primary-action" disabled={exporting} onClick={() => { void submit() }}><Download size={14} />{exporting ? 'Exporting…' : `Export ${format.toUpperCase()}`}</button>
+          <button type="button" className="primary-action" disabled={exporting || Boolean(inputProblem)} onClick={() => { void submit() }}><Download size={14} />{exporting ? 'Exporting…' : `Export ${format.toUpperCase()}`}</button>
         </div>
       </section>
     </div>

@@ -657,7 +657,17 @@ function rowHasContent(sheet: CellMap, row: number, left: number, right: number)
  * blank rows and columns. Returns null when the cell is empty and has no filled neighbour.
  */
 export function detectCurrentRegion(sheet: CellMap, row: number, col: number): Bounds | null {
-  const bounds: Bounds = { top: row, bottom: row, left: col, right: col }
+  const region = currentRegionAround(sheet, { top: row, bottom: row, left: col, right: col })
+  if (region.top === region.bottom && region.left === region.right && !occupied(sheet, row, col)) return null
+  return region
+}
+
+/**
+ * The current region grown from a whole rectangle (a selection) rather than one cell: the
+ * rectangle plus every block of data touching it, bounded by blank rows and columns.
+ */
+export function currentRegionAround(sheet: CellMap, start: Bounds): Bounds {
+  const bounds: Bounds = { ...start }
   // Each side remembers the span of its outer line already found empty, so growing the region
   // in one direction never rescans the other sides' lines (linear in the region's perimeter).
   const memos: Record<'top' | 'bottom' | 'left' | 'right', { line: number; from: number; to: number } | null> = { top: null, bottom: null, left: null, right: null }
@@ -684,7 +694,6 @@ export function detectCurrentRegion(sheet: CellMap, row: number, col: number): B
     while (bounds.left > 0 && sideHasContent('left', bounds.left - 1, bounds.top - 1, bounds.bottom + 1)) { bounds.left -= 1; changed = true }
     while (bounds.right < MAX_COLUMNS - 1 && sideHasContent('right', bounds.right + 1, bounds.top - 1, bounds.bottom + 1)) { bounds.right += 1; changed = true }
   }
-  if (bounds.top === bounds.bottom && bounds.left === bounds.right && !occupied(sheet, row, col)) return null
   return bounds
 }
 
@@ -754,6 +763,24 @@ export function applyFilterResult(sheet: Pick<SheetData, 'hiddenRows' | 'filtere
 export function hiddenRowsWithoutFilter(sheet: Pick<SheetData, 'hiddenRows' | 'filteredRows'>): number[] {
   const filtered = new Set(sheet.filteredRows || [])
   return (sheet.hiddenRows || []).filter((row) => !filtered.has(row))
+}
+
+/**
+ * 0-based rows an active filter (the sheet's AutoFilter or a table's) currently hides. Excel's
+ * range commands (Delete, Fill Down/Right, the fill handle, Ctrl+Enter, Copy, formatting, the
+ * status-bar sums) act on visible cells only in a filtered list, so they skip these rows. Rows
+ * the user hid by hand are not included: Excel still clears, fills and copies those.
+ */
+export function filterHiddenRowSet(sheet: Pick<SheetData, 'hiddenRows' | 'filteredRows'>): Set<number> {
+  const rows = new Set<number>()
+  if (!sheet.filteredRows?.length || !sheet.hiddenRows?.length) return rows
+  const hidden = new Set(sheet.hiddenRows.map(Number))
+  for (const value of sheet.filteredRows) {
+    const row = Number(value)
+    // A filtered row the user unhid by hand is visible again, so commands act on it.
+    if (Number.isInteger(row) && row >= 1 && hidden.has(row)) rows.add(row - 1)
+  }
+  return rows
 }
 
 /**

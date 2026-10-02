@@ -163,6 +163,37 @@ function renderGroup(group) {
   return `<x14:sparklineGroup ${attributes.join(' ')}>${colorXml}<x14:sparklines>${sparklines}</x14:sparklines></x14:sparklineGroup>`
 }
 
+function quoteSheetName(name) {
+  return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(name) && !/^[A-Za-z]{1,3}\d+$/.test(name) ? name : `'${name.replace(/'/g, "''")}'`
+}
+
+/**
+ * A sheet renamed in the editor keeps its import-time name in `sourceSheetName`. Sparkline
+ * sources that still name a sheet which no longer exists by that name, but whose source name
+ * matches a renamed sheet, are pointed at the sheet's current name (Excel rewrites them the
+ * same way on rename). Returns the group unchanged when nothing needs remapping.
+ */
+function remapRenamedSources(group, model) {
+  const names = new Set((model.sheets || []).map((sheet) => String(sheet.name).toLowerCase()))
+  const renamed = new Map()
+  for (const sheet of model.sheets || []) {
+    const source = typeof sheet.sourceSheetName === 'string' ? sheet.sourceSheetName : ''
+    if (source && source !== sheet.name && !names.has(source.toLowerCase())) renamed.set(source.toLowerCase(), sheet.name)
+  }
+  if (!renamed.size) return group
+  let changed = false
+  const sparklines = group.sparklines.map((item) => {
+    const match = /^\s*(?:'((?:[^']|'')+)'|([^'!]+))!(.+)$/.exec(String(item && item.source || ''))
+    if (!match) return item
+    const sheetName = match[1] != null ? match[1].replace(/''/g, "'") : match[2]
+    const target = renamed.get(sheetName.toLowerCase())
+    if (!target || names.has(sheetName.toLowerCase())) return item
+    changed = true
+    return { ...item, source: `${quoteSheetName(target)}!${match[3]}` }
+  })
+  return changed ? { ...group, sparklines } : group
+}
+
 /** Write the model's sparkline groups into each worksheet part of a package built by ExcelJS. */
 async function writeSparklinesToPackage(zip, model) {
   const sheets = (model.sheets || []).filter((sheet) => Array.isArray(sheet.sparklineGroups))
@@ -175,7 +206,9 @@ async function writeSparklinesToPackage(zip, model) {
     let xml = await file.async('string')
     xml = xml.replace(new RegExp(`<ext\\b[^>]*uri="${EXT_URI.replace(/[{}]/g, '\\$&')}"[\\s\\S]*?</ext>`, 'g'), '')
     xml = xml.replace(/<extLst>\s*<\/extLst>/, '')
-    const groups = sheet.sparklineGroups.filter((group) => group && Array.isArray(group.sparklines) && group.sparklines.length)
+    const groups = sheet.sparklineGroups
+      .filter((group) => group && Array.isArray(group.sparklines) && group.sparklines.length)
+      .map((group) => remapRenamedSources(group, model))
     if (groups.length) {
       const ext = `<ext uri="${EXT_URI}" xmlns:x14="${NS_X14}"><x14:sparklineGroups xmlns:xm="${NS_XM}">${groups.map(renderGroup).join('')}</x14:sparklineGroups></ext>`
       const close = xml.lastIndexOf('</worksheet>')

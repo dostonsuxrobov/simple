@@ -16,6 +16,7 @@ import {
   Printer,
   Redo2,
   Save,
+  ScanText,
   Signature,
   Square,
   Strikethrough,
@@ -51,6 +52,8 @@ interface ToolbarProps {
   onZoom: (zoom: number) => void
   onFit: (mode: 'fit' | 'width' | 'actual' | 'custom') => void
   onPrint: () => void
+  /** Opens Recognize text (OCR). */
+  onRecognizeText: () => void
   onBookmark: () => void
   onImmersive: () => void
 }
@@ -59,7 +62,7 @@ export function Toolbar(props: ToolbarProps) {
   const {
     sidebarOpen, pageIndex, pageCount, zoom, zoomMode, tool, bookmarked, canUndo, canRedo,
     onToggleSidebar, onOpen, onSave, onExport, onUndo, onRedo, onTool,
-    onPage, onZoom, onFit, onPrint, onBookmark, onImmersive,
+    onPage, onZoom, onFit, onPrint, onRecognizeText, onBookmark, onImmersive,
   } = props
   const [pageValue, setPageValue] = useState(String(pageIndex + 1))
   const [zoomValue, setZoomValue] = useState(String(Math.round(zoom * 100)))
@@ -145,6 +148,7 @@ export function Toolbar(props: ToolbarProps) {
       <div className="toolbar-group toolbar-trailing">
         <IconButton icon={Eye} label="Immersive reading (Esc to exit)" onClick={onImmersive} />
         <IconButton icon={Bookmark} label={bookmarked ? 'Remove bookmark' : 'Bookmark this page'} active={bookmarked} onClick={onBookmark} />
+        <IconButton icon={ScanText} label="Recognize text (OCR)" onClick={onRecognizeText} />
         <IconButton icon={Printer} label="Print (Ctrl+P)" onClick={onPrint} />
       </div>
     </div>

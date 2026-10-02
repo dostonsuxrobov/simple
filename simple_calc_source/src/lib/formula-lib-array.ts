@@ -251,12 +251,12 @@ export function extendedMatch(
   const count = candidates.length;
   if (matchMode === 2 && typeof key === "string") {
     const tokens = wildcardTokens(key, true);
-    const work = { steps: 0 };
     for (let offset = 0; offset < count; offset += 1) {
       const index = reverse ? count - 1 - offset : offset;
       const candidate = candidates[index];
       if (typeof candidate !== "string") continue;
-      const matched = wildcardMatches(candidate, tokens, true, work);
+      // The step limit applies to each candidate, not to the whole lookup range.
+      const matched = wildcardMatches(candidate, tokens, true);
       if (matched === null) return valueError();
       if (matched) return index;
     }

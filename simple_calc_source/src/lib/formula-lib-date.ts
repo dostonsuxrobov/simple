@@ -16,7 +16,9 @@ import type { EvaluationError, EvaluationScalar } from "./formulas";
 import { integerArg, numberArg, numError, spec, valueError } from "./formula-lib-shared";
 import type { Specs, Value } from "./formula-lib-shared";
 
-// ---- Civil date arithmetic (proleptic Gregorian, serial 0 = 1899-12-30) ---------------------
+// ---- Civil date arithmetic (Excel's 1900 date system) ----------------------------------------
+// Serials from 61 (1900-03-01) on are day counts from 1899-12-30; earlier serials are one less
+// because Excel counts a 1900-02-29 (serial 60), and serial 0 is 1900-01-00.
 
 export interface CivilDate {
   y: number;
@@ -37,9 +39,12 @@ function daysFromCivil(year: number, month: number, day: number): number {
 
 const EPOCH_DAYS = daysFromCivil(1899, 12, 30);
 
-/** Excel serial (integer part) to a civil date. */
+/** Excel serial (integer part) to a civil date (serial 60 is Excel's 1900-02-29). */
 export function civilFromSerial(serial: number): CivilDate {
-  const z = Math.floor(serial) + EPOCH_DAYS + 719468;
+  const whole = Math.floor(serial);
+  if (whole === 0) return { y: 1900, m: 1, d: 0 };
+  if (whole === 60) return { y: 1900, m: 2, d: 29 };
+  const z = (whole > 0 && whole < 60 ? whole + 1 : whole) + EPOCH_DAYS + 719468;
   const era = Math.floor(z / 146097);
   const doe = z - era * 146097;
   const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
@@ -56,7 +61,8 @@ export function serialFromCivil(year: number, month: number, day: number): numbe
   const totalMonths = year * 12 + (month - 1);
   const y = Math.floor(totalMonths / 12);
   const m = totalMonths - y * 12 + 1;
-  return daysFromCivil(y, m, 1) - EPOCH_DAYS + (day - 1);
+  const first = daysFromCivil(y, m, 1) - EPOCH_DAYS;
+  return (first < 61 ? first - 1 : first) + (day - 1);
 }
 
 export function isLeapYear(year: number): boolean {
@@ -64,7 +70,7 @@ export function isLeapYear(year: number): boolean {
 }
 
 export function daysInMonthOf(year: number, month: number): number {
-  if (month === 2) return isLeapYear(year) ? 29 : 28;
+  if (month === 2) return isLeapYear(year) || year === 1900 ? 29 : 28;
   return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 

@@ -89,13 +89,41 @@ function imagesFromWorksheet(worksheet, sheet) {
   return budget.exceeded ? null : images
 }
 
+function mediaBytes(medium) {
+  if (!medium) return null
+  if (Buffer.isBuffer(medium.buffer)) return medium.buffer
+  if (typeof medium.base64 === 'string') {
+    try { return Buffer.from(medium.base64.slice(medium.base64.indexOf(',') + 1), 'base64') } catch { return null }
+  }
+  return null
+}
+
+/** Media id with exactly these bytes, so a picture that is already in the package is not embedded twice. */
+function existingMediaId(workbook, extension, bytes) {
+  const crypto = require('node:crypto')
+  if (!workbook.__simpleCalcMediaIndex) {
+    const index = new Map()
+    ;(workbook.media || []).forEach((medium, id) => {
+      const data = medium && medium.type === 'image' ? mediaBytes(medium) : null
+      if (data) index.set(`${String(medium.extension || '').toLowerCase()}:${crypto.createHash('sha256').update(data).digest('hex')}`, id)
+    })
+    workbook.__simpleCalcMediaIndex = index
+  }
+  const key = `${extension}:${crypto.createHash('sha256').update(bytes).digest('hex')}`
+  return { id: workbook.__simpleCalcMediaIndex.get(key), key }
+}
+
 /** Replace a worksheet's pictures with the model's. Sheets without an `images` list are left alone. */
-function applyImagesToWorksheet(worksheet, sheet, preserveBase) {
-  if (!Array.isArray(sheet.images)) return
+function applyImagesToWorksheet(worksheet, sheet, preserveBase, options = {}) {
+  if (!Array.isArray(sheet.images)) {
+    // A matched source worksheet whose pictures the editor modelled and then removed entirely
+    // (the list was dropped instead of emptied) must not keep the source pictures.
+    if (!options.clearMissing) return
+  }
   const workbook = worksheet.workbook || worksheet._workbook
   if (!workbook || typeof worksheet.addImage !== 'function') return
   worksheet._media = (worksheet._media || []).filter((medium) => medium.type !== 'image')
-  for (const image of sheet.images) {
+  for (const image of Array.isArray(sheet.images) ? sheet.images : []) {
     if (!image || !image.anchor || !image.anchor.from || !image.anchor.to) continue
     let imageId = null
     if (preserveBase && Number.isInteger(image.sourceImageId) && workbook.getImage(image.sourceImageId)) imageId = image.sourceImageId
@@ -103,7 +131,15 @@ function applyImagesToWorksheet(worksheet, sheet, preserveBase) {
       const match = /^data:([^;,]+);base64,(.+)$/i.exec(String(image.src || ''))
       const extension = match && EXTENSION[match[1].toLowerCase()]
       if (!extension) continue
-      imageId = workbook.addImage({ base64: match[2], extension })
+      let bytes = null
+      try { bytes = Buffer.from(match[2], 'base64') } catch { bytes = null }
+      if (!bytes || !bytes.length) continue
+      const existing = existingMediaId(workbook, extension, bytes)
+      if (Number.isInteger(existing.id) && workbook.getImage(existing.id)) imageId = existing.id
+      else {
+        imageId = workbook.addImage({ buffer: bytes, extension })
+        workbook.__simpleCalcMediaIndex.set(existing.key, imageId)
+      }
     }
     const point = (value) => ({
       nativeCol: Math.max(0, Math.floor(Number(value.col) || 0)),
@@ -115,4 +151,38 @@ function applyImagesToWorksheet(worksheet, sheet, preserveBase) {
   }
 }
 
-module.exports = { imagesFromWorksheet, applyImagesToWorksheet, EMU_PER_PIXEL }
+/**
+ * Keep only the media some worksheet still shows. ExcelJS writes every media entry it loaded
+ * from the source package, so a picture the user deleted (a signature, an ID scan) would
+ * otherwise stay inside the saved file. Ids are remapped in place.
+ */
+function compactWorkbookMedia(workbook) {
+  if (!workbook || !Array.isArray(workbook.media) || !workbook.media.length) return
+  const worksheets = typeof workbook.eachSheet === 'function' ? workbook.worksheets : []
+  const used = new Set()
+  for (const worksheet of worksheets) {
+    for (const medium of worksheet._media || []) {
+      const id = medium ? Number(medium.imageId) : NaN
+      if (Number.isInteger(id)) used.add(id)
+    }
+  }
+  const remap = new Map()
+  const media = []
+  workbook.media.forEach((medium, id) => {
+    // Non-image media (none today) are kept untouched.
+    if (!medium || (medium.type === 'image' && !used.has(id))) return
+    remap.set(id, media.length)
+    media.push(medium)
+  })
+  if (media.length === workbook.media.length) return
+  for (const worksheet of worksheets) {
+    for (const medium of worksheet._media || []) {
+      const id = medium ? Number(medium.imageId) : NaN
+      if (remap.has(id)) medium.imageId = remap.get(id)
+    }
+  }
+  workbook.media = media
+  delete workbook.__simpleCalcMediaIndex
+}
+
+module.exports = { imagesFromWorksheet, applyImagesToWorksheet, compactWorkbookMedia, EMU_PER_PIXEL }

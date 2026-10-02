@@ -194,6 +194,88 @@ async function loadExcelJS(bytes) {
   return workbook
 }
 
+const RED_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==', 'base64')
+
+/** A source sheet loaded with everything a sheet can carry besides cells. */
+async function decoratedSheetSource() {
+  const workbook = new ExcelJS.Workbook()
+  workbook.addWorksheet('Summary').getCell('A1').value = 'summary'
+  const old = workbook.addWorksheet('Old', { properties: { tabColor: { argb: 'FFFF0000' } } })
+  old.getCell('A1').value = 'old data'
+  old.getCell('A2').value = 'x'
+  old.headerFooter.oddHeader = '&CCONFIDENTIAL - Old payroll'
+  old.dataValidations.add('B2:B20', { type: 'list', allowBlank: true, formulae: ['"Yes,No"'] })
+  old.addConditionalFormatting({ ref: 'A1:C20', rules: [{ type: 'expression', formulae: ['TRUE'], style: { fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF0000' } } } }] })
+  old.addImage(workbook.addImage({ buffer: RED_PNG, extension: 'png' }), 'D2:F6')
+  old.addTable({ name: 'Salaries', ref: 'H1', headerRow: true, columns: [{ name: 'Name' }, { name: 'Salary' }], rows: [['Ann', 9000]] })
+  old.autoFilter = 'A1:C5'
+  await old.protect('secret', {})
+  return Buffer.from(await workbook.xlsx.writeBuffer({ useStyles: true, useSharedStrings: true }))
+}
+
+function assertBareSheet(sheet, label) {
+  assert(sheet, `${label} exists`)
+  assert.equal(sheet.properties.tabColor, undefined, `${label}: no inherited tab colour`)
+  assert.ok(!sheet.headerFooter || !sheet.headerFooter.oddHeader, `${label}: no inherited header`)
+  assert.ok(!sheet.sheetProtection || !sheet.sheetProtection.sheet, `${label}: not protected`)
+  assert.equal(Object.keys(sheet.dataValidations.model).length, 0, `${label}: no inherited dropdowns`)
+  assert.equal(sheet.conditionalFormattings.length, 0, `${label}: no inherited conditional formats`)
+  assert.equal(sheet.getImages().length, 0, `${label}: no inherited pictures`)
+  assert.equal(sheet.getTables().length, 0, `${label}: no inherited tables`)
+  assert.ok(!sheet.autoFilter, `${label}: no inherited filter`)
+}
+
+/**
+ * calc-file-io-objects-2 / CALC-SIE-11: a sheet added after deleting another one never
+ * inherits the deleted sheet's objects, and settings the model removed do not come back.
+ */
+async function sheetIdentity() {
+  const source = await decoratedSheetSource()
+  const opened = (await workbookPayloadFromBytes('identity.xlsx', source)).workbook
+  // (A) delete "Old", add a fresh "Sheet2" (the shape App.addSheet creates); (A2) named "Old".
+  for (const name of ['Sheet2', 'Old']) {
+    const model = structuredClone(opened)
+    model.sheets.splice(1, 1)
+    model.sheets.push({ id: `new-${name}`, name, state: 'visible', rowCount: 100, colCount: 26, cells: { A1: { value: 'my new data' } }, merges: [], colWidths: {}, rowHeights: {}, frozen: {} })
+    const saved = await loadExcelJS(await serializeWorkbook(model, 'xlsx', { baseBytes: source }))
+    const sheet = saved.getWorksheet(name)
+    assertBareSheet(sheet, `new sheet "${name}"`)
+    assert.equal(sheet.getCell('A1').value, 'my new data')
+    assert.equal(saved.media.length, 0, 'the deleted sheet\'s picture is not kept in the package')
+  }
+  // (C) settings removed in the editor (keys dropped from the model) do not come back.
+  const cleared = structuredClone(opened)
+  const old = cleared.sheets[1]
+  for (const key of ['autoFilter', 'sheetProtection', 'dataValidations', 'conditionalFormattings', 'tables', 'images']) delete old[key]
+  old.properties = { ...old.properties }
+  delete old.properties.tabColor
+  old.headerFooter = {}
+  const clearedBook = await loadExcelJS(await serializeWorkbook(cleared, 'xlsx', { baseBytes: source }))
+  assertBareSheet(clearedBook.getWorksheet('Old'), 'cleared "Old"')
+  // An untouched matched sheet keeps everything.
+  const kept = await loadExcelJS(await serializeWorkbook(opened, 'xlsx', { baseBytes: source }))
+  const keptOld = kept.getWorksheet('Old')
+  assert.equal(keptOld.properties.tabColor.argb, 'FFFF0000')
+  assert.ok(keptOld.sheetProtection.sheet)
+  assert.equal(keptOld.getImages().length, 1)
+  assert.equal(keptOld.getTables().length, 1)
+  assert.ok(Object.keys(keptOld.dataValidations.model).length > 0)
+  // (Dup) a duplicate moved before its original: the original keeps the source worksheet
+  // (here: pictures the editor did not load), the copy gets a fresh one.
+  const duplicated = structuredClone(opened)
+  const original = duplicated.sheets[1]
+  delete original.images
+  original.requiresSourcePackage = ['images']
+  delete original.tables
+  original.tables = []
+  const copy = { ...structuredClone(original), id: 'copy', name: 'Old (2)' }
+  duplicated.sheets.splice(1, 0, copy)
+  const duplicateBook = await loadExcelJS(await serializeWorkbook(duplicated, 'xlsx', { baseBytes: source }))
+  assert.equal(duplicateBook.getWorksheet('Old').getImages().length, 1, 'the original keeps its source pictures')
+  assert.equal(duplicateBook.getWorksheet('Old (2)').getImages().length, 0, 'the copy does not take the original\'s source worksheet')
+  assert.deepEqual(duplicateBook.worksheets.map((sheet) => sheet.name), ['Summary', 'Old (2)', 'Old'])
+}
+
 async function main() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'simple-calc-fidelity-'))
   try {
@@ -264,7 +346,9 @@ async function main() {
     assert(!reopened.warnings.some((warning) => /images/i.test(warning)))
     assert(reopenedSheet.images && reopenedSheet.images.length > 0, 'pictures are loaded into the editor')
 
-    process.stdout.write('Fidelity QA passed: source-backed XLSX overlay retained styles, formulas, structure, validations, conditional formatting, tables, images, and print/view settings.\n')
+    await sheetIdentity()
+
+    process.stdout.write('Fidelity QA passed: source-backed XLSX overlay retained styles, formulas, structure, validations, conditional formatting, tables, images, and print/view settings; new sheets never inherit a deleted sheet\'s objects and removed settings stay removed.\n')
   } finally {
     await fs.rm(directory, { recursive: true, force: true })
   }

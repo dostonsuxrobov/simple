@@ -112,6 +112,24 @@ button { color: inherit; }
 
 .toast { position: fixed; z-index: 150; left: 50%; bottom: 28px; transform: translateX(-50%); max-width: 480px; padding: 10px 14px; border-radius: 8px; background: #111; color: white; box-shadow: 0 8px 26px rgba(0,0,0,.18); font-size: 11px; }
 .toast[data-tone="error"] { background: #a51d15; }
+
+/* Paste options: a small chip after a formatted paste (pressing Ctrl opens it). */
+.paste-options { position: fixed; z-index: 90; left: 0; top: 0; }
+.paste-options.is-offscreen { visibility: hidden; }
+.paste-options-button { height: 24px; display: inline-flex; align-items: center; gap: 1px; padding: 0 4px 0 5px; border: 1px solid #cfcfcf; border-radius: 6px; background: #fff; color: #333; box-shadow: 0 3px 10px rgba(0,0,0,.12); cursor: default; }
+.paste-options-button:hover, .paste-options.is-open .paste-options-button { border-color: #a7a7a7; background: #f5f5f5; }
+.paste-options-button:focus-visible { outline: 2px solid #111; outline-offset: 1px; }
+.paste-options-button svg { width: 15px; height: 15px; }
+.paste-options-button svg:last-child { width: 10px; height: 10px; }
+.paste-options-menu { position: absolute; left: 0; top: 28px; width: 236px; padding: 5px; border: 1px solid #d6d6d6; border-radius: 10px; background: #fff; box-shadow: 0 12px 35px rgba(0,0,0,.14); }
+.paste-options.opens-up .paste-options-menu { top: auto; bottom: 28px; }
+.paste-options.opens-left .paste-options-menu { left: auto; right: 0; }
+.paste-options-menu button { width: 100%; display: flex; align-items: center; gap: 9px; padding: 8px 9px; border: 0; border-radius: 7px; background: transparent; font-size: 12px; text-align: left; cursor: default; }
+.paste-options-menu button:hover, .paste-options-menu button:focus-visible { background: #f3f3f3; outline: none; }
+.paste-options-menu button svg { width: 14px; height: 14px; flex: none; visibility: hidden; }
+.paste-options-menu button[aria-checked="true"] svg { visibility: visible; }
+.paste-options-menu button span { flex: 1 1 auto; }
+.paste-options-menu kbd { flex: none; padding: 1px 5px; border: 1px solid #dcdcdc; border-radius: 4px; background: #fafafa; color: #555; font: 600 9px/1.5 "Segoe UI", sans-serif; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 200; display: grid; place-items: center; background: rgba(0,0,0,.24); backdrop-filter: blur(2px); }
 .modal { width: min(400px, calc(100% - 32px)); padding: 24px; border: 1px solid #d2d2d2; border-radius: 13px; background: #fff; box-shadow: 0 20px 60px rgba(0,0,0,.2); }
 .modal-icon { width: 34px; height: 34px; margin-bottom: 16px; }
@@ -248,9 +266,17 @@ body.focus-mode .editor-host .cw-review { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
   .print-preview-spinner { animation: none; border-color: #777; }
 }
-.document-compatibility { padding: 8px 20px; background: #eff5ee; border-bottom: 1px solid #d6dfd2; color: #374631; font-size: 12px; line-height: 1.45; flex-shrink: 0; }
+.document-compatibility { display: flex; align-items: flex-start; gap: 12px; padding: 8px 12px 8px 20px; background: #eff5ee; border-bottom: 1px solid #d6dfd2; color: #374631; font-size: 12px; line-height: 1.45; flex-shrink: 0; }
 .document-compatibility.is-warning { background: #fff5dd; border-color: #e7d5a8; color: #654e1c; }
 .document-compatibility[hidden] { display: none; }
+.document-compatibility > span { flex: 1 1 auto; min-width: 0; }
+.notice-close { flex: none; display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: inherit; opacity: .65; }
+.notice-close:hover { opacity: 1; background: rgba(0,0,0,.06); }
+.notice-close svg { width: 12px; height: 12px; }
+.modal .modal-note { margin-top: 10px; color: #707070; font-size: 11px; }
+#choice-modal .modal { width: min(440px, calc(100% - 32px)); }
+#choice-modal .modal-actions { flex-wrap: wrap; }
+.toast { cursor: default; }
 .document-layout-bar { display: flex; align-items: center; gap: 16px; padding: 7px 14px; border-bottom: 1px solid #d7d7d7; background: #fff; flex-shrink: 0; font-size: 12px; color: #555; }
 .document-layout-bar > div { display: flex; gap: 3px; flex-shrink: 0; }
 .document-layout-bar button { border: 1px solid #ccc; border-radius: 5px; background: #fff; padding: 6px 10px; font-size: 12px; cursor: pointer; }
@@ -259,3 +285,121 @@ body.focus-mode .editor-host .cw-review { display: none !important; }
 .original-layout-view { position: absolute; inset: 0; display: flex; flex-direction: column; background: #ddd; }
 .original-layout-view > p { padding: 30px; text-align: center; }
 .original-layout-view iframe { border: 0; width: 100%; height: 100%; flex: 1; }
+
+/* Page view shows the original pages; WordCanvas's floating bars, panes and
+   menus belong to the hidden editor and stay out of it. */
+body.page-view .cw-float-panel,
+body.page-view .cw-float-drawer,
+body.page-view .cw-fmtbar,
+body.page-view .cw-ctxbar,
+body.page-view .cw-linkbar,
+body.page-view .cw-pop,
+body.page-view .cw-menu { display: none !important; }
+
+/* Undo and Redo in the title bar. */
+.history-actions { display: flex; align-items: center; gap: 1px; }
+.history-button svg { width: 16px; height: 16px; }
+.action-button:disabled { color: #b4b4b4; background: transparent; }
+.action-button:disabled:hover, .action-button:disabled:active { background: transparent; }
+.action-divider { width: 1px; height: 18px; margin: 0 5px 0 4px; background: #dedede; }
+
+/* Command search (Alt+Q). */
+.command-search { position: relative; flex: 0 1 280px; min-width: 150px; align-self: center; display: flex; align-items: center; height: 30px; margin: 0 4px; padding: 0 8px; border: 1px solid #dadada; border-radius: 7px; background: #f6f6f6; -webkit-app-region: no-drag; }
+.command-search:hover { border-color: #c4c4c4; }
+.command-search:focus-within { border-color: #111; background: #fff; box-shadow: 0 0 0 1px #111; }
+.command-search-icon { width: 14px; height: 14px; flex: none; color: #6b6b6b; }
+.command-search-icon svg { width: 100%; height: 100%; display: block; }
+.command-search input { min-width: 0; flex: 1 1 auto; height: 100%; padding: 0 6px; border: 0; outline: 0; background: transparent; color: #111; font-size: 11px; }
+.command-search input::placeholder { color: #7b7b7b; }
+.command-search-key { flex: none; padding: 1px 5px; border: 1px solid #d6d6d6; border-radius: 4px; background: #fff; color: #6f6f6f; font: 600 9px/1.4 "Segoe UI", sans-serif; }
+.command-search:focus-within .command-search-key { display: none; }
+.command-search-list { position: absolute; z-index: 120; top: 34px; left: -1px; right: -1px; min-width: 300px; max-height: min(420px, calc(100vh - 70px)); overflow: auto; padding: 5px; border: 1px solid #d6d6d6; border-radius: 10px; background: #fff; box-shadow: 0 12px 35px rgba(0,0,0,.16); }
+.command-search-option { display: flex; align-items: center; gap: 10px; padding: 7px 9px; border-radius: 7px; cursor: default; }
+.command-search-option[aria-selected="true"] { background: #efefef; }
+.command-search-option[aria-disabled="true"] { color: #8d8d8d; }
+.command-search-text { min-width: 0; flex: 1 1 auto; display: grid; gap: 1px; }
+.command-search-text strong { overflow: hidden; font-size: 12px; font-weight: 560; text-overflow: ellipsis; white-space: nowrap; }
+.command-search-text small { overflow: hidden; color: #777; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.command-search-option kbd { flex: none; padding: 1px 5px; border: 1px solid #dcdcdc; border-radius: 4px; background: #fafafa; color: #555; font: 600 9px/1.5 "Segoe UI", sans-serif; }
+.command-search-option[data-recent="true"] .command-search-text strong::before { content: "↺ "; color: #8a8a8a; font-weight: 400; }
+.command-search-empty { padding: 12px 10px; color: #6f6f6f; font-size: 11px; }
+
+/* Small in-app dialogs that ask for text (links, bookmarks, comments, names). */
+.form-dialog { width: min(420px, calc(100% - 32px)); }
+.form-dialog .form-dialog-message { margin-bottom: 4px; }
+.form-dialog-fields { display: grid; gap: 12px; margin-top: 16px; }
+.form-field { display: grid; gap: 5px; color: #444; font-size: 11px; font-weight: 600; }
+.form-field input, .form-field textarea { width: 100%; padding: 8px 10px; border: 1px solid #cfcfcf; border-radius: 7px; background: #fff; color: #111; font: inherit; font-size: 12px; font-weight: 400; }
+.form-field textarea { min-height: 84px; resize: vertical; line-height: 1.45; }
+.form-field input:focus-visible, .form-field textarea:focus-visible { outline: 2px solid #111; outline-offset: -1px; border-color: #111; }
+.form-field [aria-invalid="true"] { border-color: #a51d15; }
+.form-field-hint { color: #777; font-size: 10px; font-weight: 400; }
+.form-dialog-error { margin: 10px 0 0 !important; color: #a51d15 !important; font-size: 11px !important; }
+.form-dialog .modal-actions { margin-top: 20px; }
+.form-dialog .modal-actions .form-dialog-extra { margin-right: auto; border-color: transparent; color: #a51d15; }
+.form-dialog .modal-actions .form-dialog-extra:hover { background: #fbeceb; }
+.form-dialog :focus-visible { outline-offset: 2px; }
+
+/* Settings dialogs (Paragraph, Page numbers): labelled numbers with units, choices, check boxes. */
+.settings-dialog { width: min(470px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; }
+.settings-section { margin: 14px 0 0; padding: 0; border: 0; min-width: 0; }
+.settings-section legend { margin-bottom: 8px; padding: 0; color: #727272; font-size: 9px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+.settings-field { display: grid; gap: 5px; align-content: start; color: #444; font-size: 11px; font-weight: 600; }
+.settings-field.is-checkbox { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.settings-field.is-checkbox input { width: 15px; height: 15px; margin: 0; accent-color: #111; }
+.settings-field select, .settings-input { width: 100%; height: 32px; border: 1px solid #cfcfcf; border-radius: 7px; background: #fff; color: #111; font-size: 12px; font-weight: 400; }
+.settings-field select { padding: 0 8px; }
+.settings-input { display: flex; align-items: center; overflow: hidden; }
+.settings-input input { min-width: 0; flex: 1 1 auto; height: 100%; padding: 0 8px; border: 0; background: transparent; color: inherit; font-size: 12px; outline: none; }
+.settings-unit { flex: none; padding: 0 9px 0 2px; color: #777; font-size: 11px; font-weight: 500; }
+.settings-input:focus-within, .settings-field select:focus-visible { outline: 2px solid #111; outline-offset: -1px; border-color: #111; }
+.settings-field [aria-invalid="true"] { color: #a51d15; }
+.settings-input:has([aria-invalid="true"]) { border-color: #a51d15; }
+
+/* The font box: Word's font name box with type-to-search. */
+.font-box { position: relative; display: inline-flex; align-items: stretch; height: 24px; border: 1px solid #c8c6c4; border-radius: 3px; background: #fff; vertical-align: middle; }
+.font-box:hover { border-color: #8a8886; }
+.font-box:focus-within, .font-box.is-open { border-color: #111; box-shadow: 0 0 0 1px #111; }
+.font-box-input { min-width: 0; flex: 1 1 auto; padding: 0 5px; border: 0; border-radius: 3px 0 0 3px; background: transparent; color: #323130; font-size: 12px; outline: none; }
+.font-box.is-missing .font-box-input { font-style: italic; color: #605e5c; }
+.font-box-toggle { flex: none; width: 18px; padding: 0; border: 0; border-left: 1px solid transparent; border-radius: 0 3px 3px 0; background: transparent; color: #605e5c; display: grid; place-items: center; }
+.font-box-toggle:hover { background: #f3f2f1; }
+.font-box-toggle svg { width: 12px; height: 12px; }
+.font-list { position: fixed; z-index: 1250; width: 300px; overflow: auto; padding: 5px; border: 1px solid #c8ccd1; border-radius: 8px; background: #fff; box-shadow: 0 8px 26px rgba(0,0,0,.18); }
+.font-list-heading { position: sticky; top: -5px; z-index: 1; margin: 0 -5px; padding: 7px 14px 4px; background: #fff; color: #727272; font: 700 9px/1.4 "Segoe UI", sans-serif; letter-spacing: .07em; text-transform: uppercase; }
+.font-list-empty { padding: 8px 10px; color: #6f6f6f; font-size: 11px; }
+.font-option { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 9px; border-radius: 5px; color: #202124; cursor: default; }
+.font-option[aria-selected="true"] { background: #ececec; }
+.font-option.is-current { font-weight: 600; }
+.font-option-name { min-width: 0; flex: 1 1 auto; overflow: hidden; font-size: 15px; line-height: 30px; text-overflow: ellipsis; white-space: nowrap; }
+.font-option.is-missing .font-option-name { font-family: "Segoe UI", sans-serif !important; font-style: italic; color: #605e5c; }
+.font-option-note { flex: none; color: #8a8a8a; font-size: 10px; }
+
+/* Header and Footer drop-down menus. */
+.simple-menu { position: fixed; z-index: 1250; min-width: 200px; padding: 5px; border: 1px solid #c8ccd1; border-radius: 8px; background: #fff; box-shadow: 0 6px 22px rgba(0,0,0,.2); }
+.simple-menu button { width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 10px 7px 6px; border: 0; border-radius: 5px; background: transparent; color: #2b2f33; font-size: 12px; text-align: left; white-space: nowrap; }
+.simple-menu button:hover:not(:disabled), .simple-menu button:focus-visible { background: #ececec; outline: none; }
+.simple-menu button:disabled { color: #9aa0a6; }
+.simple-menu-check { width: 14px; flex: none; text-align: center; }
+.simple-menu-separator { height: 1px; margin: 5px 8px; background: #e6e8eb; }
+
+/* Spelling choices on top of the editor's right-click menu, and the line-spacing menu additions. */
+.simple-spell-section .simple-spell-suggestion .cw-menu-lbl { font-weight: 700; }
+.simple-spell-section .simple-spell-pending .cw-menu-lbl, .simple-spell-section .simple-spell-none .cw-menu-lbl { font-style: italic; }
+.simple-spacing-separator { height: 1px; margin: 4px 6px; background: #e6e8eb; }
+
+@media (max-width: 1040px) {
+  .command-search { flex-basis: 170px; min-width: 120px; }
+  .command-search-key { display: none; }
+  /* The document name matters more than the app name when space runs out. */
+  .app-name, .title-divider { display: none; }
+  .export-action { min-width: 0; }
+}
+
+@media (max-width: 760px) {
+  .command-search { flex-basis: 34px; min-width: 34px; padding: 0 9px; }
+  .command-search input { width: 0; padding: 0; }
+  .command-search:focus-within { position: absolute; z-index: 130; left: 12px; right: 12px; top: 8px; }
+  .command-search:focus-within input { width: auto; padding: 0 6px; }
+}

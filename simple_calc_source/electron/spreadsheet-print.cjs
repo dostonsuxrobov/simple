@@ -1,9 +1,16 @@
 const MAX_PRINT_CELLS = 400_000
 const MAX_PRINT_SHEETS = 100
+const MAX_PRINT_COPIES = 999
 // Collapsed table borders add their outside stroke to the sum of column/row
 // dimensions. Reserve the maximum supported 3px stroke plus rounding room so
 // fit-to-page never places that stroke beyond the clipped content rectangle.
 const TABLE_EDGE_ALLOWANCE = 4
+// SPARKLINE() results are a private-use marker string (src/lib/formula-lib-sparkline.ts).
+// The marker is never printed as text; the picture comes from input.visuals.
+const SPARKLINE_MARKER = '\uE000sparkline:'
+// 'fit-height' fits every row on one page; 'custom' is a fixed percentage; 'fit-pages'
+// fits the content to a number of pages wide by tall (0 = automatic), as Excel's Page Setup.
+const SCALING_MODES = new Set(['actual', 'fit-width', 'fit-height', 'fit-sheet', 'custom', 'fit-pages'])
 
 const PAPER_SIZES = {
   letter: { css: 'Letter', label: 'Letter', width: 8.5, height: 11 },
@@ -68,8 +75,45 @@ function parseRange(value) {
   }
 }
 
-function printAreas(value) {
+const WHOLE_COLUMNS = /^\$?([A-Z]{1,3}):\$?([A-Z]{1,3})$/i
+const WHOLE_ROWS = /^\$?([1-9][0-9]{0,6}):\$?([1-9][0-9]{0,6})$/
+
+function columnIndexOf(label) {
+  let col = 0
+  for (const character of label.toUpperCase()) col = col * 26 + character.charCodeAt(0) - 64
+  return col - 1
+}
+
+/**
+ * One print area. Whole-column ($A:$F) and whole-row ($1:$20) areas print to the sheet's
+ * used extent, as Excel does; so does a bounded area the importer expanded from that form
+ * (pageSetup.printAreaWhole maps it back to the original reference).
+ */
+function printAreaRange(piece, whole, extents) {
+  const unqualified = String(piece || '').split('!').pop().replace(/'/g, '').trim()
+  const range = parseRange(unqualified)
+  const original = range && typeof whole[unqualified] === 'string' ? whole[unqualified] : ''
+  const columns = WHOLE_COLUMNS.exec(range ? original : unqualified)
+  const rows = !columns && WHOLE_ROWS.exec(range ? original : unqualified)
+  // The bounded copy only records where the sheet ended when it was opened: rows or columns
+  // added since are part of a whole-column / whole-row area, so the area follows the used extent.
+  if (columns) {
+    const left = columnIndexOf(columns[1]), right = columnIndexOf(columns[2])
+    if (left > 16_383 || right > 16_383) return null
+    return { top: 0, bottom: Math.max(0, extents.bottom), left: Math.min(left, right), right: Math.max(left, right) }
+  }
+  if (rows) {
+    const first = Number(rows[1]) - 1, last = Number(rows[2]) - 1
+    if (first > 1_048_575 || last > 1_048_575) return null
+    return { top: Math.min(first, last), bottom: Math.max(first, last), left: 0, right: Math.max(0, extents.right) }
+  }
+  return range
+}
+
+function printAreas(setup, extents = { top: 0, bottom: 0, left: 0, right: 0 }) {
+  const value = setup && typeof setup === 'object' ? setup.printArea : setup
   if (!value) return []
+  const whole = setup && typeof setup === 'object' && setup.printAreaWhole && typeof setup.printAreaWhole === 'object' ? setup.printAreaWhole : {}
   // Excel separates areas with commas (ExcelJS also accepts &&). A quoted sheet
   // name can itself contain commas or escaped apostrophes.
   const pieces = []
@@ -89,7 +133,7 @@ function printAreas(value) {
     } else current += character
   }
   pieces.push(current)
-  const ranges = pieces.map(parseRange)
+  const ranges = pieces.map((piece) => printAreaRange(piece, whole, extents))
   if (quoted || pieces.length > 100 || ranges.some((range) => !range)) {
     throw new Error('The saved print area is not a supported cell range. Select the cells to print and choose Selection.')
   }
@@ -135,18 +179,96 @@ function usedBounds(sheet) {
   return bottom >= 0 ? { top, bottom, left, right } : { top: 0, bottom: 0, left: 0, right: 0 }
 }
 
+function clampInteger(value, min, max, fallback) {
+  if (value === null || value === undefined || value === '') return fallback
+  const number = Math.trunc(Number(value))
+  return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback
+}
+
+/** Custom margins in inches (0-10 each); null when any side is missing or invalid. */
+function customMarginsOf(value) {
+  if (!value || typeof value !== 'object') return null
+  const margins = {}
+  for (const side of ['top', 'right', 'bottom', 'left']) {
+    const number = Number(value[side])
+    if (value[side] === null || value[side] === '' || !Number.isFinite(number) || number < 0 || number > 10) return null
+    margins[side] = number
+  }
+  for (const side of ['header', 'footer']) {
+    const number = Number(value[side])
+    if (value[side] !== null && value[side] !== undefined && value[side] !== '' && Number.isFinite(number) && number >= 0 && number <= 10) margins[side] = number
+  }
+  return margins
+}
+
+/** Pages to print, 1-based and inclusive; `to` may be omitted for "to the end". */
+function pageRangeOf(value) {
+  if (!value || typeof value !== 'object') return null
+  const from = clampInteger(value.from, 1, 1_000_000, 1)
+  const to = clampInteger(value.to, 1, 1_000_000, null)
+  if (from === 1 && to === null) return null
+  return { from, to }
+}
+
+/**
+ * Printer settings for the native job (never used for layout): an explicitly chosen printer
+ * queue, copies and collation. Without deviceName the job goes to the Windows default.
+ */
+function printJobOf(value) {
+  const input = value && typeof value === 'object' ? value : {}
+  const job = { copies: clampInteger(input.copies, 1, MAX_PRINT_COPIES, 1), collate: input.collate !== false }
+  const deviceName = typeof input.deviceName === 'string' ? input.deviceName.trim() : ''
+  if (deviceName && deviceName.length <= 256 && !/[\u0000-\u001f\u007f]/.test(deviceName)) job.deviceName = deviceName
+  return job
+}
+
 function safeOptions(value) {
   const input = value && typeof value === 'object' ? value : {}
-  return {
+  const scaling = SCALING_MODES.has(input.scaling) ? input.scaling : 'fit-width'
+  const customMargins = input.margins === 'custom' ? customMarginsOf(input.customMargins) : null
+  const options = {
     scope: ['active-sheet', 'selection', 'workbook'].includes(input.scope) ? input.scope : 'active-sheet',
     orientation: input.orientation === 'landscape' ? 'landscape' : 'portrait',
-    scaling: ['actual', 'fit-width', 'fit-sheet'].includes(input.scaling) ? input.scaling : 'fit-width',
+    scaling,
     paperSize: Object.hasOwn(PAPER_SIZES, input.paperSize) ? input.paperSize : 'letter',
-    margins: Object.hasOwn(MARGIN_PRESETS, input.margins) ? input.margins : 'normal',
+    margins: Object.hasOwn(MARGIN_PRESETS, input.margins) || customMargins ? input.margins : 'normal',
     gridlines: input.gridlines !== false,
     headings: input.headings === true,
     useSavedLayout: input.useSavedLayout === true,
   }
+  if (scaling === 'custom') options.scalePercent = clampInteger(input.scalePercent, 10, 400, 100)
+  if (scaling === 'fit-pages') {
+    options.fitWidth = clampInteger(input.fitWidth, 0, 100, 1)
+    options.fitHeight = clampInteger(input.fitHeight, 0, 100, 0)
+    // One page by one page is Fit Sheet on One Page; nothing constrained is actual size.
+    if (options.fitWidth === 1 && options.fitHeight === 1) options.fitSheet = true
+  }
+  if (customMargins) options.customMargins = customMargins
+  const pageRange = pageRangeOf(input.pageRange)
+  if (pageRange) options.pageRange = pageRange
+  return options
+}
+
+/** The layout rule a page model follows (separate from the reported `scaling` choice). */
+function layoutMode(options) {
+  if (options.scaling === 'fit-sheet' || options.fitSheet) return 'single'
+  if (options.savedScale || options.scaling === 'custom') return 'grid'
+  if (options.fitWidth || options.fitHeight) return 'grid'
+  if (options.scaling === 'fit-width') return 'one-wide'
+  if (options.scaling === 'fit-height') return 'one-tall'
+  return 'grid'
+}
+
+// Manual page breaks apply on an axis whose page count is not fixed by a fit rule, which
+// keeps Fit All Columns on One Page (the default) honouring row breaks, as Google Sheets does.
+function honoursRowBreaks(options) {
+  const mode = layoutMode(options)
+  return mode !== 'single' && mode !== 'one-tall' && !options.fitHeight
+}
+
+function honoursColumnBreaks(options) {
+  const mode = layoutMode(options)
+  return mode !== 'single' && mode !== 'one-wide' && !options.fitWidth
 }
 
 function sheetOptions(sheet, options, warnings) {
@@ -163,6 +285,13 @@ function sheetOptions(sheet, options, warnings) {
   result.horizontalCentered = setup.horizontalCentered === true
   result.verticalCentered = setup.verticalCentered === true
   result.pageOrder = setup.pageOrder
+  // The saved layout replaces the manual scaling choice entirely.
+  delete result.scalePercent
+  delete result.fitWidth
+  delete result.fitHeight
+  delete result.fitSheet
+  delete result.customMargins
+  if (!Object.hasOwn(MARGIN_PRESETS, result.margins)) result.margins = 'normal'
   // The dormant fitToWidth/fitToHeight fields are often 1 even when Excel's
   // active mode is percentage scale. Only fitToPage enables those fields.
   if (setup.fitToPage === true) {
@@ -172,6 +301,9 @@ function sheetOptions(sheet, options, warnings) {
   } else if (Number.isFinite(Number(setup.scale)) && Number(setup.scale) >= 10 && Number(setup.scale) <= 400) {
     result.savedScale = Number(setup.scale) / 100
     result.scaling = 'actual'
+  } else if (!['actual', 'fit-width', 'fit-sheet'].includes(result.scaling)) {
+    // A file without a saved scale uses the dialog's default, never a hidden manual choice.
+    result.scaling = 'fit-width'
   }
   return result
 }
@@ -468,7 +600,10 @@ function overflowWidth(sheet, row, colIndex, cols, cell, merge, layout, displayV
 
 function pageMetrics(options) {
   const paper = PAPER_SIZES[options.paperSize]
-  const margins = { ...MARGIN_PRESETS[options.margins], header: 0.2, footer: 0.2 }
+  const custom = options.margins === 'custom' && options.customMargins
+  const margins = custom
+    ? { header: Math.min(0.2, custom.top), footer: Math.min(0.2, custom.bottom), ...custom }
+    : { ...MARGIN_PRESETS[options.margins] || MARGIN_PRESETS.normal, header: 0.2, footer: 0.2 }
   for (const side of ['top', 'right', 'bottom', 'left', 'header', 'footer']) {
     const value = Number(options.savedMargins?.[side])
     if (Number.isFinite(value) && value >= 0 && value <= 10) margins[side] = value
@@ -476,7 +611,9 @@ function pageMetrics(options) {
   const widthInches = options.orientation === 'landscape' ? paper.height : paper.width
   const heightInches = options.orientation === 'landscape' ? paper.width : paper.height
   if (margins.left + margins.right >= widthInches || margins.top + margins.bottom >= heightInches) {
-    throw new Error('The saved page margins leave no room for cells. Turn off Use saved page layout and choose smaller margins.')
+    throw new Error(custom
+      ? 'These margins leave no room for cells. Choose smaller margins.'
+      : 'The saved page margins leave no room for cells. Turn off Use saved page layout and choose smaller margins.')
   }
   return {
     paper,
@@ -490,50 +627,85 @@ function pageMetrics(options) {
   }
 }
 
+const HEADING_WIDTH = 38
+const HEADING_HEIGHT = 24
+
+/** Title rows/columns that are not already part of the printed indices, in order. */
+function prependedTitles(indices, titles) {
+  if (!titles.length) return []
+  const present = new Set(indices)
+  return titles.filter((index) => !present.has(index))
+}
+
 function scaleFor(sheet, rows, cols, options, metrics) {
   if (options.savedScale) return options.savedScale
-  if (options.fitWidth || options.fitHeight) {
-    const width = cols.reduce((sum, col) => sum + columnWidth(sheet, col), options.headings ? 38 : 0)
-    const height = rows.reduce((sum, row) => sum + rowHeight(sheet, row), options.headings ? 24 : 0)
+  if (options.scaling === 'custom') return Math.max(0.1, Math.min(4, (Number(options.scalePercent) || 100) / 100))
+  const headX = options.headings ? HEADING_WIDTH : 0
+  const headY = options.headings ? HEADING_HEIGHT : 0
+  if ((options.fitWidth || options.fitHeight) && !options.fitSheet) {
+    const width = cols.reduce((sum, col) => sum + columnWidth(sheet, col), headX)
+    const height = rows.reduce((sum, row) => sum + rowHeight(sheet, row), headY)
     let scale = Math.min(1,
       options.fitWidth ? metrics.contentWidth * options.fitWidth / Math.max(1, width + TABLE_EDGE_ALLOWANCE) : Infinity,
       options.fitHeight ? metrics.contentHeight * options.fitHeight / Math.max(1, height + TABLE_EDGE_ALLOWANCE) : Infinity)
     // Account for whole rows/columns at page boundaries, rather than assuming a
     // cell may split over two pages when fitting to a saved page count.
+    const titleRows = repeatedRows(sheet, options)
+    const titleCols = repeatedColumns(sheet, options)
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      const across = chunkIndices(cols, (col) => columnWidth(sheet, col), metrics.contentWidth / scale - TABLE_EDGE_ALLOWANCE - (options.headings ? 38 : 0)).length
-      const down = chunkRows(sheet, rows, metrics.contentHeight / scale - TABLE_EDGE_ALLOWANCE - (options.headings ? 24 : 0), repeatedRows(sheet, options)).length
+      const across = options.fitWidth ? chunkColumns(sheet, cols, metrics.contentWidth / scale - TABLE_EDGE_ALLOWANCE - headX, titleCols).length : 0
+      const down = options.fitHeight ? chunkRows(sheet, rows, metrics.contentHeight / scale - TABLE_EDGE_ALLOWANCE - headY, titleRows).length : 0
       if ((!options.fitWidth || across <= options.fitWidth) && (!options.fitHeight || down <= options.fitHeight)) break
       scale *= 0.99
     }
     return Math.max(0.01, scale)
   }
-  if (options.scaling === 'actual') return 1
-  const width = cols.reduce((sum, col) => sum + columnWidth(sheet, col), options.headings ? 38 : 0)
-  const height = rows.reduce((sum, row) => sum + rowHeight(sheet, row), options.headings ? 24 : 0)
+  // Fit to automatic x automatic pages is actual size; 1 x 1 is Fit Sheet on One Page below.
+  if (options.scaling === 'actual' || (options.scaling === 'fit-pages' && !options.fitSheet)) return 1
+  // Fit width/height/sheet: repeated titles outside the printed range are part of every page.
+  const width = [...prependedTitles(cols, repeatedColumns(sheet, options)), ...cols].reduce((sum, col) => sum + columnWidth(sheet, col), headX)
+  const height = [...prependedTitles(rows, repeatedRows(sheet, options)), ...rows].reduce((sum, row) => sum + rowHeight(sheet, row), headY)
   const widthScale = metrics.contentWidth / Math.max(1, width + TABLE_EDGE_ALLOWANCE)
   const heightScale = metrics.contentHeight / Math.max(1, height + TABLE_EDGE_ALLOWANCE)
-  const value = options.scaling === 'fit-sheet' ? Math.min(widthScale, heightScale) : widthScale
+  const value = layoutMode(options) === 'single' ? Math.min(widthScale, heightScale) : options.scaling === 'fit-height' ? heightScale : widthScale
   return Math.max(0.01, Math.min(1, value))
 }
 
-function chunkIndices(indices, sizeFor, capacity) {
+/**
+ * Split printed rows or columns into pages. `titles` repeat at the start of every
+ * continuation page (and lead the first page when they lie outside the printed range);
+ * `breaks` holds the indices that must start a new page (manual page breaks).
+ */
+function chunkAxis(indices, sizeFor, capacity, titles = [], breaks = null, fullMessage = '') {
   if (!indices.length) return [[]]
+  const titleSize = titles.reduce((sum, index) => sum + Math.max(1, sizeFor(index)), 0)
+  if (titles.length && titleSize >= capacity) throw new Error(fullMessage)
   const chunks = []
-  let current = []
-  let consumed = 0
+  const lead = prependedTitles(indices, titles)
+  let current = lead
+  let consumed = lead.reduce((sum, index) => sum + Math.max(1, sizeFor(index)), 0)
+  let body = 0
   for (const index of indices) {
+    if (body && current.includes(index)) continue
     const size = Math.max(1, sizeFor(index))
-    if (current.length && consumed + size > capacity) {
+    const forced = Boolean(breaks && body && breaks.has(index))
+    if (body && (forced || consumed + size > capacity)) {
       chunks.push(current)
-      current = []
-      consumed = 0
+      current = [...titles]
+      consumed = titleSize
+      body = 0
+      if (current.includes(index)) continue
     }
     current.push(index)
     consumed += size
+    body += 1
   }
   if (current.length) chunks.push(current)
   return chunks
+}
+
+function chunkIndices(indices, sizeFor, capacity) {
+  return chunkAxis(indices, sizeFor, capacity)
 }
 
 function repeatedRows(sheet, options) {
@@ -545,39 +717,56 @@ function repeatedRows(sheet, options) {
   return visibleIndices(first - 1, last - 1, sheet.hiddenRows)
 }
 
-function chunkRows(sheet, rows, capacity, titles) {
-  if (!titles.length) return chunkIndices(rows, row => rowHeight(sheet, row), capacity)
-  const titleHeight = titles.reduce((sum,row) => sum + rowHeight(sheet,row), 0)
-  if (titleHeight >= capacity) throw new Error('The repeated heading rows fill the page. Use a smaller scale or fewer heading rows.')
-  const chunks = [], present = new Set(rows)
-  let current = titles.filter(row => !present.has(row))
-  let consumed = current.reduce((sum,row) => sum + rowHeight(sheet,row),0)
-  for (const row of rows) {
-    if (current.includes(row)) continue
-    const size = rowHeight(sheet,row)
-    if (current.length && consumed + size > capacity) {
-      chunks.push(current)
-      current = [...titles]
-      consumed = titleHeight
-    }
-    if (!current.includes(row)) { current.push(row); consumed += size }
+function repeatedColumns(sheet, options) {
+  if (options.scope === 'selection') return []
+  const match = /^\$?([A-Z]{1,3})(?::\$?([A-Z]{1,3}))?$/i.exec(String(sheet.pageSetup?.printTitlesColumn || '').trim())
+  if (!match) return []
+  const first = columnIndexOf(match[1]), last = columnIndexOf(match[2] || match[1])
+  if (first < 0 || last < first || last > 16_383 || last - first > 1023) throw new Error('The saved columns to repeat are too large. Choose a smaller print title range.')
+  // Hidden columns are stored 1-based, like hidden rows.
+  return visibleIndices(first, last, sheet.hiddenCols)
+}
+
+function chunkRows(sheet, rows, capacity, titles, breaks = null) {
+  return chunkAxis(rows, (row) => rowHeight(sheet, row), capacity, titles, breaks, 'The repeated heading rows fill the page. Use a smaller scale or fewer heading rows.')
+}
+
+function chunkColumns(sheet, cols, capacity, titles, breaks = null) {
+  return chunkAxis(cols, (col) => columnWidth(sheet, col), capacity, titles, breaks, 'The repeated heading columns fill the page. Use a smaller scale or fewer heading columns.')
+}
+
+/**
+ * Manual page breaks as the 0-based indices that start a new page. The model keeps
+ * ExcelJS's shape ({ id, max, man } with id = the 1-based row above the break, which is
+ * the 0-based index of the first row after it); plain numbers mean the same.
+ */
+function manualBreaks(values) {
+  if (!Array.isArray(values) || !values.length) return null
+  const breaks = new Set()
+  for (const value of values.slice(0, 1026)) {
+    const id = Math.trunc(Number(value && typeof value === 'object' ? value.id : value))
+    if (Number.isFinite(id) && id >= 1 && id <= 1_048_575) breaks.add(id)
   }
-  if (current.length) chunks.push(current)
-  return chunks
+  return breaks.size ? breaks : null
 }
 
 function paginateSheet(sheet, bounds, options, metrics) {
   const rows = visibleIndices(bounds.top, bounds.bottom, sheet.hiddenRows)
   const cols = visibleIndices(bounds.left, bounds.right, sheet.hiddenCols)
   const scale = scaleFor(sheet, rows, cols, options, metrics)
-  if (options.scaling === 'fit-sheet') return [{ rows, cols, scale }]
+  const mode = layoutMode(options)
+  if (mode === 'single') return [{ rows, cols, scale }]
 
-  const unscaledWidth = metrics.contentWidth / scale - TABLE_EDGE_ALLOWANCE - (options.headings ? 38 : 0)
-  const unscaledHeight = metrics.contentHeight / scale - TABLE_EDGE_ALLOWANCE - (options.headings ? 24 : 0)
-  const columnChunks = options.scaling === 'fit-width'
-    ? [cols]
-    : chunkIndices(cols, (col) => columnWidth(sheet, col), Math.max(1, unscaledWidth))
-  const rowChunks = chunkRows(sheet, rows, Math.max(1, unscaledHeight), repeatedRows(sheet, options))
+  const unscaledWidth = metrics.contentWidth / scale - TABLE_EDGE_ALLOWANCE - (options.headings ? HEADING_WIDTH : 0)
+  const unscaledHeight = metrics.contentHeight / scale - TABLE_EDGE_ALLOWANCE - (options.headings ? HEADING_HEIGHT : 0)
+  const titleRows = repeatedRows(sheet, options)
+  const titleCols = repeatedColumns(sheet, options)
+  const columnChunks = mode === 'one-wide'
+    ? [[...prependedTitles(cols, titleCols), ...cols]]
+    : chunkColumns(sheet, cols, Math.max(1, unscaledWidth), titleCols, honoursColumnBreaks(options) ? manualBreaks(sheet.colBreaks) : null)
+  const rowChunks = mode === 'one-tall'
+    ? [[...prependedTitles(rows, titleRows), ...rows]]
+    : chunkRows(sheet, rows, Math.max(1, unscaledHeight), titleRows, honoursRowBreaks(options) ? manualBreaks(sheet.rowBreaks) : null)
   const pages = []
   if (options.pageOrder === 'downThenOver') {
     for (const columnChunk of columnChunks) for (const rowChunk of rowChunks) pages.push({ rows: rowChunk, cols: columnChunk, scale })
@@ -677,24 +866,35 @@ function axisPositions(count, sizeOf, hiddenValues) {
   return { at: (index) => positions[Math.max(0, Math.min(count, index))], size: (index) => (hidden.has(index) ? 0 : sizeOf(index)) }
 }
 
+/**
+ * Leading repeated titles on a continuation page (they sit before the page's body). On
+ * the first page the titles are simply the first printed rows/columns: no prefix.
+ */
+function leadingTitleCount(indices, titles) {
+  if (!titles.size) return 0
+  let prefix = 0
+  while (prefix < indices.length && titles.has(indices[prefix])) prefix += 1
+  if (prefix >= indices.length || (prefix > 0 && indices[prefix] === indices[prefix - 1] + 1)) return 0
+  return prefix
+}
+
 function chartOverlayHtml(sheet, rows, cols, options, charts) {
   if (!charts.length || !rows.length || !cols.length) return ''
-  const headX = options.headings ? 38 : 0
-  const headY = options.headings ? 24 : 0
-  let maxCol = cols[cols.length - 1], maxRow = rows.reduce((max, row) => Math.max(max, row), 0)
+  const headX = options.headings ? HEADING_WIDTH : 0
+  const headY = options.headings ? HEADING_HEIGHT : 0
+  let maxCol = cols.reduce((max, col) => Math.max(max, col), 0), maxRow = rows.reduce((max, row) => Math.max(max, row), 0)
   for (const chart of charts) { maxCol = Math.max(maxCol, chart.to.col); maxRow = Math.max(maxRow, chart.to.row) }
   const xs = axisPositions(maxCol + 2, (col) => columnWidth(sheet, col), sheet.hiddenCols)
   const ys = axisPositions(maxRow + 2, (row) => rowHeight(sheet, row), sheet.hiddenRows)
-  // Repeated title rows prepended to a later page sit above the page's body rows.
-  const titles = new Set(repeatedRows(sheet, options))
-  let prefix = 0
-  while (prefix < rows.length && titles.has(rows[prefix])) prefix += 1
-  if (prefix >= rows.length || (prefix > 0 && rows[prefix] === rows[prefix - 1] + 1)) prefix = 0
-  const bodyTop = headY + rows.slice(0, prefix).reduce((sum, row) => sum + rowHeight(sheet, row), 0)
-  const width = cols.reduce((sum, col) => sum + columnWidth(sheet, col), 0)
-  const height = rows.slice(prefix).reduce((sum, row) => sum + rowHeight(sheet, row), 0)
-  const originX = xs.at(cols[0])
-  const originY = ys.at(rows[prefix])
+  // Repeated title rows/columns prepended to a later page sit above/left of its body.
+  const rowPrefix = leadingTitleCount(rows, new Set(repeatedRows(sheet, options)))
+  const colPrefix = leadingTitleCount(cols, new Set(repeatedColumns(sheet, options)))
+  const bodyTop = headY + rows.slice(0, rowPrefix).reduce((sum, row) => sum + rowHeight(sheet, row), 0)
+  const bodyLeft = headX + cols.slice(0, colPrefix).reduce((sum, col) => sum + columnWidth(sheet, col), 0)
+  const width = cols.slice(colPrefix).reduce((sum, col) => sum + columnWidth(sheet, col), 0)
+  const height = rows.slice(rowPrefix).reduce((sum, row) => sum + rowHeight(sheet, row), 0)
+  const originX = xs.at(cols[colPrefix])
+  const originY = ys.at(rows[rowPrefix])
   const place = (point) => ({
     x: xs.at(point.col) + Math.min(xs.size(point.col), point.colOffsetEmu / EMU_PER_PIXEL) - originX,
     y: ys.at(point.row) + Math.min(ys.size(point.row), point.rowOffsetEmu / EMU_PER_PIXEL) - originY,
@@ -707,11 +907,140 @@ function chartOverlayHtml(sheet, rows, cols, options, charts) {
     items.push(`<div class="print-chart" style="left:${a.x.toFixed(2)}px;top:${a.y.toFixed(2)}px;width:${w.toFixed(2)}px;height:${h.toFixed(2)}px">${chart.svg}</div>`)
   }
   if (!items.length) return ''
-  return `<div class="print-charts" aria-hidden="false" style="left:${headX}px;top:${bodyTop.toFixed(2)}px;width:${width.toFixed(2)}px;height:${height.toFixed(2)}px">${items.join('')}</div>`
+  return `<div class="print-charts" aria-hidden="false" style="left:${bodyLeft.toFixed(2)}px;top:${bodyTop.toFixed(2)}px;width:${width.toFixed(2)}px;height:${height.toFixed(2)}px">${items.join('')}</div>`
 }
 
-function renderPage(sheet, bounds, rows, cols, displayValues, options, themeColors, metrics, pageNumber, sheetPage, scale, pageName, headerContext, warnings, displayParts, charts = []) {
-  const layout = mergeLayout(sheet, { ...bounds, top: rows.reduce((min,row) => Math.min(min,row), bounds.top), bottom: rows.reduce((max,row) => Math.max(max,row), bounds.bottom) }, rows, cols)
+// ---------------------------------------------------------------------------
+// Resolved cell visuals: conditional formatting (fills, colour scales, data bars, icon
+// sets, fonts, borders), table styles and banding, number-format colours, checkboxes and
+// sparklines, resolved in the renderer by src/lib/print-visuals.ts with the same rules the
+// grid draws (src/lib/visual-style.ts).
+// Payload contract: input.visuals = {
+//   icons: { 'set:index': '<svg…>' },                 // serialized ConditionalIcon glyphs
+//   sheets: { [sheetId]: {
+//     styles: [{ fill?, color?, bold?, italic?, decoration?, borders?, bar?, icon?, hide?, checkbox? }],
+//     cells: { [address]: styleIndex },
+//     text?: { [address]: string },                  // the value as a CF number format shows it
+//     sparklines?: { [address]: '<svg…>' },          // drawn at the printed cell size
+//   } } }
+// Everything is validated here: colours are #RRGGBB, borders and data-bar backgrounds follow
+// a strict CSS grammar (no url() or other external references), SVG passes the chart allowlist.
+// ---------------------------------------------------------------------------
+const MAX_VISUAL_STYLES = 50_000
+const MAX_VISUAL_ICONS = 400
+const MAX_VISUAL_ICON_SVG = 16 * 1024
+const MAX_VISUAL_SVG = 256 * 1024
+const MAX_VISUAL_SVG_TOTAL = 32 * 1024 * 1024
+const MAX_VISUAL_TEXT = 32_767
+const HEX_COLOR = /^#[0-9a-f]{6}$/i
+const CSS_BORDER = /^(?:[0-9]|10)(?:\.[0-9]{1,3})?px (?:solid|dashed|dotted|double) #[0-9a-f]{6}$/i
+const ICON_KEY = /^[0-9A-Za-z]{1,32}:[0-9]{1,2}$/
+const TEXT_DECORATIONS = new Set(['underline', 'line-through', 'underline line-through'])
+const BACKGROUND_FUNCTIONS = new Set(['linear-gradient', 'repeating-linear-gradient', 'calc'])
+
+/** A data-bar background value: gradients of hex colours, lengths and keywords only. */
+function safeBackgroundValue(value) {
+  if (typeof value !== 'string' || !value || value.length > 2_000) return ''
+  if (!/^[#a-z0-9%.,()\s+-]+$/i.test(value)) return ''
+  const functions = [...value.matchAll(/([a-z-]+)\s*\(/gi)]
+  if (functions.some((match) => !BACKGROUND_FUNCTIONS.has(match[1].toLowerCase()))) return ''
+  // Every "(" opens an allowed function: no bare groups.
+  if ((value.match(/\(/g) || []).length !== functions.length) return ''
+  return value
+}
+
+function safeIconTable(source) {
+  const icons = new Map()
+  if (!source || typeof source !== 'object') return icons
+  for (const [key, svg] of Object.entries(source).slice(0, MAX_VISUAL_ICONS)) {
+    if (!ICON_KEY.test(key) || typeof svg !== 'string' || svg.length > MAX_VISUAL_ICON_SVG) continue
+    const safe = safeChartSvg(svg)
+    if (safe) icons.set(key, safe)
+  }
+  return icons
+}
+
+function safeVisualStyle(value, icons) {
+  if (!value || typeof value !== 'object') return null
+  const css = []
+  if (typeof value.fill === 'string' && HEX_COLOR.test(value.fill)) css.push(`background-color:${value.fill}`)
+  if (typeof value.color === 'string' && HEX_COLOR.test(value.color)) css.push(`color:${value.color}`)
+  if (typeof value.bold === 'boolean') css.push(`font-weight:${value.bold ? 700 : 400}`)
+  if (typeof value.italic === 'boolean') css.push(`font-style:${value.italic ? 'italic' : 'normal'}`)
+  if (TEXT_DECORATIONS.has(value.decoration)) css.push(`text-decoration:${value.decoration}`)
+  if (value.borders && typeof value.borders === 'object') {
+    for (const side of ['top', 'right', 'bottom', 'left']) {
+      const border = value.borders[side]
+      if (typeof border === 'string' && CSS_BORDER.test(border)) css.push(`border-${side}:${border}`)
+    }
+  }
+  if (value.bar && typeof value.bar === 'object') {
+    const image = safeBackgroundValue(value.bar.image)
+    const size = safeBackgroundValue(value.bar.size)
+    const position = safeBackgroundValue(value.bar.position)
+    const repeat = safeBackgroundValue(value.bar.repeat)
+    if (image && size && position && repeat) css.push(`background-image:${image}`, `background-size:${size}`, `background-position:${position}`, `background-repeat:${repeat}`)
+  }
+  const style = {
+    css: css.join(';'),
+    icon: typeof value.icon === 'string' && icons.has(value.icon) ? icons.get(value.icon) : '',
+    hide: value.hide === true,
+    checkbox: typeof value.checkbox === 'boolean' ? value.checkbox : null,
+  }
+  return style.css || style.icon || style.hide || style.checkbox !== null ? style : null
+}
+
+/** Validated visuals for one sheet, or null when the renderer sent none. */
+function sheetVisualsFor(input, sheet, icons, budget) {
+  const sheets = input && input.visuals && typeof input.visuals === 'object' ? input.visuals.sheets : null
+  const source = sheets && typeof sheets === 'object' && Object.hasOwn(sheets, sheet.id) ? sheets[sheet.id] : null
+  if (!source || typeof source !== 'object') return null
+  const styles = Array.isArray(source.styles) ? source.styles.slice(0, MAX_VISUAL_STYLES).map((style) => safeVisualStyle(style, icons)) : []
+  const visuals = { cells: new Map(), text: new Map(), sparklines: new Map() }
+  const entries = (value) => (value && typeof value === 'object' ? Object.entries(value).slice(0, MAX_PRINT_CELLS) : [])
+  const key = (address) => {
+    const position = parseAddress(address)
+    return position ? addressOf(position.row, position.col) : ''
+  }
+  for (const [address, index] of entries(source.cells)) {
+    const style = Number.isInteger(index) ? styles[index] : null
+    const target = key(address)
+    if (style && target) visuals.cells.set(target, style)
+  }
+  for (const [address, text] of entries(source.text)) {
+    const target = key(address)
+    if (target && typeof text === 'string' && text.length <= MAX_VISUAL_TEXT) visuals.text.set(target, text)
+  }
+  for (const [address, svg] of entries(source.sparklines)) {
+    const target = key(address)
+    if (!target || typeof svg !== 'string' || svg.length > MAX_VISUAL_SVG || budget.svg + svg.length > MAX_VISUAL_SVG_TOTAL) continue
+    const safe = safeChartSvg(svg)
+    if (!safe) continue
+    budget.svg += safe.length
+    visuals.sparklines.set(target, safe)
+  }
+  return visuals
+}
+
+/** A printed checkbox, drawn like the grid's checkbox control. */
+function checkboxSvg(checked) {
+  return checked
+    ? '<svg viewBox="0 0 14 14" width="13" height="13" role="img" aria-label="Checked"><rect x="0.75" y="0.75" width="12.5" height="12.5" rx="2.5" fill="#476b57" stroke="#476b57" stroke-width="1.5"/><path d="M3.6 7.3 L6 9.6 L10.5 4.7" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    : '<svg viewBox="0 0 14 14" width="13" height="13" role="img" aria-label="Not checked"><rect x="0.75" y="0.75" width="12.5" height="12.5" rx="2.5" fill="#ffffff" stroke="#6b756f" stroke-width="1.2"/></svg>'
+}
+
+function checkedValue(value) {
+  return value === true || String(value).toUpperCase() === 'TRUE'
+}
+
+function renderPage(sheet, bounds, rows, cols, displayValues, options, themeColors, metrics, pageNumber, sheetPage, scale, pageName, headerContext, warnings, displayParts, charts = [], visuals = null) {
+  // Repeated title rows/columns may lie outside the printed area; their merges still apply.
+  const layout = mergeLayout(sheet, {
+    top: rows.reduce((min, row) => Math.min(min, row), bounds.top),
+    bottom: rows.reduce((max, row) => Math.max(max, row), bounds.bottom),
+    left: cols.reduce((min, col) => Math.min(min, col), bounds.left),
+    right: cols.reduce((max, col) => Math.max(max, col), bounds.right),
+  }, rows, cols)
   const { masters, covered } = layout
   const columns = []
   if (options.headings) columns.push('<col class="row-heading-column" style="width:38px">')
@@ -728,22 +1057,40 @@ function renderPage(sheet, bounds, rows, cols, displayValues, options, themeColo
       const merge = masters.get(key)
       const address = merge?.sourceAddress || addressOf(row, col)
       const cell = mergedRenderCell(sheet, merge, sheet.cells?.[address] || {})
-      const value = displayValues?.[address] ?? cell.display ?? cell.result ?? cell.value ?? ''
-      const parts = printDisplayParts(cell, value, displayParts?.[address])
+      const visual = visuals?.cells.get(address) || null
+      const sparkline = visuals?.sparklines.get(address) || ''
+      // A checkbox cell control (cell.type) prints as a box even without renderer visuals.
+      const checkbox = visual && visual.checkbox !== null
+        ? visual.checkbox
+        : cell.type === 'checkbox' ? checkedValue(cell.formula ? cell.result : cell.value) : null
+      let value = displayValues?.[address] ?? cell.display ?? cell.result ?? cell.value ?? ''
+      if (typeof value === 'string' && value.startsWith(SPARKLINE_MARKER)) value = ''
+      const override = visuals?.text.get(address)
+      if (override !== undefined) value = override
+      if (visual?.hide || checkbox !== null) value = ''
+      const parts = printDisplayParts(cell, value, override === undefined ? displayParts?.[address] : undefined)
+      const accounting = value !== '' ? parts.accounting : undefined
       const height = rows.slice(rowIndex, rowIndex + (merge?.rowspan || 1)).reduce((sum, item) => sum + rowHeight(sheet, item), 0)
       const contentHeight = cellContentHeight(cell, height, options.gridlines)
       const availableWidth = value !== '' ? overflowWidth(sheet, row, colIndex, cols, cell, merge, layout, displayValues, parts) : columnWidth(sheet, col)
       const overflowing = !merge && availableWidth > columnWidth(sheet, col)
+      const classes = [overflowing ? 'print-overflow' : '', sparkline ? 'has-sparkline' : ''].filter(Boolean).join(' ')
+      const css = cellStyle(cell, themeColors, parts.type) + (visual?.css ? `;${visual.css}` : '')
       const attributes = [
         `data-address="${escapeHtml(addressOf(row, col))}"`,
         merge?.rowspan > 1 ? `rowspan="${merge.rowspan}"` : '',
         merge?.colspan > 1 ? `colspan="${merge.colspan}"` : '',
-        `style="${escapeHtml(cellStyle(cell, themeColors, parts.type))}"`,
-        overflowing ? 'class="print-overflow"' : '',
+        `style="${escapeHtml(css)}"`,
+        classes ? `class="${classes}"` : '',
       ].filter(Boolean).join(' ')
       const contentStyle = `max-height:${contentHeight.toFixed(2)}px${overflowing ? `;width:${Math.max(0, availableWidth - 8).toFixed(2)}px` : ''}`
-      const content = parts.accounting ? `<span class="accounting-symbol">${escapeHtml(parts.accounting.symbol)}</span><span class="accounting-amount">${escapeHtml(parts.accounting.amount)}</span>` : escapeHtml(value)
-      cells.push(`<td ${attributes}><span${parts.accounting ? ' class="print-accounting"' : ''} style="${contentStyle}">${content}</span></td>`)
+      const text = accounting ? `<span class="accounting-symbol">${escapeHtml(accounting.symbol)}</span><span class="accounting-amount">${escapeHtml(accounting.amount)}</span>` : escapeHtml(value)
+      let content
+      if (checkbox !== null) content = `<span class="print-checkbox" style="${contentStyle}">${checkboxSvg(checkbox)}</span>`
+      else if (visual?.icon && !cell.hyperlink) content = `<span class="print-cf" style="${contentStyle}"><span class="print-cf-icon" aria-hidden="true">${visual.icon}</span><span class="print-cf-text${accounting ? ' print-accounting' : ''}">${text}</span></span>`
+      else content = `<span${accounting ? ' class="print-accounting"' : ''} style="${contentStyle}">${text}</span>`
+      if (sparkline) content = `<span class="print-sparkline" aria-hidden="true">${sparkline}</span>${content}`
+      cells.push(`<td ${attributes}>${content}</td>`)
     }
     return `<tr style="height:${rowHeight(sheet, row).toFixed(2)}px">${cells.join('')}</tr>`
   }).join('')
@@ -753,6 +1100,12 @@ function renderPage(sheet, bounds, rows, cols, displayValues, options, themeColo
   const lastCol = cols[cols.length - 1]
   const rowRange = Number.isFinite(firstRow) ? `${firstRow + 1}:${lastRow + 1}` : ''
   const columnRange = Number.isFinite(firstCol) ? `${columnName(firstCol)}:${columnName(lastCol)}` : ''
+  // The page's own rows and columns, after repeated titles: where its page breaks fall.
+  const bodyRows = rows.slice(leadingTitleCount(rows, new Set(repeatedRows(sheet, options))))
+  const bodyCols = cols.slice(leadingTitleCount(cols, new Set(repeatedColumns(sheet, options))))
+  const bodyRange = bodyRows.length && bodyCols.length
+    ? ` data-body-rows="${bodyRows[0] + 1}:${bodyRows[bodyRows.length - 1] + 1}" data-body-columns="${bodyCols[0] + 1}:${bodyCols[bodyCols.length - 1] + 1}"`
+    : ''
   const style = [
     `--page-width:${metrics.width.toFixed(2)}px`,
     `--page-height:${metrics.height.toFixed(2)}px`,
@@ -775,7 +1128,7 @@ function renderPage(sheet, bounds, rows, cols, displayValues, options, themeColo
   // Charts: positioned over the table inside the scaled sheet so they scale with it.
   const chartOverlay = chartOverlayHtml(sheet, rows, cols, options, charts)
   const sheetHtml = chartOverlay ? `<div class="print-sheet-body">${tableHtml}${chartOverlay}</div>` : tableHtml
-  return `<section class="print-page print-sheet" aria-label="Page ${pageNumber}, ${escapeHtml(sheet.name)}" data-page-number="${pageNumber}" data-sheet-page="${sheetPage}" data-sheet-id="${escapeHtml(sheet.id)}" data-sheet-name="${escapeHtml(sheet.name)}" data-row-range="${rowRange}" data-column-range="${columnRange}" data-scale="${scale.toFixed(4)}" style="${style}">${header ? `<header class="page-header">${header}</header>` : ''}<div class="page-content" style="${alignment}"><div class="sheet-scale" style="--sheet-scale:${scale.toFixed(4)}">${sheetHtml}</div></div>${footer ? `<footer class="page-footer">${footer}</footer>` : ''}</section>`
+  return `<section class="print-page print-sheet" aria-label="Page ${pageNumber}, ${escapeHtml(sheet.name)}" data-page-number="${pageNumber}" data-sheet-page="${sheetPage}" data-sheet-id="${escapeHtml(sheet.id)}" data-sheet-name="${escapeHtml(sheet.name)}" data-row-range="${rowRange}" data-column-range="${columnRange}"${bodyRange} data-scale="${scale.toFixed(4)}" style="${style}">${header ? `<header class="page-header">${header}</header>` : ''}<div class="page-content" style="${alignment}"><div class="sheet-scale" style="--sheet-scale:${scale.toFixed(4)}">${sheetHtml}</div></div>${footer ? `<footer class="page-footer">${footer}</footer>` : ''}</section>`
 }
 
 function selectedSheets(workbook, options) {
@@ -799,11 +1152,11 @@ function createSpreadsheetPrintDocument(input) {
   if (options.scope === 'selection' && !selection) throw new Error('Select a valid range before printing the selection.')
   let printedCells = 0
   const warnings = new Set()
-  for (const sheet of sheets) if (sheet.pageSetup?.printTitlesColumn && options.scope !== 'selection') warnings.add(`${sheet.name}: repeated heading columns are not yet included in print previews.`)
   const chartsBySheet = new Map(sheets.map((sheet) => [sheet.id, [...printImagesFor(input, sheet), ...printChartsFor(input, sheet)]]))
   const renderable = sheets.flatMap((sheet, sheetIndex) => {
-    const areas = options.scope === 'selection' ? [selection] : printAreas(sheet.pageSetup?.printArea)
-    if (!areas.length) areas.push(boundsIncludingCharts(usedBounds(sheet), chartsBySheet.get(sheet.id) || []))
+    const extents = boundsIncludingCharts(usedBounds(sheet), chartsBySheet.get(sheet.id) || [])
+    const areas = options.scope === 'selection' ? [selection] : printAreas(sheet.pageSetup, extents)
+    if (!areas.length) areas.push(extents)
     const resolvedOptions = sheetOptions(sheet, options, warnings)
     const metrics = pageMetrics(resolvedOptions)
     return areas.map((bounds) => {
@@ -824,7 +1177,7 @@ function createSpreadsheetPrintDocument(input) {
     const rows = visibleIndices(bounds.top, bounds.bottom, sheet.hiddenRows)
     const cols = visibleIndices(bounds.left, bounds.right, sheet.hiddenCols)
     const scale = scaleFor(sheet, rows, cols, resolvedOptions, metrics)
-    if (resolvedOptions.scaling === 'actual') {
+    if (resolvedOptions.scaling === 'actual' || resolvedOptions.scaling === 'custom') {
       const availableWidth = Math.max(1, metrics.contentWidth / scale - TABLE_EDGE_ALLOWANCE - (resolvedOptions.headings ? 38 : 0))
       const availableHeight = Math.max(1, metrics.contentHeight / scale - TABLE_EDGE_ALLOWANCE - (resolvedOptions.headings ? 24 : 0))
       oversizedDimensions += visibleIndices(bounds.left, bounds.right, sheet.hiddenCols)
@@ -852,7 +1205,18 @@ function createSpreadsheetPrintDocument(input) {
   const directory = sourcePath.slice(0, Math.max(sourcePath.lastIndexOf('/'), sourcePath.lastIndexOf('\\')) + 1)
   const requestedDate = new Date(input.printedAt || Date.now())
   const timestamp = Number.isNaN(requestedDate.getTime()) ? new Date() : requestedDate
-  const sections = pages.map((page, index) => renderPage(
+  // A page range keeps each page's number and the total (Page 3 of 10) from the whole printout.
+  let printed = pages.map((page, index) => ({ page, number: index + 1 }))
+  if (options.pageRange) {
+    const { from, to } = options.pageRange
+    if (to !== null && to < from) throw new Error('The last page to print comes before the first. Check the page range.')
+    if (from > pages.length) throw new Error(`This printout has ${pages.length} ${pages.length === 1 ? 'page' : 'pages'}. Choose pages from 1 to ${pages.length}.`)
+    printed = printed.slice(from - 1, to === null ? pages.length : Math.min(pages.length, to))
+  }
+  const icons = safeIconTable(input.visuals && typeof input.visuals === 'object' ? input.visuals.icons : null)
+  const budget = { svg: 0 }
+  const visualsBySheet = new Map(sheets.map((sheet) => [sheet.id, sheetVisualsFor(input, sheet, icons, budget)]))
+  const sections = printed.map(({ page, number }) => renderPage(
     page.sheet,
     page.bounds,
     page.rows,
@@ -861,12 +1225,12 @@ function createSpreadsheetPrintDocument(input) {
     page.options,
     themeColors,
     page.metrics,
-    index + 1,
+    number,
     page.sheetPage,
     page.scale,
     page.pageName,
     {
-      page: page.sheet.pageSetup?.useFirstPageNumber === true && Number(page.sheet.pageSetup.firstPageNumber) > 0 ? Number(page.sheet.pageSetup.firstPageNumber) + page.sheetPage - 1 : index + 1,
+      page: page.sheet.pageSetup?.useFirstPageNumber === true && Number(page.sheet.pageSetup.firstPageNumber) > 0 ? Number(page.sheet.pageSetup.firstPageNumber) + page.sheetPage - 1 : number,
       pages: pages.length,
       filename,
       directory,
@@ -877,6 +1241,7 @@ function createSpreadsheetPrintDocument(input) {
     warnings,
     input.displayParts?.[page.sheet.id] || {},
     chartsBySheet.get(page.sheet.id) || [],
+    visualsBySheet.get(page.sheet.id) || null,
   )).join('')
   const paper = metrics.paper
   const pageStyles = Array.from(new Map(renderable.map((entry) => [entry.pageName, `@page ${entry.pageName} { size: ${entry.metrics.paper.css} ${entry.options.orientation}; margin: 0; }`])).values()).join('\n')
@@ -885,7 +1250,7 @@ function createSpreadsheetPrintDocument(input) {
 <style>
 @page { size: ${paper.css} ${primaryOptions.orientation}; margin: 0; }
 ${pageStyles}
-* { box-sizing: border-box; }
+* { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 html, body { margin: 0; min-height: 100%; padding: 0; color: #171a18; font-family: Aptos, Calibri, Arial, sans-serif; font-size: 10pt; }
 :root { --preview-zoom:1; }
 .print-page { position: relative; width: var(--page-width); height: var(--page-height); padding: var(--margin-top) var(--margin-right) var(--margin-bottom) var(--margin-left); overflow: hidden; background: #fff; break-after: page; page-break-after: always; }
@@ -912,6 +1277,16 @@ html, body { margin: 0; min-height: 100%; padding: 0; color: #171a18; font-famil
 .accounting-symbol { flex: none; }
 .accounting-amount { min-width: 0; overflow: hidden; text-align: right; }
 .sheet-table.show-gridlines td { border: 1px solid #c8ceca; }
+.sheet-table td.has-sparkline { position: relative; }
+.sheet-table td > .print-sparkline { position: absolute; inset: 2px 3px; display: block; overflow: hidden; }
+.print-sparkline > svg { display: block; width: 100%; height: 100%; }
+.sheet-table td > .print-cf { display: flex; align-items: center; gap: 3px; }
+.print-cf-icon { flex: none; display: block; width: 13px; height: 13px; }
+.print-cf-icon > svg { display: block; width: 13px; height: 13px; }
+.print-cf-text { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.print-cf-text.print-accounting { display: flex; justify-content: space-between; gap: 4px; }
+.sheet-table td > .print-checkbox { display: flex; align-items: center; justify-content: center; }
+.print-checkbox > svg { display: block; flex: none; }
 .column-heading, .row-heading, .corner-heading { border: 1px solid #adb5b0; color: #47514b; background: #eef1ef; font-weight: 600; text-align: center; vertical-align: middle; }
 .column-heading { height: 24px; }
 .row-heading { width: 38px; padding: 1px 2px; }
@@ -927,7 +1302,7 @@ tr, td, th { break-inside: avoid; page-break-inside: avoid; }
   body { display: block; }
   .print-page { margin: 0; box-shadow: none; }
 }
-</style></head><body data-print-scope="${options.scope}" data-orientation="${primaryOptions.orientation}" data-scaling="${primaryOptions.scaling}" data-paper-size="${primaryOptions.paperSize}" data-gridlines="${primaryOptions.gridlines}" data-headings="${primaryOptions.headings}">${sections}</body></html>`
+</style></head><body data-print-scope="${options.scope}" data-orientation="${primaryOptions.orientation}" data-scaling="${primaryOptions.scaling}" data-paper-size="${primaryOptions.paperSize}" data-gridlines="${primaryOptions.gridlines}" data-headings="${primaryOptions.headings}" data-total-pages="${pages.length}" data-first-page="${printed.length ? printed[0].number : 1}">${sections}</body></html>`
   return {
     html,
     title,
@@ -936,7 +1311,9 @@ tr, td, th { break-inside: avoid; page-break-inside: avoid; }
     mixedPaperSizes,
     sheetCount: sheets.length,
     printedCells,
-    pageCount: pages.length,
+    // Pages in this document (a page range prints part of the printout) and in the whole printout.
+    pageCount: printed.length,
+    totalPages: pages.length,
     pageBreaks: Math.max(0, pages.length - sheets.length),
     minimumScale,
     oversizedDimensions,
@@ -945,11 +1322,14 @@ tr, td, th { break-inside: avoid; page-break-inside: avoid; }
       widthInches: metrics.widthInches,
       heightInches: metrics.heightInches,
     },
+    // Native job settings for webContents.print (see default-printer.cjs directPrintOptions).
+    printJob: printJobOf(input.options && typeof input.options === 'object' ? input.options.printer : null),
   }
 }
 
 module.exports = {
   MAX_PRINT_CELLS,
+  MAX_PRINT_COPIES,
   MARGIN_PRESETS,
   PAPER_SIZES,
   createSpreadsheetPrintDocument,

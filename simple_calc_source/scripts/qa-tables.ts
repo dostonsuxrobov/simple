@@ -9,6 +9,7 @@ import {
   fillCalculatedColumn,
   renameStructuredReferences,
   renameTable,
+  renameTablesInCopiedSheet,
   resizeTable,
   setTotalsFunction,
   setTotalsRow,
@@ -228,4 +229,32 @@ assert.deepEqual(uniqueColumnNames(['Item', '', 'Item', 'item', '']), ['Item', '
   assert.equal(data.cells.B3.formula, '$A3*2')
 }
 
-console.log('Tables QA passed: naming, creation, totals, header sync, renames, calculated columns, auto-expand, resize, structure edits, convert to range.')
+// ---- A copied sheet's tables get unique names (calc-file-io-objects-10) ------------------------
+{
+  const totals = { ...v(12), formula: 'SUBTOTAL(109,Sales[Qty])' }
+  const original = sheet('s1', 'Data', {
+    A1: v('Name'), B1: v('Qty'), A2: v('a'), B2: v(5), A3: v('b'), B3: v(7), A4: v('Total'), B4: totals,
+    C2: f('[@Qty]*2'), D1: f('COUNT(Sales[Qty])+COUNT(Other[Qty])'),
+  }, {
+    tables: [
+      { id: 'table-Sales', name: 'Sales', displayName: 'Sales', ref: 'A1:B4', headerRow: true, totalsRow: true, columns: [{ name: 'Name', totalsRowLabel: 'Total' }, { name: 'Qty', totalsRowFunction: 'sum' }] },
+      { id: 'table-Table1', name: 'Table1', displayName: 'Table1', ref: 'F1:F3', headerRow: true, totalsRow: false, columns: [{ name: 'Col' }] },
+    ],
+    conditionalFormattings: [{ ref: 'B2:B3', rules: [{ type: 'expression', formulae: ['B2>AVERAGE(Sales[Qty])'] }] }],
+  })
+  const other = sheet('s2', 'Other', {}, { tables: [{ id: 'table-Other', name: 'Other', ref: 'A1:A2', headerRow: true, totalsRow: false, columns: [{ name: 'Qty' }] }, { id: 'table-Sales2', name: 'Sales2', ref: 'C1:C2', headerRow: true, totalsRow: false, columns: [{ name: 'X' }] }] })
+  const book = workbook(original, other)
+  const copy = structuredClone(original)
+  let id = 0
+  const renames = renameTablesInCopiedSheet(book, copy, (prefix) => `${prefix}-copy-${++id}`)
+  assert.deepEqual([...renames.entries()], [['sales', 'Sales3'], ['table1', 'Table2']], 'Sales2 is taken elsewhere, so the copy is Sales3')
+  assert.deepEqual(copy.tables?.map((table) => [table.id, table.name, table.displayName]), [['table-copy-1', 'Sales3', 'Sales3'], ['table-copy-2', 'Table2', 'Table2']])
+  assert.equal(copy.cells.B4.formula, 'SUBTOTAL(109,Sales3[Qty])', 'the totals row follows the renamed table')
+  assert.equal(copy.cells.C2.formula, '[@Qty]*2', 'this-row references stay unqualified')
+  assert.equal(copy.cells.D1.formula, 'COUNT(Sales3[Qty])+COUNT(Other[Qty])', 'references to tables elsewhere stay')
+  assert.deepEqual((copy.conditionalFormattings?.[0] as { rules: Array<{ formulae: string[] }> }).rules[0].formulae, ['B2>AVERAGE(Sales3[Qty])'])
+  assert.equal(original.cells.B4.formula, 'SUBTOTAL(109,Sales[Qty])', 'the original sheet keeps its names')
+  assert.equal(validateTableName({ sheets: [original, other, copy] }, 'Sales3'), 'The name "Sales3" is already used in this workbook.')
+}
+
+console.log('Tables QA passed: naming, creation, totals, header sync, renames, calculated columns, auto-expand, resize, structure edits, convert to range, copied-sheet names.')

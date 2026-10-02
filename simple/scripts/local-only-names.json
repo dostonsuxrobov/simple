@@ -1,0 +1,16 @@
+{
+  "about": "SHA-256 hashes of the lower-case names (words joined without spaces or hyphens) of cloud storage services that Simple app code, tests and text must never name. The names themselves are kept out of the source; scripts/local-only-guard.cjs compares hashes of words in the text. To add one: node -e \"console.log(require('crypto').createHash('sha256').update('<name>').digest('hex'))\"",
+  "hashes": [
+    "12e7a69929c6089972cfd0943c4e010e346f7dfedb8b1753ef66a306cf84b970",
+    "345077e5da9f7a09253f76c1e4642fee132ed918fd1039ce235d9553d2d9dc3d",
+    "4e032178f5b45359e3c2635a90b3511e718119ceb7e83304d5eac8d8ce608451",
+    "567781541aa1d043041ec08be14e1c519629784e3952d0d079ac87640242ba5e",
+    "75170593d559f227f37d422056e701a9748849b661f92f74a8ffee3c977c1bb9",
+    "9211da2bdb79a1bf369af43968fb152c553345fe409cd7e4bc5c43f9003d6ded",
+    "9f9061a13251ea21e630aba6cdaa4061e83c477bceb1af66d6fe0fafd4b17d77",
+    "a4158c78f76e9617f7cc0725aad0e0ac4228bfcc6629335d9f9f4fbaf5802161",
+    "b4908884ffae28db7cd1c09edfac0d11b0cba4ab288611c03398887b88820d61",
+    "e0337ddfed1f926ec50e9e4838ead8991a74a2edcb99daf75de4415c0753e890",
+    "e0aa81dd500c530a70b5511fc95959ae1e19dc19a01034e223bfc5ed78e3bdef"
+  ]
+}

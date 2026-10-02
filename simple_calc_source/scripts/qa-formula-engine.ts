@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import {
   evaluateFormula,
   evaluateFormulaDetailed,
+  formulaHasImplicitIntersection,
   formulaMayReturnArray,
   type FormulaEvaluationHooks,
   type FormulaTableInfo,
@@ -126,5 +127,71 @@ assert.equal(formulaMayReturnArray('LEN(A1)'), false)
 tracked.length = 0
 run('SUM(A:A)')
 assert.ok(tracked.includes('Sheet1:1,1:1048576,1'), 'A:A is tracked as the full column')
+
+// calc-formula-engine-3: a host that returns values means "=..." text as text.
+{
+  const values: Record<string, unknown> = { A1: '=== Q1 ===', A2: 10, A3: 20, B1: '=SUM(A2:A3)', G1: '=1+1' }
+  const valueRun = (formula: string) => evaluateFormula(formula, 'Sheet1', (_sheet, address) => values[address] as never, { resolverReturnsValues: true })
+  assert.equal(valueRun('SUM(A1:A3)'), 30)
+  assert.equal(valueRun('A1&" total"'), '=== Q1 === total')
+  assert.equal(valueRun('B1'), '=SUM(A2:A3)')
+  assert.equal(valueRun('LEN(B1)'), 11)
+  assert.equal(valueRun('ISTEXT(G1)'), true)
+  assert.equal(valueRun('G1'), '=1+1')
+  assert.equal(valueRun('ISFORMULA(G1)'), false)
+  // Test resolvers that hand back formula text keep working.
+  assert.equal(evaluateFormula('G1*2', 'Sheet1', (_sheet, address) => values[address] as never), 4)
+}
+
+// calc-formula-engine-7: unary plus passes ranges through (=+A1:A3 still spills).
+assert.deepEqual(array('+A1:A3'), { rows: 3, columns: 1, values: [1, 2, 3] })
+
+// calc-formula-engine-5: legacy (pre-dynamic-array) formulas intersect instead of spilling.
+{
+  const legacy = (formula: string, row: number, column = 12) => {
+    const result = evaluateFormulaDetailed(formula, 'Sheet1', resolver, { ...hooks(row, column), implicitIntersection: true })
+    return result.array ? 'spilled' : result.value
+  }
+  assert.equal(legacy('A1:A5*2', 2), 4, 'row 2 reads A2')
+  assert.equal(legacy('A1:A5*2', 3), 6)
+  assert.equal(legacy('A1:A5*2', 9), '#VALUE!', 'outside the range rows')
+  assert.equal(legacy('A1:A5', 4), 4)
+  assert.equal(legacy('B1:B5', 5), 50)
+  assert.equal(legacy('SUM(A1:A5*2)', 2), 4, 'operators intersect inside SUM')
+  assert.equal(legacy('SUM(A1:A5)', 2), 15, 'reference arguments stay whole')
+  assert.equal(legacy('SUMPRODUCT(A1:A5*2)', 2), 30, 'array arguments are not intersected')
+  assert.equal(legacy('SUMPRODUCT((A1:A5>2)*B1:B5)', 9), 120)
+  assert.equal(legacy('INDEX((A1:A5>2)*B1:B5,4)', 9), 40, "INDEX's array argument is not intersected")
+  assert.equal(legacy('LEN(D1:D3)', 2), 5)
+  assert.equal(legacy('IF(A1:A5>2,"big","small")', 4), 'big')
+  assert.equal(legacy('IF(A1:A5>2,"big","small")', 1), 'small')
+  assert.equal(legacy('SUM(IF(A1>0,B1:B5,0))', 9), 150, 'IF passes a reference through')
+  assert.equal(legacy('INDEX(A1:B5,0,2)', 3), 30)
+  assert.equal(legacy('SEQUENCE(3)', 2), 1, 'arrays show their first value')
+  assert.equal(legacy('{1,2,3}*2', 2), 2)
+  assert.equal(legacy('SUM({1,2,3}*2)', 2), 12, 'array constants are not intersected')
+  assert.equal(legacy('A1:C1', 1, 2), 10, 'a row range intersects by column')
+  assert.equal(legacy('@A1:A5', 3), 3)
+  // The same formulas as dynamic arrays spill.
+  assert.deepEqual(array('A1:A5*2', 2), { rows: 5, columns: 1, values: [2, 4, 6, 8, 10] })
+  assert.equal(run('SUM(A1:A5*2)', 2), 30)
+}
+
+// Formulas whose meaning depends on dynamic-array evaluation.
+assert.equal(formulaHasImplicitIntersection('A1:A3*2'), true)
+assert.equal(formulaHasImplicitIntersection('SUM(A1:A3*2)'), true)
+assert.equal(formulaHasImplicitIntersection('SUM(LEN(A1:A3))'), true)
+assert.equal(formulaHasImplicitIntersection('Price'), true)
+assert.equal(formulaHasImplicitIntersection('SUM(A1:A3)'), false)
+assert.equal(formulaHasImplicitIntersection('SUMPRODUCT((A1:A3>1)*B1:B3)'), false)
+assert.equal(formulaHasImplicitIntersection('SUM(IF(A1>0,B1:B3,0))'), false)
+assert.equal(formulaHasImplicitIntersection('VLOOKUP(A1,B:C,2,FALSE)'), false)
+assert.equal(formulaHasImplicitIntersection('INDEX(A:A,MATCH(1,B:B,0))'), false)
+assert.equal(formulaHasImplicitIntersection('INDEX(A1:C3,0,2)'), true)
+assert.equal(formulaHasImplicitIntersection('A1+B1'), false)
+assert.equal(evaluateFormulaDetailed('SUM(A1:A3*2)', 'Sheet1', resolver, hooks()).arrayEvaluation, true)
+assert.equal(evaluateFormulaDetailed('SUM(A1:A3)', 'Sheet1', resolver, hooks()).arrayEvaluation, undefined)
+assert.equal(evaluateFormulaDetailed('SUMPRODUCT(A1:A3*2)', 'Sheet1', resolver, hooks()).arrayEvaluation, undefined)
+assert.equal(evaluateFormulaDetailed('INDEX(A1:A5,MATCH(3,A1:A5,0))', 'Sheet1', resolver, hooks()).arrayEvaluation, undefined)
 
 console.log('Formula engine QA passed: comparisons, text conversion, LET/LAMBDA, lifting, references, tables, and spills.')

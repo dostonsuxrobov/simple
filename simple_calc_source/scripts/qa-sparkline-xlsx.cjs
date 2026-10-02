@@ -54,7 +54,16 @@ async function main() {
   const cleared = structuredClone(reopened.workbook)
   cleared.sheets[0].sparklineGroups = []
   assert.doesNotMatch(await sheetXml(await serializeWorkbook(cleared, 'xlsx', { baseBytes: first })), /sparkline/)
-  process.stdout.write('Sparkline XLSX QA passed: groups written into the extLst, read back with colours and flags, kept byte-exact, rewritten when edited, removed when cleared.\n')
+  // CALC-SIE-25: a sheet renamed in the editor; sources still naming the old sheet are written
+  // with the new name (Excel would have rewritten them on rename).
+  const renamed = structuredClone(reopened.workbook)
+  renamed.sheets[0].name = 'Sales Q1'
+  const xml4 = await sheetXml(await serializeWorkbook(renamed, 'xlsx', { baseBytes: first }))
+  assert.match(xml4, /<xm:f>'Sales Q1'!A1:C1<\/xm:f><xm:sqref>D1<\/xm:sqref>/)
+  assert.doesNotMatch(xml4, /<xm:f>Trend!/)
+  const renamedBack = await workbookPayloadFromBytes('spark.xlsx', await serializeWorkbook(renamed, 'xlsx', { baseBytes: first }))
+  assert.equal(renamedBack.workbook.sheets[0].sparklineGroups[1].sparklines[1].source, "'Sales Q1'!A2:C2")
+  process.stdout.write('Sparkline XLSX QA passed: groups written into the extLst, read back with colours and flags, kept byte-exact, rewritten when edited, removed when cleared, sources follow a renamed sheet.\n')
 }
 
 main().catch((error) => {

@@ -6,6 +6,7 @@
  * call them on an immer draft.
  */
 import type { CellBorderSide, CellData, SheetData, SheetTable, WorkbookModel } from '../spreadsheet-types'
+import { adjustFilterForStructure } from './filter'
 import { moveReferencesInFormula, tokenizeFormulaText } from './formula-editing'
 import { parseStructuredSpecifier, shiftFormulaReferences } from './formulas'
 import { tableCellPaint } from './table-styles'
@@ -456,6 +457,63 @@ export function applyStructuredRename(workbook: WorkbookModel, rename: Structure
   }
 }
 
+/**
+ * A copied sheet's tables need workbook-unique names (Excel repairs a file with two tables called
+ * "Sales"): Sales becomes Sales2, Table1 becomes Table2, and so on. The copy's own structured
+ * references (formulas, totals, validation and conditional formats) follow the new names, as in
+ * Excel; references on other sheets keep pointing at the original tables. Mutates `copy` (which
+ * must not be in `workbook.sheets` yet) and returns the renames, old lower-case name -> new name.
+ */
+export function renameTablesInCopiedSheet(workbook: Pick<WorkbookModel, 'sheets' | 'definedNames'>, copy: SheetData, makeId: (prefix: string) => string): Map<string, string> {
+  const renames = new Map<string, string>()
+  if (!copy.tables?.length) return renames
+  const taken = new Set<string>()
+  const usable = (name: string) => !taken.has(name.toLocaleLowerCase()) && validateTableName(workbook, name) === null
+  copy.tables = copy.tables.map((table) => {
+    const stem = table.name.replace(/\d+$/, '') || 'Table'
+    let index = Math.max(2, Number(/\d+$/.exec(table.name)?.[0] ?? 1) + 1)
+    let name = `${stem}${index}`
+    while (!usable(name) && index < 100_000) name = `${stem}${++index}`
+    // A stem that cannot carry a number (it would read as a cell reference) falls back to TableN.
+    for (let fallback = 1; !usable(name); fallback += 1) name = `Table${fallback}`
+    taken.add(name.toLocaleLowerCase())
+    renames.set(table.name.toLocaleLowerCase(), name)
+    const next: SheetTable = { ...table, id: makeId('table'), name, displayName: name, columns: table.columns.map((column) => ({ ...column })) }
+    delete next.imported
+    return next
+  })
+  const rename: StructuredRename = { tables: renames }
+  const tables = copy.tables.map((table) => ({ table, bounds: parseTableRef(table.ref) }))
+  for (const [address, cell] of Object.entries(copy.cells)) {
+    if (!cell.formula || !cell.formula.includes('[')) continue
+    const match = /^([A-Z]+)(\d+)$/.exec(address)
+    const row = match ? Number(match[2]) - 1 : -1
+    const col = match ? columnIndex(match[1]) : -1
+    const host = tables.find(({ bounds }) => bounds && row >= bounds.top && row <= bounds.bottom && col >= bounds.left && col <= bounds.right)?.table
+    const next = renameStructuredReferences(cell.formula, rename, host?.name)
+    if (next !== cell.formula) copy.cells[address] = { ...cell, formula: next }
+  }
+  copy.tables = copy.tables.map((table) => ({
+    ...table,
+    columns: table.columns.map((column) => (column.totalsRowFormula ? { ...column, totalsRowFormula: renameStructuredReferences(column.totalsRowFormula, rename, table.name) } : column)),
+  }))
+  const renameAll = (formulae: unknown) => (Array.isArray(formulae) ? formulae.map((item) => (typeof item === 'string' ? renameStructuredReferences(item.replace(/^=/, ''), rename) : item)) : formulae)
+  if (copy.dataValidations) {
+    for (const [key, validation] of Object.entries(copy.dataValidations)) {
+      const record = validation as { formulae?: unknown[] } | null
+      if (record && Array.isArray(record.formulae)) copy.dataValidations[key] = { ...record, formulae: renameAll(record.formulae) }
+    }
+  }
+  if (copy.conditionalFormattings) {
+    copy.conditionalFormattings = copy.conditionalFormattings.map((block) => {
+      const record = block as { rules?: Array<{ formulae?: unknown[] }> } | null
+      if (!record?.rules) return block
+      return { ...record, rules: record.rules.map((rule) => (Array.isArray(rule.formulae) ? { ...rule, formulae: renameAll(rule.formulae) as unknown[] } : rule)) }
+    })
+  }
+  return renames
+}
+
 export function renameTable(workbook: WorkbookModel, tableId: string, name: string): string | null {
   const entry = findTable(workbook, tableId)
   if (!entry) return 'The table no longer exists.'
@@ -778,6 +836,7 @@ export function transformTablesForStructure(sheet: SheetData, operation: { axis:
         bottom -= removedBefore + removedInside
       }
       next.ref = formatTableRef({ top, bottom, left: regions.left, right: regions.right })
+      transformTableFilter(table, regions, next, operation)
       return [next]
     }
     let { left, right } = regions
@@ -802,6 +861,26 @@ export function transformTablesForStructure(sheet: SheetData, operation: { axis:
       right -= removedBefore + removedInside
     }
     next.ref = formatTableRef({ top: regions.top, bottom: regions.bottom, left, right })
+    transformTableFilter(table, regions, next, operation)
     return [next]
   })
+}
+
+/**
+ * A table's own filter follows its columns (criteria are stored per column offset) and its
+ * range, and goes with the header row.
+ */
+function transformTableFilter(table: SheetTable, before: TableRegions, next: SheetTable, operation: { axis: 'row' | 'column'; kind: 'insert' | 'delete'; index: number; count: number }) {
+  if (!table.filter) return
+  const after = tableRegions(next)
+  if (before.header === null || !after || after.header === null) {
+    delete next.filter
+    return
+  }
+  const adjusted = adjustFilterForStructure({ ...table.filter, ref: formatTableRef({ top: before.header, bottom: Math.max(before.header, before.dataBottom), left: before.left, right: before.right }) }, operation)
+  if (!adjusted) {
+    delete next.filter
+    return
+  }
+  next.filter = { ...adjusted, ref: formatTableRef({ top: after.header, bottom: Math.max(after.header, after.dataBottom), left: after.left, right: after.right }) }
 }

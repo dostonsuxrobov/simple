@@ -1,11 +1,18 @@
-/* WordCanvas 0.12.0 adapter: anchored header images occupy no flow space.
- * The MIT dependency ships generated modules. Keep this patch explicit, pinned,
+/* WordCanvas 0.12.0 adapters: anchored header images occupy no flow space, the
+ * reviewed creation/fidelity fixes, and the generic SIMPLE_HOOKS layer.
+ * The MIT dependency ships generated modules. Keep every patch explicit, pinned,
  * idempotent, and fail closed on upstream changes; never alter the source model.
  * See wordcanvas-patch.md for scope, sources, and remaining rendering limits.
  */
 const fs = require('node:fs');
 const path = require('node:path');
-const base = path.resolve(__dirname, '../node_modules/@forevka/wordcanvas');
+// Tests require() this file to review the SIMPLE_HOOKS source. Only running it
+// (postinstall/pretest/prebuild:web) patches the dependency.
+module.exports = { simpleHooks: simpleHooksDefinition() };
+if (require.main !== module) return;
+// SIMPLE_WORDCANVAS_PACKAGE_DIR points the patcher at a scratch copy of the
+// package (the regression test uses it to prove the version guard).
+const base = path.resolve(process.env.SIMPLE_WORDCANVAS_PACKAGE_DIR || path.join(__dirname, '../node_modules/@forevka/wordcanvas'));
 const marker = '// SIMPLE_WORDCANVAS_HEADER_IMAGES_V1';
 if (JSON.parse(fs.readFileSync(path.join(base, 'package.json'), 'utf8')).version !== '0.12.0') {
   throw new Error('WordCanvas patch requires reviewed version 0.12.0.');
@@ -359,5 +366,446 @@ function simpleOfficeColor(value, fallback) {
     pending.set(file, `${marker}\n${helper}\n${source}`);
   }
 }
+// SIMPLE_HOOKS runs last: its anchors sit outside every region edited above.
+// The marker line carries a fingerprint of the hook source, so an install that
+// holds an older SIMPLE_HOOKS revision fails loudly instead of being skipped.
+{
+  const {marker: hooksMarker, markerLine, file: relative, helpers, edits} = module.exports.simpleHooks;
+  const file = path.join(base, relative);
+  let source = pending.get(file) ?? fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+  const applied = source.split('\n').find((line) => line.startsWith(hooksMarker));
+  if (applied && applied !== markerLine) throw new Error(`${relative}: holds "${applied}" but this script expects "${markerLine}". Reinstall @forevka/wordcanvas 0.12.0 (npm ci) so the reviewed hooks are applied to pristine sources. No files written.`);
+  if (!applied) {
+    for (const [before, after] of edits) {
+      const count = source.split(before).length - 1;
+      if (count !== 1) throw new Error(`${relative}: SIMPLE_HOOKS expected one reviewed instance of ${JSON.stringify(before.slice(0, 120))}, found ${count}. No files written.`);
+      source = source.split(before).join(after);
+    }
+    pending.set(file, `${markerLine}\n${helpers}\n${source}`);
+  }
+}
 for (const [file, source] of pending) fs.writeFileSync(file, source);
-console.log(`WordCanvas 0.12.0 header image adapter: ${pending.size ? `patched ${pending.size} modules` : 'already applied'}.`);
+console.log(`WordCanvas 0.12.0 adapters: ${pending.size ? `patched ${pending.size} modules` : 'already applied'}.`);
+
+/* SIMPLE_HOOKS: one generic "Simple layer" over the browser editor
+ * (dist-lib/editorApp) instead of one minified patch per feature. It adds
+ * - a `simple:docchange` custom event after every committed model change
+ *   (typing, commands, paste, undo/redo, remote ops, document loads), never
+ *   for selection, view or transient preview changes;
+ * - handle methods: insertImageBytes, insertBlocks, replaceBlock, replaceImage,
+ *   undo/redo/canUndo/canRedo, setSelection, focus, seedReview,
+ *   positionFromPoint, deleteWord and getModelRevision;
+ * - a dialog bridge for every reachable prompt()/alert() (prompt() throws in
+ *   Electron 43) and a rejecting openDocx instead of an alert;
+ * - an after-insert text hook (AutoFormat) and a built-in autocorrect switch;
+ * - Ctrl+Backspace / Ctrl+Delete word deletion (keydown and beforeinput).
+ * src/engine-bridge.ts is the typed consumer; wordcanvas-patch.md documents
+ * the contract. Every edit below must match exactly once or nothing is written.
+ */
+function simpleHooksDefinition() {
+  const marker = '// SIMPLE_WORDCANVAS_SIMPLE_HOOKS_V1';
+  // Module-level helpers. Engine names used here (xM, XA, xB, Qg, Jg, BI, UC,
+  // hC) are imports or module functions of editorApp-vN1g1Ew1.js 0.12.0.
+  const helpers = String.raw`
+const simpleHookVersion = 1, simpleHookBands = ["header", "footer", "headerFirst", "headerEven", "footerFirst", "footerEven"];
+function simpleHookApp(options) {
+  const app = {
+    version: simpleHookVersion,
+    revision: 0,
+    dialog: null,
+    insertTextHook: null,
+    autoCorrect: !0,
+    docChanged(origin, canUndo, canRedo) {
+      const payload = { revision: ++app.revision, origin, canUndo: !!canUndo, canRedo: !!canRedo };
+      try {
+        options?.onEvent?.({ type: "custom", name: "simple:docchange", payload });
+      } catch (error) {
+        console.error("[simple-hooks] a simple:docchange listener failed", error);
+      }
+      return payload;
+    }
+  };
+  return app;
+}
+function simpleHookDialog(app, request) {
+  const kind = request.kind, empty = kind === "prompt" ? null : kind === "confirm" ? !1 : void 0;
+  const settle = (value) => kind === "prompt" ? typeof value == "string" ? value : null : kind === "confirm" ? value === !0 : void 0;
+  const handler = app?.dialog;
+  if (typeof handler == "function") {
+    try {
+      return Promise.resolve(handler({ ...request })).then(settle, (error) => (console.error("[simple-hooks] dialog handler failed", error), empty));
+    } catch (error) {
+      console.error("[simple-hooks] dialog handler failed", error);
+      return Promise.resolve(empty);
+    }
+  }
+  try {
+    if (kind === "prompt") return Promise.resolve(settle(window.prompt(request.message, request.defaultValue ?? "")));
+    if (kind === "confirm") return Promise.resolve(settle(window.confirm(request.message)));
+    window.alert(request.message);
+  } catch (error) {
+    console.warn("[simple-hooks] window." + kind + "() is unavailable; register a dialog handler with setDialogHandler().", error);
+  }
+  return Promise.resolve(empty);
+}
+async function simpleHookPrepareImage(bytes, mime) {
+  const data = ArrayBuffer.isView(bytes) ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength) : Object.prototype.toString.call(bytes) === "[object ArrayBuffer]" ? new Uint8Array(bytes) : null;
+  if (!data || data.byteLength === 0) return null;
+  const type = typeof mime == "string" && /^image\/[\w.+-]+$/i.test(mime) ? mime.toLowerCase() : "image/png";
+  let widthPx = 0, heightPx = 0;
+  try {
+    const bitmap = await createImageBitmap(new Blob([data], { type }));
+    widthPx = bitmap.width, heightPx = bitmap.height, bitmap.close();
+  } catch {
+    return null;
+  }
+  if (!(widthPx > 0 && heightPx > 0)) return null;
+  const mediaId = await UC(data, type), src = hC(mediaId);
+  return src ? { src, mediaId, mime: type, widthPx, heightPx } : null;
+}
+function simpleHookMapChildren(block, visit) {
+  if (block?.kind === "table" && Array.isArray(block.rows)) {
+    let changed = !1;
+    const rows = block.rows.map((row) => {
+      let rowChanged = !1;
+      const cells = (row.cells ?? []).map((cell) => {
+        const blocks = simpleHookMapBlocks(cell.blocks, visit);
+        return blocks === cell.blocks ? cell : (rowChanged = !0, { ...cell, blocks });
+      });
+      return rowChanged ? (changed = !0, { ...row, cells }) : row;
+    });
+    return changed ? { ...block, rows, revision: (block.revision ?? 0) + 1 } : block;
+  }
+  if (block?.kind === "shape" && Array.isArray(block.text?.blocks)) {
+    const blocks = simpleHookMapBlocks(block.text.blocks, visit);
+    return blocks === block.text.blocks ? block : { ...block, text: { ...block.text, blocks }, revision: (block.revision ?? 0) + 1 };
+  }
+  return block;
+}
+function simpleHookMapBlocks(blocks, visit) {
+  if (!Array.isArray(blocks)) return blocks;
+  let out = null;
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index];
+    let next = visit(block);
+    next === block && (next = simpleHookMapChildren(block, visit));
+    next !== block && ((out ??= blocks.slice())[index] = next);
+  }
+  return out ?? blocks;
+}
+function simpleHookMapDocument(doc, visit) {
+  let next = doc;
+  const blocks = simpleHookMapBlocks(doc.blocks, visit);
+  blocks !== doc.blocks && (next = { ...next, blocks });
+  let section = doc.section;
+  for (const band of simpleHookBands) {
+    const list = doc.section?.[band];
+    if (!list) continue;
+    const mapped = simpleHookMapBlocks(list, visit);
+    mapped !== list && (section = { ...section, [band]: mapped });
+  }
+  section !== doc.section && (next = { ...next, section });
+  for (const key of ["footnotes", "endnotes"]) {
+    const notes = doc[key];
+    if (!notes) continue;
+    let changed = null;
+    for (const [id, list] of Object.entries(notes)) {
+      const mapped = simpleHookMapBlocks(list, visit);
+      mapped !== list && ((changed ??= { ...notes })[id] = mapped);
+    }
+    changed && (next = { ...next, [key]: changed });
+  }
+  return next;
+}
+function simpleHookRevisionMap(block, map = new Map()) {
+  if (!block || typeof block != "object") return map;
+  typeof block.id == "string" && Number.isFinite(block.revision) && map.set(block.id, block.revision);
+  if (block.kind === "table") for (const row of block.rows ?? []) for (const cell of row.cells ?? []) for (const child of cell.blocks ?? []) simpleHookRevisionMap(child, map);
+  else if (block.kind === "shape") for (const child of block.text?.blocks ?? []) simpleHookRevisionMap(child, map);
+  return map;
+}
+// Layout caches measurements by block id + revision: a replacement must never
+// reuse the revision of the block (or nested block) it replaces.
+function simpleHookRevise(block, previous) {
+  if (!block || typeof block != "object") return block;
+  const own = Number.isFinite(block.revision) ? block.revision : 0, old = previous.get(block.id);
+  const next = { ...block, revision: old === void 0 ? own : Math.max(own, old + 1) };
+  if (next.kind === "table" && Array.isArray(next.rows)) next.rows = next.rows.map((row) => ({ ...row, cells: (row.cells ?? []).map((cell) => ({ ...cell, blocks: (cell.blocks ?? []).map((child) => simpleHookRevise(child, previous)) })) }));
+  else if (next.kind === "shape" && Array.isArray(next.text?.blocks)) next.text = { ...next.text, blocks: next.text.blocks.map((child) => simpleHookRevise(child, previous)) };
+  return next;
+}
+function simpleHookRemint(block) {
+  if (!block || typeof block != "object") return block;
+  const next = { ...block, id: Jg(), revision: Number.isFinite(block.revision) ? block.revision : 0 };
+  if (next.kind === "table" && Array.isArray(next.rows)) next.rows = next.rows.map((row) => ({ ...row, cells: (row.cells ?? []).map((cell) => ({ ...cell, id: Jg(), blocks: (cell.blocks ?? []).map((child) => simpleHookRemint(child)) })) }));
+  else if (next.kind === "shape" && Array.isArray(next.text?.blocks)) next.text = { ...next.text, blocks: next.text.blocks.map((child) => simpleHookRemint(child)) };
+  return next;
+}
+function simpleHookFirstParagraph(block) {
+  if (!block || typeof block != "object") return null;
+  if (block.kind === "paragraph") return block.id;
+  const children = block.kind === "table" ? (block.rows ?? []).flatMap((row) => (row.cells ?? []).flatMap((cell) => cell.blocks ?? [])) : block.kind === "shape" ? block.text?.blocks ?? [] : [];
+  for (const child of children) {
+    const id = simpleHookFirstParagraph(child);
+    if (id) return id;
+  }
+  return null;
+}
+function simpleHookSelectionIn(doc, selection, replacement) {
+  const valid = (position) => {
+    const block = position && XA(doc, position.blockId);
+    return !!block && Number.isInteger(position.offset) && position.offset >= 0 && position.offset <= xB(block.runs).length;
+  };
+  if (selection && valid(selection.anchor) && valid(selection.focus)) return selection;
+  const first = simpleHookFirstParagraph(replacement);
+  return first ? { anchor: { blockId: first, offset: 0 }, focus: { blockId: first, offset: 0 } } : null;
+}
+function simpleHookPatchRuns(runs, start, end, patch) {
+  const out = [];
+  let at = 0;
+  for (const run of runs) {
+    const from = at, to = at + run.text.length;
+    if (at = to, to <= start || from >= end || run.text.length === 0) {
+      out.push(run);
+      continue;
+    }
+    const a = Math.max(start, from) - from, b = Math.min(end, to) - from;
+    a > 0 && out.push({ text: run.text.slice(0, a), style: run.style });
+    out.push({ text: run.text.slice(a, b), style: { ...run.style, ...patch } });
+    b < run.text.length && out.push({ text: run.text.slice(b), style: run.style });
+  }
+  return out;
+}
+// One transaction for an insert-text hook result, so Ctrl+Z reverts only the
+// correction. Text edits apply right to left; list edits apply last.
+function simpleHookEditTransaction(state, edits, blockId) {
+  if (!Array.isArray(edits) || edits.length === 0) return null;
+  let doc = state.doc, selection = state.selection;
+  const ops = [], apply = (op) => {
+    const result = xM(doc, op);
+    doc = result.doc, ops.push(op), selection && (selection = { anchor: result.mapPosition(selection.anchor), focus: result.mapPosition(selection.focus) });
+  };
+  const textEdits = edits.filter((edit) => edit && (edit.type === "replace" || edit.type === "format")).sort((x, y) => (Number(y.start) || 0) - (Number(x.start) || 0));
+  for (const edit of textEdits) {
+    const id = typeof edit.blockId == "string" ? edit.blockId : blockId, block = id ? XA(doc, id) : void 0;
+    if (!block) continue;
+    const length = xB(block.runs).length, clamp = (value) => Math.max(0, Math.min(length, Math.trunc(Number(value) || 0)));
+    const start = clamp(edit.start), end = Math.max(start, clamp(edit.end ?? edit.start)), patch = edit.style && typeof edit.style == "object" ? edit.style : null;
+    if (edit.type === "replace") {
+      const text = typeof edit.text == "string" ? edit.text : "", style = { ...Qg(block.runs, end > start ? start + 1 : start) ?? {}, ...patch ?? {} };
+      end > start && apply({ type: "deleteRange", blockId: id, start, end }), text && apply({ type: "insertText", at: { blockId: id, offset: start }, text, style });
+    } else end > start && patch && apply({ type: "setRuns", blockId: id, runs: simpleHookPatchRuns(block.runs, start, end, patch) });
+  }
+  for (const edit of edits) {
+    if (edit?.type !== "list") continue;
+    const kind = edit.kind === "bullet" ? "bullet" : edit.kind === "number" || edit.kind === "decimal" ? "decimal" : null, id = typeof edit.blockId == "string" ? edit.blockId : blockId;
+    if (!kind || !id || !XA(doc, id)) continue;
+    const caret = { blockId: id, offset: 0 }, command = BI(kind)({ doc, selection: { anchor: caret, focus: caret }, cellSelection: null, pendingStyle: null });
+    for (const op of command?.ops ?? []) apply(op);
+  }
+  return ops.length > 0 ? { ops, selectionAfter: selection, origin: "command" } : null;
+}
+`;
+  // Editor-local helpers, inserted at the top of the editor factory (_M).
+  const editorHelpers = String.raw`
+  let simpleHookSeen = o;
+  const simpleHookCommit = (origin) => {
+    o !== simpleHookSeen && (simpleHookSeen = o, g.simple?.docChanged(origin, M !== "view" && t.canUndo, M !== "view" && t.canRedo));
+  }, simpleHookAfterInsert = (kind, text, run) => {
+    const before = o, previous = h?.focus;
+    run();
+    const hook = g.simple?.insertTextHook;
+    if (typeof hook != "function" || o === before || M === "view" || !h || !zB(h)) return;
+    const focus = h.focus, block = XA(o, focus.blockId);
+    if (!block) return;
+    const context = { kind, text, blockId: focus.blockId, offset: focus.offset, paragraphText: xB(block.runs), paragraphStyle: { ...block.style }, mode: M };
+    if (kind === "paragraph" && previous && previous.blockId !== focus.blockId) {
+      const prior = XA(o, previous.blockId);
+      prior && (context.previousBlockId = prior.id, context.previousText = xB(prior.runs));
+    }
+    let edits;
+    try {
+      edits = hook(context);
+    } catch (error) {
+      console.error("[simple-hooks] insert-text hook failed", error);
+      return;
+    }
+    Array.isArray(edits) && edits.length > 0 && _((state) => simpleHookEditTransaction(state, edits, focus.blockId));
+  }, simpleHookDeleteWord = (direction) => {
+    if (M === "view" || fI()) return !1;
+    const before = o, plain = () => direction < 0 ? UM() : Qt();
+    return _((state) => {
+      const selection = state.selection;
+      if (!selection) return null;
+      if (!zB(selection)) return plain()(state);
+      const target = ic?.simpleWordTarget?.(selection.focus, direction);
+      if (!target || target.blockId !== selection.focus.blockId) return plain()(state);
+      const { blockId, offset } = selection.focus, start = Math.min(offset, target.offset), end = Math.max(offset, target.offset);
+      return start === end ? null : wA([{ type: "deleteRange", blockId, start, end }], qA(blockId, start), "command");
+    }), o !== before;
+  }, simpleHookTextWidth = () => {
+    const caret = h ? og(Y, h.focus, J()) : null, page = caret ? Y.pages[caret.pageIndex] : null, section = o.section, columns = section.columns;
+    const width = page ? page.widthPx - page.marginPx.left - page.marginPx.right : section.pageWidthPx - section.marginPx.left - section.marginPx.right;
+    return columns?.count > 1 ? (width - (columns.gapPx ?? 0) * (columns.count - 1)) / columns.count : width;
+  }, simpleHookPosition = (x, y) => {
+    const point = Number.isFinite(x) && Number.isFinite(y) ? C.clientToPage(x, y) : null;
+    return point ? UI(Y, point.pageIndex, point.x, point.y, J()) : null;
+  }, simpleHookInsertImage = (image, options = {}) => {
+    if (M === "view" || !image?.src) return !1;
+    if (options.at) {
+      const position = simpleHookPosition(options.at.clientX, options.at.clientY);
+      position && l({ anchor: position, focus: position });
+    }
+    const naturalWidth = image.widthPx > 0 ? image.widthPx : 320, naturalHeight = image.heightPx > 0 ? image.heightPx : 200;
+    let width = options.widthPx > 0 ? options.widthPx : 0, height = options.heightPx > 0 ? options.heightPx : 0;
+    if (width && !height) height = width * naturalHeight / naturalWidth;
+    else if (height && !width) width = height * naturalWidth / naturalHeight;
+    else if (!width) width = naturalWidth, height = naturalHeight;
+    const limit = options.maxWidthPx > 0 ? options.maxWidthPx : simpleHookTextWidth();
+    limit > 0 && width > limit && (height = height * limit / width, width = limit), width = Math.max(1, Math.round(width)), height = Math.max(1, Math.round(height));
+    const before = o;
+    return _(jC(image.src, width, height, image.mediaId)), o === before && _(Eo(image.src, width, height, image.mediaId)), o !== before;
+  }, simpleHookInsertBlocks = (blocks, options = {}) => {
+    if (M === "view") return !1;
+    const list = (Array.isArray(blocks) ? blocks : [blocks]).filter((block) => block && typeof block == "object" && typeof block.kind == "string");
+    if (list.length === 0) return !1;
+    const fresh = list.map((block) => options.keepIds ? simpleHookRevise(block, new Map()) : simpleHookRemint(block)), before = o;
+    return _((state) => {
+      if (Number.isInteger(options.index)) {
+        const index = Math.max(0, Math.min(state.doc.blocks.length, options.index));
+        return wA(fresh.map((block, offset) => ({ type: "insertBlock", index: index + offset, block })), state.selection, "command");
+      }
+      const removal = EI(state);
+      if (!removal) return null;
+      let doc = state.doc;
+      for (const op of removal.ops) doc = xM(doc, op).doc;
+      const placed = $Q({ ...state, doc, selection: { anchor: removal.at, focus: removal.at } }, () => fresh[0]);
+      if (!placed) return null;
+      const ops = [...removal.ops, ...placed.ops], first = placed.ops.find((op) => op.type === "insertBlock");
+      for (let offset = 1; offset < fresh.length; offset++) ops.push({ type: "insertBlock", index: first.index + offset, block: fresh[offset] });
+      return wA(ops, placed.selectionAfter, "command");
+    }), o !== before;
+  }, simpleHookReplaceBlock = (blockId, replacement) => {
+    if (M !== "edit" || typeof blockId != "string" || !replacement) return !1;
+    const before = o;
+    return _((state) => {
+      let found = !1, next = null;
+      const doc = simpleHookMapDocument(state.doc, (block) => {
+        if (found || block?.id !== blockId) return block;
+        found = !0;
+        const candidate = typeof replacement == "function" ? replacement(block) : replacement;
+        return candidate && typeof candidate == "object" && typeof candidate.kind == "string" ? next = simpleHookRevise({ ...candidate, id: blockId }, simpleHookRevisionMap(block)) : block;
+      });
+      return next && doc !== state.doc ? wA([{ type: "setDocument", doc }], simpleHookSelectionIn(doc, state.selection, next), "command") : null;
+    }), o !== before;
+  }, simpleHookReplaceImage = (imageId, image, options = {}) => !!image?.src && simpleHookReplaceBlock(imageId, (old) => {
+    if (old.kind !== "image") return null;
+    const ratio = image.widthPx > 0 && image.heightPx > 0 ? image.widthPx / image.heightPx : old.widthPx / Math.max(1, old.heightPx);
+    const width = options.widthPx > 0 ? options.widthPx : old.widthPx, height = options.heightPx > 0 ? options.heightPx : options.fit === "frame" ? old.heightPx : width / ratio;
+    const next = { ...old, src: image.src, mediaId: image.mediaId, widthPx: Math.max(1, Math.round(width)), heightPx: Math.max(1, Math.round(height)) };
+    if (options.crop === null) delete next.crop;
+    else if (options.crop !== void 0) next.crop = options.crop;
+    else if (!options.keepCrop) delete next.crop;
+    return next;
+  });`;
+  const edits = [
+    // Editor factory: model revision tracking and the editor-side hook bodies.
+    ['  C.setTree(Y);\n  const v = () => ({ doc: o, selection: h, cellSelection: a, pendingStyle: d }), f = (E) => {',
+      `  C.setTree(Y);${editorHelpers}\n  const v = () => ({ doc: o, selection: h, cellSelection: a, pendingStyle: d }), f = (E) => {`],
+    // Committed transactions, undo, redo and remote ops emit simple:docchange.
+    ['Vg(E.selectionAfter, E.origin === "transient");\n  }, Fg = (E) => {',
+      'Vg(E.selectionAfter, E.origin === "transient"), E.origin !== "transient" && E.ops.length > 0 && simpleHookCommit(E.origin);\n  }, Fg = (E) => {'],
+    ['F.record(E.inverseOps, "undo", E.selectionBefore, Date.now()), Vg(E.selectionBefore);',
+      'F.record(E.inverseOps, "undo", E.selectionBefore, Date.now()), Vg(E.selectionBefore), simpleHookCommit("undo");'],
+    ['F.record(E.ops, "redo", E.selectionAfter, Date.now()), Vg(E.selectionAfter);',
+      'F.record(E.ops, "redo", E.selectionAfter, Date.now()), Vg(E.selectionAfter), simpleHookCommit("redo");'],
+    ['    U = ci(U, o), E.length > 0 && SA(), Vg(i);\n  }, eI = (E) => {',
+      '    U = ci(U, o), E.length > 0 && SA(), Vg(i), simpleHookCommit("remote");\n  }, eI = (E) => {'],
+    // Typed text: built-in autocorrect switch and the after-insert hook.
+    ['    if (E.length === 1 && h && zB(h)) {\n      const D = XA(o, h.focus.blockId), N = D ? xB(D.runs).slice(0, h.focus.offset) : "";',
+      '    if (E.length === 1 && h && zB(h) && g.simple?.autoCorrect !== !1) {\n      const D = XA(o, h.focus.blockId), N = D ? xB(D.runs).slice(0, h.focus.offset) : "";'],
+    ['    onInsertText: (E) => Qc(E),',
+      '    onInsertText: (E) => simpleHookAfterInsert("text", E, () => Qc(E)),'],
+    ['    onSplitParagraph: () => {\n      const E = h?.focus;\n      E && Nt(o, E) || _(Oc());\n    },',
+      '    onSplitParagraph: () => simpleHookAfterInsert("paragraph", "\\n", () => {\n      const E = h?.focus;\n      E && Nt(o, E) || _(Oc());\n    }),'],
+    // Word deletion: hidden-input beforeinput (IME/touch) and Ctrl+Backspace/Delete.
+    ['    onDeleteForward: () => {\n      fI() || _(Qt());\n    },',
+      '    onDeleteForward: () => {\n      fI() || _(Qt());\n    },\n    onDeleteWordBackward: () => simpleHookDeleteWord(-1),\n    onDeleteWordForward: () => simpleHookDeleteWord(1),'],
+    ['      case "deleteContentForward":\n        F.preventDefault(), B.onDeleteForward();\n        return;',
+      '      case "deleteContentForward":\n        F.preventDefault(), B.onDeleteForward();\n        return;\n      case "deleteWordBackward":\n      case "deleteWordForward":\n        if (Q) return;\n        F.preventDefault(), F.inputType === "deleteWordBackward" ? B.onDeleteWordBackward?.() : B.onDeleteWordForward?.();\n        return;'],
+    ['    onDeleteSelection: () => _(UM()),\n    getStory: () => T,',
+      '    onDeleteSelection: () => _(UM()),\n    simpleDeleteWord: (E) => simpleHookDeleteWord(E),\n    getStory: () => T,'],
+    ['    if (!q) return;\n    const CA = (X) => {',
+      '    if (!q) return;\n    if (jA && !V.altKey && !V.shiftKey && !V.isComposing && (V.key === "Backspace" || V.key === "Delete") && A.simpleDeleteWord) {\n      A.simpleDeleteWord(V.key === "Backspace" ? -1 : 1), V.preventDefault();\n      return;\n    }\n    const CA = (X) => {'],
+    // Same word boundaries as Ctrl+Arrow, in logical (not visual) direction.
+    ['B.addEventListener("cut", vA), {\n    destroy() {',
+      'B.addEventListener("cut", vA), {\n    simpleWordTarget: (V, q) => c(V, q, !0),\n    destroy() {'],
+    ['    undo: EQ,\n    redo: eQ,\n    destroy() {',
+      '    simpleCanUndo: () => M !== "view" && t.canUndo,\n    simpleCanRedo: () => M !== "view" && t.canRedo,\n    simpleDeleteWord: (E) => simpleHookDeleteWord(E < 0 ? -1 : 1),\n    simpleInsertImage: (E, i) => simpleHookInsertImage(E, i),\n    simpleInsertBlocks: (E, i) => simpleHookInsertBlocks(E, i),\n    simpleReplaceBlock: (E, i) => simpleHookReplaceBlock(E, i),\n    simpleReplaceImage: (E, i, D) => simpleHookReplaceImage(E, i, D),\n    simplePositionFromPoint: (E, i) => simpleHookPosition(E, i),\n    undo: EQ,\n    redo: eQ,\n    destroy() {'],
+    // Context-menu prompts (editor factory scope).
+    ['      i("Edit Hyperlink…", () => {\n        const oA = prompt("Link URL:", FB);\n        oA !== null && _(HM(oA.trim() === "" ? null : oA.trim()));\n      }),',
+      '      i("Edit Hyperlink…", () => {\n        simpleHookDialog(g.simple, { kind: "prompt", id: "hyperlink.edit", title: "Edit hyperlink", message: "Link URL:", defaultValue: FB }).then((oA) => {\n          oA !== null && _(HM(oA.trim() === "" ? null : oA.trim())), ig.focus();\n        });\n      }),'],
+    ['      i("Insert Hyperlink…", () => {\n        const oA = prompt("Link URL:");\n        oA !== null && oA.trim() !== "" && _(HM(oA.trim()));\n      }, { icon: u.link }),',
+      '      i("Insert Hyperlink…", () => {\n        simpleHookDialog(g.simple, { kind: "prompt", id: "hyperlink.insert", title: "Insert hyperlink", message: "Link URL:", defaultValue: "" }).then((oA) => {\n          oA !== null && oA.trim() !== "" && _(HM(oA.trim())), ig.focus();\n        });\n      }, { icon: u.link }),'],
+    // Application scope: one hook state per mounted editor app.
+    ['  const yB = {\n    engine: K,',
+      '  const simpleApp = simpleHookApp(A);\n  const yB = {\n    simple: simpleApp,\n    engine: K,'],
+    ['s = _M(Q, S, yB), vB(), IA(), MA(), DA(), aA(), window.__cw = { doc: S, tree: void 0, engine: K, editor: s, createLayoutEngine: fQ, sampleDoc: Jc, stressDoc: Iw, persist: DB };\n  }, lA = () => {',
+      's = _M(Q, S, yB), vB(), IA(), MA(), DA(), aA(), window.__cw = { doc: S, tree: void 0, engine: K, editor: s, createLayoutEngine: fQ, sampleDoc: Jc, stressDoc: Iw, persist: DB, handle: mB }, simpleApp.docChanged("load", !1, !1);\n  }, lA = () => {'],
+    // The engine's existing debug global also carries the (hooked) handle.
+    ['      T?.destroy(), s.destroy(), M.root.remove();\n    }\n  };\n  if (mA = {\n    ...mB,',
+      '      T?.destroy(), s.destroy(), M.root.remove();\n    }\n  };\n  window.__cw.handle = mB;\n  if (mA = {\n    ...mB,'],
+    // handle.openDocx rejects on failure (the caller reports it) instead of an
+    // alert followed by a resolved promise and an unchanged model.
+    ['  }, ZA = async (m) => {',
+      '  }, ZA = async (m, simpleRethrow = !1) => {'],
+    ['      alert(`Could not open "${GA}": ${kA instanceof Error ? kA.message : String(kA)}`);',
+      '      if (simpleRethrow) throw kA;\n      simpleHookDialog(simpleApp, { kind: "alert", id: "document.open-failed", title: "Could not open document", message: `Could not open "${GA}": ${kA instanceof Error ? kA.message : String(kA)}` });'],
+    ['    openDocx: (m) => ZA(m),',
+      '    openDocx: (m) => ZA(m, !0),'],
+    ['        s.inspectContentControl() || alert("Place the caret inside a content control first.");',
+      '        s.inspectContentControl() || simpleHookDialog(simpleApp, { kind: "alert", id: "content-control.none", title: "Content control", message: "Place the caret inside a content control first." });'],
+    ['      const R = prompt("List items (comma-separated):", "Yes, No, N/A");\n      if (R === null) return;\n      const O = R.split(",").map((p) => p.trim()).filter((p) => p.length > 0).map((p) => ({ display: p, value: p }));\n      s.dispatch($M("dropDown", { alias: "Drop-Down List", listItems: O })), s.focus();',
+      '      simpleHookDialog(simpleApp, { kind: "prompt", id: "content-control.dropdown-items", title: "Drop-down list", message: "List items (comma-separated):", defaultValue: "Yes, No, N/A" }).then((R) => {\n        if (R === null) return void s.focus();\n        const O = R.split(",").map((p) => p.trim()).filter((p) => p.length > 0).map((p) => ({ display: p, value: p }));\n        s.dispatch($M("dropDown", { alias: "Drop-Down List", listItems: O })), s.focus();\n      });'],
+    ['            const uA = prompt("Rename bookmark:", gA);\n            uA && uA.trim() && uA !== gA && (s.dispatch(Mt(gA, uA.trim())), s.focus());',
+      '            simpleHookDialog(simpleApp, { kind: "prompt", id: "bookmark.rename", title: "Rename bookmark", message: "Rename bookmark:", defaultValue: gA }).then((uA) => {\n              uA && uA.trim() && uA !== gA && s.dispatch(Mt(gA, uA.trim())), s.focus();\n            });'],
+    ['        const b = prompt("Bookmark name:");\n        b && b.trim() && (s.dispatch(gt(b.trim())), s.focus(), N());',
+      '        simpleHookDialog(simpleApp, { kind: "prompt", id: "bookmark.add", title: "Add bookmark", message: "Bookmark name:", defaultValue: "" }).then((b) => {\n          b && b.trim() ? (s.dispatch(gt(b.trim())), s.focus(), N()) : s.focus();\n        });'],
+    // Handle surface (also spread into every custom ribbon action context).
+    ['    invalidateDecorations: () => s.invalidateDecorations(),\n    destroy: () => {',
+      `    invalidateDecorations: () => s.invalidateDecorations(),
+    simpleHooks: simpleHookVersion,
+    getModelRevision: () => simpleApp.revision,
+    insertImageBytes: async (m, zA, k = {}) => {
+      const kA = await simpleHookPrepareImage(m, zA);
+      return !!kA && s.simpleInsertImage(kA, k ?? {});
+    },
+    insertBlocks: (m, zA = {}) => s.simpleInsertBlocks(m, zA ?? {}),
+    replaceBlock: (m, zA) => s.simpleReplaceBlock(m, zA),
+    replaceImage: async (m, zA, k, kA = {}) => {
+      const GA = await simpleHookPrepareImage(zA, k);
+      return !!GA && s.simpleReplaceImage(m, GA, kA ?? {});
+    },
+    setDialogHandler: (m) => {
+      simpleApp.dialog = typeof m == "function" ? m : null;
+    },
+    setInsertTextHook: (m) => {
+      simpleApp.insertTextHook = typeof m == "function" ? m : null;
+    },
+    setBuiltinAutoCorrect: (m) => {
+      simpleApp.autoCorrect = m !== !1;
+    },
+    deleteWord: (m) => s.simpleDeleteWord(m),
+    undo: () => s.undo(),
+    redo: () => s.redo(),
+    canUndo: () => s.simpleCanUndo(),
+    canRedo: () => s.simpleCanRedo(),
+    setSelection: (m) => s.setSelection(m),
+    focus: () => s.focus(),
+    seedReview: (m) => s.seedReview(m),
+    positionFromPoint: (m, zA) => s.simplePositionFromPoint(m, zA),
+    destroy: () => {`],
+  ];
+  const fingerprint = require('node:crypto').createHash('sha256').update(JSON.stringify([helpers, edits])).digest('hex').slice(0, 16);
+  return { marker, markerLine: `${marker} ${fingerprint}`, fingerprint, file: 'dist-lib/editorApp-vN1g1Ew1.js', helpers, edits };
+}

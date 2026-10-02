@@ -2,15 +2,21 @@ import assert from 'node:assert/strict'
 import type { SheetData, WorkbookModel } from '../src/spreadsheet-types.ts'
 import {
   applySelectionStructureCommand,
+  createSheetCopy,
   deleteColumns,
   deleteRows,
   insertBlankSheet,
   insertColumns,
   insertRows,
+  insertSheetCopy,
+  removeSheetScopedNames,
   rewriteFormulaForSheetStructure,
+  rewriteWorkbookFormulaText,
   SheetStructureError,
   shiftCells,
 } from '../src/lib/sheet-operations.ts'
+import { hiddenRowsWithoutFilter } from '../src/lib/filter.ts'
+import { removeSheetFromFormula, renameSheetInFormula } from '../src/lib/formula-editing.ts'
 
 function sheet(overrides: Partial<SheetData> = {}): SheetData {
   return {
@@ -325,4 +331,186 @@ function rowInsertionFixture(): WorkbookModel {
   assert.deepEqual(inside.merges, ['A3:B3'], 'merges inside the band move')
 }
 
-process.stdout.write('Sheet operations QA passed: pure row/column edits and cell shifts preserve formulas, ranges, dimensions, panes, and sheet metadata.\n')
+// calc-grid-interaction-5: inserting or deleting rows/columns moves the AutoFilter with the data.
+// Header in row 3, data in rows 4-7, filter column A = 'East' (rows 5 and 7 hidden).
+function filteredFixture(extra: Partial<SheetData> = {}): WorkbookModel {
+  return workbook(sheet({
+    rowCount: 20,
+    cells: {
+      A3: { value: 'Region' }, B3: { value: 'Sales' },
+      A4: { value: 'East' }, B4: { value: 1 },
+      A5: { value: 'West' }, B5: { value: 2 },
+      A6: { value: 'East' }, B6: { value: 3 },
+      A7: { value: 'West' }, B7: { value: 4 },
+    },
+    filter: { ref: 'A3:B7', columns: { 0: { values: ['East'] } } },
+    autoFilter: 'A3:B7',
+    filteredRows: [5, 7],
+    hiddenRows: [5, 7],
+    ...extra,
+  }))
+}
+{
+  const above = insertRows(filteredFixture(), 'main', 1, 1).sheets[0]
+  assert.equal(above.filter?.ref, 'A4:B8', 'the filter range follows its header down')
+  assert.equal(above.autoFilter, 'A4:B8')
+  assert.deepEqual(above.filteredRows, [6, 8], 'filtered rows move with their data')
+  assert.deepEqual(above.hiddenRows, [6, 8])
+  assert.deepEqual(hiddenRowsWithoutFilter(above), [], 'removing the filter afterwards shows every row')
+  assert.ok(!above.filteredRows?.includes(4), 'the header row is never hidden')
+
+  const inside = insertRows(filteredFixture(), 'main', 5, 2).sheets[0]
+  assert.equal(inside.filter?.ref, 'A3:B9', 'rows inserted inside the list extend it')
+  assert.deepEqual(inside.filteredRows, [5, 9], 'new rows are visible; later filtered rows shift')
+
+  const removedData = deleteRows(filteredFixture(), 'main', 4, 1).sheets[0]
+  assert.equal(removedData.filter?.ref, 'A3:B6')
+  assert.deepEqual(removedData.filteredRows, [6], 'a deleted filtered row is gone; the next one shifts up')
+
+  const noHeader = deleteRows(filteredFixture({ hiddenRows: [2, 5, 7] }), 'main', 2, 1).sheets[0]
+  assert.equal(noHeader.filter, undefined, 'deleting the header row removes the filter')
+  assert.equal(noHeader.autoFilter, undefined)
+  assert.equal(noHeader.filteredRows, undefined)
+  assert.deepEqual(noHeader.hiddenRows, [2], 'rows the filter hid come back; a row hidden by hand stays hidden')
+
+  const leftColumn = insertColumns(filteredFixture(), 'main', 0, 1).sheets[0]
+  assert.equal(leftColumn.filter?.ref, 'B3:C7')
+  assert.deepEqual(Object.keys(leftColumn.filter?.columns || {}), ['0'], 'criteria stay on their column')
+  assert.deepEqual(leftColumn.filteredRows, [5, 7], 'column edits do not move rows')
+
+  const between = filteredFixture({ filter: { ref: 'A3:B7', columns: { 1: { condition: { operator: 'greaterThan', value: 2 } } } } })
+  const widened = insertColumns(between, 'main', 1, 1).sheets[0]
+  assert.equal(widened.filter?.ref, 'A3:C7')
+  assert.deepEqual(Object.keys(widened.filter?.columns || {}), ['2'], 'a criterion right of an inserted column moves with its column')
+
+  const withoutColumns = deleteColumns(filteredFixture(), 'main', 0, 2).sheets[0]
+  assert.equal(withoutColumns.filter, undefined, 'deleting every filter column removes the filter')
+  assert.deepEqual(withoutColumns.hiddenRows, [], 'and its rows come back')
+
+  assert.throws(
+    () => shiftCells(filteredFixture(), 'main', { top: 4, bottom: 4, left: 0, right: 0 }, 'down'),
+    (error: unknown) => error instanceof SheetStructureError && error.code === 'SHIFT_CONFLICT',
+    'cells inside a filtered list cannot be shifted',
+  )
+  const below = shiftCells(filteredFixture(), 'main', { top: 10, bottom: 10, left: 0, right: 1 }, 'down').sheets[0]
+  assert.equal(below.filter?.ref, 'A3:B7', 'a shift below the list leaves the filter alone')
+  const unfiltered = filteredFixture({ filter: { ref: 'A3:B7', columns: {} }, filteredRows: undefined, hiddenRows: undefined })
+  const grown = shiftCells(unfiltered, 'main', { top: 4, bottom: 4, left: 0, right: 1 }, 'down').sheets[0]
+  assert.equal(grown.filter?.ref, 'A3:B8', 'with no criteria, a full-width shift inside the list grows it')
+}
+{
+  // A table's own filter follows its columns.
+  const tableSheet = sheet({
+    cells: { A1: { value: 'Name' }, B1: { value: 'Qty' }, A2: { value: 'a' }, B2: { value: 1 } },
+    tables: [{ id: 't1', name: 'Sales', ref: 'A1:B2', headerRow: true, totalsRow: false, columns: [{ name: 'Name' }, { name: 'Qty' }], filter: { ref: 'A1:B2', columns: { 1: { values: ['1'] } } } }],
+  })
+  const inserted = insertColumns(workbook(tableSheet), 'main', 1, 1).sheets[0]
+  assert.equal(inserted.tables?.[0].ref, 'A1:C2')
+  assert.deepEqual(Object.keys(inserted.tables?.[0].filter?.columns || {}), ['2'], 'the Qty criterion moves with the Qty column')
+  assert.equal(inserted.tables?.[0].filter?.ref, 'A1:C2')
+}
+
+// calc-file-io-objects-10: a duplicated sheet's tables get unique names; its own references and
+// charts point at the copy; import bookkeeping is dropped.
+{
+  const data = sheet({
+    id: 'data',
+    name: 'Data',
+    sourceWorksheetId: 1,
+    sourceSheetName: 'Data',
+    sourceSheetIndex: 0,
+    cells: {
+      A1: { value: 'Name' }, B1: { value: 'Qty' }, A2: { value: 'a' }, B2: { value: 5 }, A3: { value: 'b' }, B3: { value: 7 },
+      C1: { formula: 'SUM(Sales[Qty])', result: 12 },
+      D1: { formula: 'Data!A1&Other!A1' },
+    },
+    tables: [{ id: 'table-Sales', name: 'Sales', displayName: 'Sales', ref: 'A1:B3', headerRow: true, totalsRow: false, columns: [{ name: 'Name' }, { name: 'Qty' }], imported: true }],
+    dataValidations: { 'E1:E3': { type: 'list', formulae: ['Sales[Name]'] } },
+    sparklineGroups: [{ type: 'line', colors: {}, sparklines: [{ source: 'Data!B2:B3', cell: 'F1' }], sourceXml: '<x14:sparklineGroup/>', signature: 'sig' }],
+    charts: [{ id: 'chart-1', type: 'column', anchor: { from: { row: 5, col: 0 }, to: { row: 15, col: 6 } }, series: [{ id: 's1', valuesRef: 'Data!$B$2:$B$3', categoriesRef: 'Data!$A$2:$A$3' }], sourcePart: 'xl/charts/chart1.xml', sourceInfo: { drawingPart: 'xl/drawings/drawing1.xml', anchorIndex: 0, fingerprint: 'f', kind: 'chart' } }],
+  })
+  const other = sheet({ id: 'other', name: 'Other', cells: { A1: { formula: 'SUM(Sales[Qty])' } } })
+  const model: WorkbookModel = {
+    ...workbook(data, other),
+    definedNames: [
+      { name: 'Local', ranges: ['Data!$A$1'], localSheetIndex: 0 },
+      { name: 'OtherLocal', ranges: ['Other!$A$1'], localSheetIndex: 1 },
+      { name: 'Global', ranges: ['Data!$B$2'] },
+    ],
+  }
+  let ids = 0
+  const copy = createSheetCopy(model, 'data', { id: 'copy', makeId: (prefix) => `${prefix}-${++ids}` })
+  assert.equal(copy.name, 'Data copy')
+  assert.equal(copy.tables?.[0].name, 'Sales2', 'the copied table gets a workbook-unique name')
+  assert.equal(copy.tables?.[0].displayName, 'Sales2')
+  assert.notEqual(copy.tables?.[0].id, 'table-Sales')
+  assert.equal(copy.tables?.[0].imported, undefined)
+  assert.equal(copy.cells.C1.formula, 'SUM(Sales2[Qty])', "the copy's own structured references follow its table")
+  assert.equal(copy.cells.D1.formula, "'Data copy'!A1&Other!A1", 'references to the source sheet point at the copy')
+  assert.deepEqual((copy.dataValidations?.['E1:E3'] as { formulae: string[] }).formulae, ['Sales2[Name]'])
+  assert.equal(copy.sparklineGroups?.[0].sparklines[0].source, "'Data copy'!B2:B3", 'sparklines read the copy')
+  assert.equal(copy.charts?.[0].series[0].valuesRef, "'Data copy'!$B$2:$B$3", 'charts plot the copy')
+  assert.equal(copy.charts?.[0].sourcePart, undefined, 'the chart is written fresh, never byte-copied from the original')
+  assert.equal(copy.charts?.[0].sourceInfo, undefined)
+  assert.notEqual(copy.charts?.[0].id, 'chart-1')
+  assert.equal(copy.sourceWorksheetId, undefined, 'the copy is a new worksheet when saved')
+  assert.equal(copy.sourceSheetName, undefined)
+  assert.equal(copy.sourceSheetIndex, undefined)
+  assert.equal(model.sheets[0].cells.C1.formula, 'SUM(Sales[Qty])', 'the source sheet is unchanged')
+  assert.equal(model.sheets[0].tables?.[0].name, 'Sales')
+
+  const next = structuredClone(model)
+  insertSheetCopy(next, copy, 'data')
+  assert.deepEqual(next.sheets.map((item) => item.name), ['Data', 'Data copy', 'Other'])
+  assert.equal(next.definedNames?.find((name) => name.name === 'OtherLocal')?.localSheetIndex, 2, 'sheet-scoped names stay on their sheet')
+  const copiedLocal = next.definedNames?.filter((name) => name.name === 'Local')
+  assert.deepEqual(copiedLocal?.map((name) => [name.localSheetIndex, name.ranges[0]]), [[0, 'Data!$A$1'], [1, "'Data copy'!$A$1"]], 'the copy gets its own sheet-scoped names')
+  assert.equal(next.definedNames?.filter((name) => name.name === 'Global').length, 1, 'workbook names are not duplicated')
+  assert.equal(createSheetCopy(next, 'data', { id: 'copy2' }).name, 'Data copy 2')
+  assert.equal(createSheetCopy(next, 'data', { id: 'copy3', makeId: (prefix) => `${prefix}-x` }).tables?.[0].name, 'Sales3', 'Sales2 is taken by the first copy')
+}
+
+// calc-file-io-objects-11: renaming or deleting a sheet rewrites the sparklines that read it.
+{
+  const model: WorkbookModel = workbook(
+    sheet({ id: 'main', name: 'Sheet1', cells: { B2: { value: 1 } } }),
+    sheet({ id: 'other', name: 'Sales', sparklineGroups: [{ type: 'line', colors: {}, sparklines: [{ source: 'Sheet1!B2:F2', cell: 'A1' }, { source: 'Sales!B2:F2', cell: 'A2' }], sourceXml: '<x/>', signature: 'old' }] }),
+  )
+  const renamed = structuredClone(model)
+  rewriteWorkbookFormulaText(renamed, (formula) => renameSheetInFormula(formula, 'Sheet1', 'Data 2026'))
+  assert.deepEqual(renamed.sheets[1].sparklineGroups?.[0].sparklines.map((item) => item.source), ["'Data 2026'!B2:F2", 'Sales!B2:F2'])
+  const removed = structuredClone(model)
+  rewriteWorkbookFormulaText(removed, (formula) => removeSheetFromFormula(formula, 'Sheet1'))
+  assert.equal(removed.sheets[1].sparklineGroups?.[0].sparklines[0].source, '#REF!', 'a deleted source sheet leaves #REF!, never another sheet')
+}
+{
+  const model: WorkbookModel = {
+    ...workbook(sheet({ id: 'a', name: 'A' }), sheet({ id: 'b', name: 'B' })),
+    definedNames: [
+      { name: 'OnA', ranges: ['A!$A$1'], localSheetIndex: 0 },
+      { name: 'OnB', ranges: ['B!$A$1'], localSheetIndex: 1 },
+      { name: 'OnC', ranges: ['C!$A$1'], localSheetIndex: 2 },
+    ],
+  }
+  removeSheetScopedNames(model, 1)
+  assert.deepEqual(model.definedNames?.map((name) => [name.name, name.localSheetIndex]), [['OnA', 0], ['OnC', 1]], "a deleted sheet's names go; later sheets keep theirs")
+}
+
+{
+  // Review F7: an opened whole-column / whole-row print area keeps its original form when rows
+  // or columns are inserted or deleted.
+  const columns = workbook(sheet({ cells: { A1: { value: 1 } }, pageSetup: { printArea: 'A1:B5&&D1:D5', printAreaWhole: { 'A1:B5': '$A:$B' } } }))
+  const afterInsert = insertRows(columns, 'main', 2, 1).sheets[0].pageSetup!
+  assert.equal(afterInsert.printArea, 'A1:B6,D1:D6')
+  assert.deepEqual(afterInsert.printAreaWhole, { 'A1:B6': '$A:$B' })
+  const afterDelete = deleteRows(columns, 'main', 1, 2).sheets[0].pageSetup!
+  assert.deepEqual(afterDelete.printAreaWhole, { 'A1:B3': '$A:$B' })
+  const afterColumn = insertColumns(columns, 'main', 0, 1).sheets[0].pageSetup!
+  assert.deepEqual(afterColumn.printAreaWhole, { 'B1:C5': '$B:$C' }, 'a column insert moves the whole-column form')
+  const rows = workbook(sheet({ pageSetup: { printArea: 'A2:H3', printAreaWhole: { 'A2:H3': '$2:$3' } } }))
+  assert.deepEqual(insertRows(rows, 'main', 0, 2).sheets[0].pageSetup!.printAreaWhole, { 'A4:H5': '$4:$5' })
+  const plain = insertRows(workbook(sheet({ pageSetup: { printArea: 'A1:B5' } })), 'main', 0, 1).sheets[0].pageSetup!
+  assert.equal(plain.printAreaWhole, undefined)
+}
+
+process.stdout.write('Sheet operations QA passed: pure row/column edits and cell shifts preserve formulas, ranges, dimensions, panes, filters, and sheet metadata; sheet copies, renames and deletions keep references, tables and names consistent.\n')

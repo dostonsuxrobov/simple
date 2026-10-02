@@ -4,10 +4,12 @@
  * or font colour, and left-to-right orientation. The app applies the resulting cell changes.
  */
 import type { CellData, SheetData } from '../spreadsheet-types'
+import { currentRegionAround } from './filter'
 import {
   addressOf,
   boundsContain,
   boundsIntersect,
+  cellHasContent,
   collationKeys,
   columnLabel,
   compareCollated,
@@ -427,6 +429,29 @@ export function sortKeyColors(bounds: Bounds, orientation: SortOrientation, key:
     seen.add(sortOn === 'fillColor' ? hostFillColor(host, row, col) : hostFontColor(host, row, col))
   }
   return [...seen].sort((a, b) => (a === null ? 1 : 0) - (b === null ? 1 : 0))
+}
+
+/**
+ * Excel's Sort Warning ("found data next to your selection"): sorting a one-column or partial
+ * selection that has data right beside it would separate that column from the rest of its rows.
+ * Returns the region to offer instead (the current region around the selection, Excel's
+ * "Expand the selection") when it reaches beyond the selection's columns; null when the
+ * selection can be sorted as it is (a single cell expands on its own).
+ */
+export function sortExpansionRegion(sheet: Pick<SheetData, 'cells'>, selection: Bounds): Bounds | null {
+  if (selection.top === selection.bottom && selection.left === selection.right) return null
+  // A whole-column selection is clipped to the data first, so the region is the data block.
+  let lastRow = -1
+  for (const address in sheet.cells) {
+    if (!cellHasContent(sheet.cells[address])) continue
+    const coord = parseAddress(address)
+    if (coord && coord.col >= selection.left - 1 && coord.col <= selection.right + 1) lastRow = Math.max(lastRow, coord.row)
+  }
+  if (lastRow < selection.top) return null
+  const clipped = { ...selection, bottom: Math.min(selection.bottom, lastRow) }
+  const region = currentRegionAround(sheet, clipped)
+  if (region.left >= selection.left && region.right <= selection.right) return null
+  return { ...region, top: Math.min(region.top, selection.top), bottom: Math.max(region.bottom, clipped.bottom) }
 }
 
 /**

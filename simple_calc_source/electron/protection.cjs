@@ -16,8 +16,31 @@ function hashPassword(password) {
   return { algorithmName: 'SHA-512', hashValue, saltValue, spinCount: DEFAULT_SPIN_COUNT }
 }
 
+/**
+ * Excel's legacy 16-bit sheet password hash (the `password="CC3D"` attribute written by Excel
+ * 2007/2010, XlsxWriter, openpyxl and LibreOffice). Weak by design, but a file protected this
+ * way must still ask for its password and keep it on save.
+ */
+function legacyPasswordHash(password) {
+  const text = String(password)
+  let hash = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const value = text.charCodeAt(index) << (index + 1)
+    hash ^= (value & 0x7fff) | (value >> 15)
+  }
+  hash ^= text.length
+  hash ^= 0xce4b
+  return (hash & 0xffff).toString(16).toUpperCase().padStart(4, '0')
+}
+
 function verifyPassword(protection, password) {
-  if (!protection || typeof protection !== 'object' || !protection.hashValue) return true
+  if (!protection || typeof protection !== 'object') return true
+  if (!protection.hashValue) {
+    const legacy = typeof protection.password === 'string' ? protection.password.trim() : ''
+    if (!legacy) return true
+    if (!/^[0-9a-f]{1,4}$/i.test(legacy)) return false
+    return legacyPasswordHash(password) === legacy.toUpperCase().padStart(4, '0')
+  }
   const algorithm = ALGORITHMS[String(protection.algorithmName || '').toUpperCase()] || ALGORITHMS[String(protection.algorithmName || '')]
   const spinCount = Math.trunc(Number(protection.spinCount) || 0)
   if (!algorithm || !protection.saltValue || spinCount < 0 || spinCount > MAX_SPIN_COUNT) return false
@@ -44,4 +67,37 @@ function registerProtectionHandlers(ipcMain, options = {}) {
   })
 }
 
-module.exports = { registerProtectionHandlers, hashPassword, verifyPassword }
+let protectionPatched = false
+
+/**
+ * ExcelJS 4.4 reads only the modern hash attributes of <sheetProtection>; the legacy
+ * `password` attribute was dropped on open, so any password unprotected the sheet and the
+ * saved file lost it. Keep it on read and write it back while no modern hash replaces it.
+ */
+function installProtectionPatches() {
+  if (protectionPatched) return
+  protectionPatched = true
+  const SheetProtectionXform = require('exceljs/lib/xlsx/xform/sheet/sheet-protection-xform')
+  const proto = SheetProtectionXform.prototype
+  const originalParseOpen = proto.parseOpen
+  proto.parseOpen = function parseOpen(node) {
+    const handled = originalParseOpen.call(this, node)
+    if (handled && node && node.name === this.tag && this.model && !this.model.hashValue) {
+      const legacy = node.attributes && node.attributes.password
+      if (typeof legacy === 'string' && /^[0-9a-f]{1,4}$/i.test(legacy.trim())) this.model.password = legacy.trim().toUpperCase()
+    }
+    return handled
+  }
+  const originalRender = proto.render
+  proto.render = function render(xmlStream, model) {
+    const legacy = model && model.sheet && !model.hashValue && typeof model.password === 'string' && /^[0-9a-f]{1,4}$/i.test(model.password)
+      ? model.password.toUpperCase()
+      : null
+    if (!legacy) return originalRender.call(this, xmlStream, model)
+    const stream = Object.create(xmlStream)
+    stream.leafNode = (tag, attributes, text) => xmlStream.leafNode(tag, { password: legacy, ...(attributes || {}) }, text)
+    return originalRender.call(this, stream, model)
+  }
+}
+
+module.exports = { registerProtectionHandlers, hashPassword, verifyPassword, legacyPasswordHash, installProtectionPatches }

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { ChevronRight, Search } from 'lucide-react'
+import './app-polish.css'
 
 export interface SpreadsheetMenuItem {
   id: string
@@ -22,6 +23,49 @@ export interface SpreadsheetMenuDefinition {
 
 interface SpreadsheetMenusProps {
   menus: SpreadsheetMenuDefinition[]
+  /**
+   * Commands that live outside the menu bar (toolbar buttons, context menus): found by the
+   * command search ("Menus", Alt+/) but not shown as menus.
+   */
+  extraCommands?: SpreadsheetMenuDefinition[]
+  /** Changing this number opens the command search (Help > Search the menus). */
+  searchRequest?: number
+}
+
+/** Up/Down/Home/End between the enabled items of one menu level; Right/Left open and close submenus. */
+function moveWithinMenu(event: ReactKeyboardEvent<HTMLElement>, onLeaveRoot?: (direction: 1 | -1) => void) {
+  const target = event.target instanceof HTMLElement ? event.target : null
+  const entry = target?.closest('.sheet-menu-entry')
+  const level = entry?.parentElement
+  if (!entry || !level) return false
+  const buttons = [...level.children]
+    .map((child) => child.querySelector<HTMLButtonElement>(':scope > button'))
+    .filter((button): button is HTMLButtonElement => Boolean(button && !button.disabled))
+  const index = buttons.indexOf(target as HTMLButtonElement)
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    if (!buttons.length) return true
+    const delta = event.key === 'ArrowDown' ? 1 : -1
+    buttons[(index + delta + buttons.length) % buttons.length]?.focus()
+    return true
+  }
+  if (event.key === 'Home' || event.key === 'End') {
+    buttons[event.key === 'Home' ? 0 : buttons.length - 1]?.focus()
+    return true
+  }
+  if (event.key === 'ArrowRight') {
+    const child = entry.querySelector<HTMLButtonElement>(':scope > .sheet-submenu > .sheet-menu-entry > button:not(:disabled)')
+    if (child) { child.focus(); return true }
+    onLeaveRoot?.(1)
+    return true
+  }
+  if (event.key === 'ArrowLeft') {
+    const parentEntry = level.closest('.sheet-submenu')?.parentElement
+    const parentButton = parentEntry?.querySelector<HTMLButtonElement>(':scope > button')
+    if (parentButton) { parentButton.focus(); return true }
+    onLeaveRoot?.(-1)
+    return true
+  }
+  return false
 }
 
 function MenuItems({ items, close }: { items: SpreadsheetMenuItem[]; close: () => void }) {
@@ -142,16 +186,41 @@ function flattenItems(menus: SpreadsheetMenuDefinition[]) {
   return output
 }
 
-export function SpreadsheetMenus({ menus }: SpreadsheetMenusProps) {
+/** Commands whose path or shortcut matches every word of the query, best matches first. */
+function searchCommands(commands: Array<SpreadsheetMenuItem & { path: string }>, query: string) {
+  const words = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
+  if (!words.length) return commands.slice(0, 18)
+  const scored: Array<{ item: SpreadsheetMenuItem & { path: string }; score: number }> = []
+  for (const item of commands) {
+    const path = item.path.toLocaleLowerCase()
+    const label = item.label.toLocaleLowerCase()
+    const shortcut = (item.shortcut || '').toLocaleLowerCase()
+    if (!words.every((word) => path.includes(word) || shortcut.includes(word))) continue
+    // The command's own name beats its menu path: "copy" finds Edit › Copy before Copy sheet.
+    const score = (label.startsWith(words[0]) ? 0 : label.includes(words[0]) ? 1 : 2) * 1000 + label.length
+    scored.push({ item, score })
+  }
+  return scored.sort((a, b) => a.score - b.score).slice(0, 18).map((entry) => entry.item)
+}
+
+export function SpreadsheetMenus({ menus, extraCommands, searchRequest }: SpreadsheetMenusProps) {
   const [open, setOpen] = useState<string | null>(null)
   const [query, setQuery] = useState('')
+  const [activeIndex, setActiveIndex] = useState(0)
   const rootRef = useRef<HTMLDivElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
-  const commands = useMemo(() => flattenItems(menus), [menus])
-  const matches = useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase()
-    return (needle ? commands.filter((item) => item.path.toLocaleLowerCase().includes(needle)) : commands).slice(0, 18)
-  }, [commands, query])
+  const resultsRef = useRef<HTMLDivElement>(null)
+  // Where the keyboard was before the search opened, so Esc can return it there.
+  const returnFocusRef = useRef<HTMLElement | null>(null)
+  const commands = useMemo(() => {
+    const fromMenus = flattenItems(menus)
+    // A toolbar or context command that is also in a menu is listed once, under its menu.
+    const known = new Set(fromMenus.map((item) => `${item.label.toLocaleLowerCase()}|${item.shortcut || ''}`))
+    const extra = flattenItems(extraCommands || []).filter((item) => !known.has(`${item.label.toLocaleLowerCase()}|${item.shortcut || ''}`))
+    return [...fromMenus, ...extra]
+  }, [extraCommands, menus])
+  const matches = useMemo(() => searchCommands(commands, query), [commands, query])
+  const activeMatch = matches[Math.min(activeIndex, matches.length - 1)]
 
   useEffect(() => {
     const closeOutside = (event: PointerEvent) => {
@@ -160,7 +229,14 @@ export function SpreadsheetMenus({ menus }: SpreadsheetMenusProps) {
     const closeWithEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || !open) return
       event.preventDefault()
+      const menuId = open
       setOpen(null)
+      // The keyboard goes back to the sheet (or wherever Alt+/ opened the search from).
+      window.requestAnimationFrame(() => {
+        const previous = menuId === 'command-search' ? returnFocusRef.current : null
+        if (previous?.isConnected) previous.focus({ preventScroll: true })
+        else document.querySelector<HTMLElement>('.sheet-viewport')?.focus({ preventScroll: true })
+      })
     }
     window.addEventListener('pointerdown', closeOutside)
     window.addEventListener('keydown', closeWithEscape)
@@ -170,13 +246,50 @@ export function SpreadsheetMenus({ menus }: SpreadsheetMenusProps) {
     }
   }, [open])
 
+  // Alt+/ opens the command search from anywhere, as in Google Sheets.
+  useEffect(() => {
+    const openSearch = (event: KeyboardEvent) => {
+      if (!event.altKey || event.ctrlKey || event.metaKey || (event.key !== '/' && event.code !== 'Slash')) return
+      if (document.querySelector('[aria-modal="true"]')) return
+      event.preventDefault()
+      returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      setOpen('command-search')
+    }
+    window.addEventListener('keydown', openSearch)
+    return () => window.removeEventListener('keydown', openSearch)
+  }, [])
+
+  useEffect(() => {
+    if (!searchRequest) return
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setOpen('command-search')
+  }, [searchRequest])
+
   useEffect(() => {
     if (open !== 'command-search') return
     setQuery('')
+    setActiveIndex(0)
     window.requestAnimationFrame(() => searchRef.current?.focus())
   }, [open])
 
+  useEffect(() => { setActiveIndex(0) }, [query])
+  useEffect(() => {
+    resultsRef.current?.querySelector<HTMLElement>('.is-active')?.scrollIntoView({ block: 'nearest' })
+  }, [activeIndex])
+
   const close = () => setOpen(null)
+  const runCommand = (item: SpreadsheetMenuItem | undefined) => {
+    if (!item?.action) return
+    close()
+    item.action()
+  }
+  const switchMenu = (menuId: string, direction: 1 | -1) => {
+    const index = menus.findIndex((menu) => menu.id === menuId)
+    const next = menus[(index + direction + menus.length) % menus.length]
+    if (!next) return
+    setOpen(next.id)
+    window.requestAnimationFrame(() => rootRef.current?.querySelector<HTMLButtonElement>('.sheet-menu-panel .sheet-menu-entry > button:not(:disabled)')?.focus())
+  }
   return (
     <div className="spreadsheet-menu-bar" ref={rootRef}>
       <div className="sheet-menu-root">
@@ -185,17 +298,59 @@ export function SpreadsheetMenus({ menus }: SpreadsheetMenusProps) {
           className={`menu-search-trigger${open === 'command-search' ? ' is-open' : ''}`}
           aria-haspopup="menu"
           aria-expanded={open === 'command-search'}
-          onClick={() => setOpen((current) => current === 'command-search' ? null : 'command-search')}
+          title="Search the menus (Alt+/)"
+          onClick={() => {
+            returnFocusRef.current = null
+            setOpen((current) => current === 'command-search' ? null : 'command-search')
+          }}
         >
           <Search size={13} aria-hidden="true" />
           <span>Menus</span>
         </button>
         {open === 'command-search' && (
-          <div className="command-search-panel" role="menu" aria-label="Search menus">
-            <div className="command-search-input"><Search size={13} aria-hidden="true" /><input ref={searchRef} aria-label="Search menus" placeholder="Search commands" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
-            <div className="command-search-results">
-              {matches.map((item) => (
-                <button key={item.id} type="button" role="menuitem" data-menu-action={`search-${item.id}`} onClick={() => { item.action?.(); close() }}>
+          <div className="command-search-panel" role="dialog" aria-label="Command search">
+            <div className="command-search-input">
+              <Search size={13} aria-hidden="true" />
+              <input
+                ref={searchRef}
+                role="combobox"
+                aria-label="Search menus"
+                aria-expanded="true"
+                aria-controls="command-search-results"
+                aria-activedescendant={activeMatch ? `command-search-${activeMatch.id}` : undefined}
+                placeholder="Search commands"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                    event.preventDefault()
+                    if (!matches.length) return
+                    const delta = event.key === 'ArrowDown' ? 1 : -1
+                    setActiveIndex((index) => (Math.min(index, matches.length - 1) + delta + matches.length) % matches.length)
+                  } else if (event.key === 'Enter') {
+                    event.preventDefault()
+                    runCommand(activeMatch)
+                  } else if (event.key === 'Tab') {
+                    event.preventDefault()
+                  }
+                }}
+              />
+            </div>
+            <div className="command-search-results" id="command-search-results" role="listbox" aria-label="Commands" ref={resultsRef}>
+              {matches.map((item, index) => (
+                <button
+                  key={item.id}
+                  id={`command-search-${item.id}`}
+                  type="button"
+                  role="option"
+                  tabIndex={-1}
+                  aria-selected={item === activeMatch}
+                  className={item === activeMatch ? 'is-active' : undefined}
+                  data-menu-action={`search-${item.id}`}
+                  onMouseEnter={() => setActiveIndex(index)}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => runCommand(item)}
+                >
                   <span>{item.path}</span>{item.shortcut && <small>{item.shortcut}</small>}
                 </button>
               ))}
@@ -214,9 +369,29 @@ export function SpreadsheetMenus({ menus }: SpreadsheetMenusProps) {
             data-menu-trigger={menu.id}
             onPointerEnter={() => { if (open && open !== 'command-search') setOpen(menu.id) }}
             onClick={() => setOpen((current) => current === menu.id ? null : menu.id)}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowDown' || ((event.key === 'Enter' || event.key === ' ') && open !== menu.id)) {
+                event.preventDefault()
+                setOpen(menu.id)
+                window.requestAnimationFrame(() => rootRef.current?.querySelector<HTMLButtonElement>('.sheet-menu-panel .sheet-menu-entry > button:not(:disabled)')?.focus())
+              } else if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+                event.preventDefault()
+                const index = menus.findIndex((item) => item.id === menu.id)
+                const next = menus[(index + (event.key === 'ArrowRight' ? 1 : -1) + menus.length) % menus.length]
+                rootRef.current?.querySelector<HTMLButtonElement>(`[data-menu-trigger="${next.id}"]`)?.focus()
+                if (open) setOpen(next.id)
+              }
+            }}
           >{menu.label}</button>
           {open === menu.id && (
-            <div className="sheet-menu-panel" role="menu" aria-label={`${menu.label} menu`}>
+            <div
+              className="sheet-menu-panel"
+              role="menu"
+              aria-label={`${menu.label} menu`}
+              onKeyDown={(event) => {
+                if (moveWithinMenu(event, (direction) => switchMenu(menu.id, direction))) event.preventDefault()
+              }}
+            >
               <MenuItems items={menu.items} close={close} />
             </div>
           )}

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { spawn, spawnSync } from 'node:child_process'
@@ -15,8 +16,10 @@ const basePort = 9_500 + (process.pid % 200)
 const vitePort = basePort
 const debugPort = basePort + 200
 const appUrl = `http://127.0.0.1:${vitePort}/`
-const profilePath = path.resolve(root, 'tmp', `legacy-xls-layout-profile-${process.pid}`)
-const deadline = Date.now() + 60_000
+// The Electron profile lives outside the project: Vite watches the project folder, and the
+// profile's own writes would keep reloading the page (QA_PROFILE_DIR overrides the parent).
+const profilePath = path.resolve(process.env.QA_PROFILE_DIR || os.tmpdir(), `simple-calc-legacy-xls-layout-profile-${process.pid}`)
+const deadline = Date.now() + Number(process.env.QA_TIMEOUT_MS || 60_000)
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 let viteOutput = ''
@@ -71,6 +74,8 @@ class CdpClient {
     })
     this.socket.addEventListener('message', (event) => {
       const message = JSON.parse(String(event.data))
+      // Renderer exceptions are reported, so a blank page says why.
+      if (message.method === 'Runtime.exceptionThrown') process.stderr.write(`Renderer exception: ${message.params?.exceptionDetails?.exception?.description || message.params?.exceptionDetails?.text}\n`)
       const request = this.pending.get(message.id)
       if (!request) return
       this.pending.delete(message.id)
@@ -107,7 +112,8 @@ class CdpClient {
       } catch {}
       await pause(100)
     }
-    throw new Error(`Timed out waiting for ${label}.`)
+    const seen = await this.evaluate("location.href + ' | ' + (document.querySelector('.document-title')?.textContent || 'no title') + ' | ' + document.body.innerText.replace(/\s+/g, ' ').slice(0, 300) + ' | ' + document.documentElement.outerHTML.slice(0, 600)").catch((error) => `evaluate failed: ${error.message}`)
+    throw new Error(`Timed out waiting for ${label} (page: ${seen}).`)
   }
 
   close() {
@@ -225,6 +231,5 @@ try {
   client?.close()
   forceStop(electron)
   forceStop(vite)
-  const safeTmpRoot = `${path.resolve(root, 'tmp')}${path.sep}`
-  if (profilePath.startsWith(safeTmpRoot)) await fs.rm(profilePath, { recursive: true, force: true }).catch(() => {})
+  if (path.basename(profilePath).startsWith('simple-calc-') && path.basename(profilePath).includes(`-profile-${process.pid}`)) await fs.rm(profilePath, { recursive: true, force: true }).catch(() => {})
 }

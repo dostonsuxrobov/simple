@@ -14,16 +14,21 @@ import {
   RotateCcw,
   RotateCw,
   ScanSearch,
+  ScanText,
   Trash2,
   Type,
   X,
 } from 'lucide-react'
 import type { PageObjectEdit, PageTextEdit } from '../types'
+import type { PageScanState } from '../lib/ocr/pageClassifier'
+import { resizeTextEditRect } from '../lib/editClipboard'
 import { clamp, cx } from '../lib/utils'
 import { Button, IconButton } from './ui'
 
 interface EditInspectorProps {
-  pageHasNativeText: boolean | null
+  /** What the current page holds (scan, recognised scan, …); null while unknown. */
+  pageScanState: PageScanState | null
+  onRecognizeText: () => void
   textEdit: PageTextEdit | null
   objectEdit: PageObjectEdit | null
   selectingObjectRegion: boolean
@@ -56,14 +61,54 @@ function hexToRgb(value: string): [number, number, number] {
   return [0, 2, 4].map((offset) => parseInt(normalized.slice(offset, offset + 2), 16) / 255) as [number, number, number]
 }
 
+/** Whether a change touches how the text looks (font, size, style, colour, spacing). */
+function changesFormat(before: PageTextEdit, after: PageTextEdit) {
+  return before.fontFamily !== after.fontFamily
+    || before.fontSize !== after.fontSize
+    || (before.fontWeight || 400) !== (after.fontWeight || 400)
+    || (before.fontStyle || 'normal') !== (after.fontStyle || 'normal')
+    || before.color.some((channel, index) => channel !== after.color[index])
+    || (before.letterSpacing || 0) !== (after.letterSpacing || 0)
+    || before.lineHeight !== after.lineHeight
+}
+
+/** "Times New Roman · Bold Italic · 11.2 pt" */
+function describeFont(family: string, weight: number | undefined, style: string | undefined, size: number) {
+  const face = [(weight || 400) >= 600 ? 'Bold' : '', style === 'italic' ? 'Italic' : ''].filter(Boolean).join(' ') || 'Regular'
+  return `${family} · ${face} · ${Math.round(size * 10) / 10} pt`
+}
+
 export function EditInspector({
-  textEdit, objectEdit, pageHasNativeText, selectingObjectRegion, onTextChange, onObjectChange,
+  textEdit, objectEdit, pageScanState, onRecognizeText, selectingObjectRegion, onTextChange, onObjectChange,
   onCommitText, onCommitObject, onCancelSelection, onDeleteSelection, onAddText,
   onCopySelection, onPasteSelection, canPasteSelection, onDuplicateText, onAddImage, onReplaceImage, onRotateObject, onFlipObject, onDuplicateObject,
   onSelectObjectRegion, onClose,
 }: EditInspectorProps) {
   const selected = textEdit || objectEdit
+  const scan = textEdit?.scan
+  // A format change to scanned text is the user's choice: a matched style
+  // arriving later must not overwrite it.
+  const changeText = (next: PageTextEdit) => onTextChange(
+    textEdit && next.scan && !next.scan.userStyled && changesFormat(textEdit, next)
+      ? { ...next, scan: { ...next.scan, userStyled: true } }
+      : next,
+  )
   const fontFamilies = ['Segoe UI', 'Arial', 'Times New Roman', 'Georgia', 'Courier New']
+  const pageKind = pageScanState?.kind
+  const emptyTitle = pageKind === 'scan'
+    ? 'This page is a scanned image'
+    : pageKind === 'searchable-scan'
+      ? 'Scanned page with recognized text'
+      : pageKind === 'vector-only'
+        ? 'This page has no editable text'
+        : 'Select content on the page'
+  const emptyDetail = pageKind === 'scan'
+    ? 'Recognize the text to select, search, and edit the printed words.'
+    : pageKind === 'searchable-scan'
+      ? 'Click a line to edit it. Your edit blends into the scan.'
+      : pageKind === 'vector-only'
+        ? 'Its words are drawn as shapes. Recognize the text to make it searchable, or add text and notes.'
+        : 'Click text to place the caret inside it. Click an image to move, resize, replace, or remove it.'
   const sourceFontLabel = textEdit?.fontFamily.split(',')
     .map((family) => family.replace(/["']/g, '').trim())
     .find((family) => !/^(g_|pdfjs|sans-serif$|serif$|monospace$)/i.test(family))
@@ -77,11 +122,12 @@ export function EditInspector({
 
       {!selected && (
         <div className="edit-inspector-empty">
-          <span className="inspector-empty-icon"><MousePointer2 size={18} /></span>
-          <strong>{pageHasNativeText === false ? 'This page has no editable text' : 'Select content on the page'}</strong>
-          <p>{pageHasNativeText === false
-            ? 'Scanned words are part of the picture. You can add text and notes, or edit the picture. Recognizing and changing the printed words is not available yet.'
-            : 'Click text to place the caret inside it. Click an image to move, resize, replace, or remove it.'}</p>
+          <span className="inspector-empty-icon">{pageKind === 'scan' || pageKind === 'searchable-scan' ? <ScanText size={18} /> : <MousePointer2 size={18} />}</span>
+          <strong>{emptyTitle}</strong>
+          <p>{emptyDetail}</p>
+          {(pageKind === 'scan' || pageKind === 'vector-only') && (
+            <Button icon={ScanText} variant="primary" className="inspector-recognize" onClick={onRecognizeText}>Recognize text</Button>
+          )}
           <div className="inspector-add-actions">
             <Button icon={Type} variant="secondary" onClick={onAddText}>Add text</Button>
             <Button icon={ImagePlus} variant="secondary" onClick={onAddImage}>Add image</Button>
@@ -104,12 +150,50 @@ export function EditInspector({
 
       {textEdit && (
         <div className="inspector-content">
-          <div className="selection-summary"><span className="selection-kind"><Type size={14} /> Text</span><small>Page {textEdit.pageIndex + 1}</small></div>
+          <div className="selection-summary">
+            <span className="selection-kind" data-scan-badge={scan ? 'true' : undefined}>{scan ? <><ScanText size={14} /> Scanned text</> : <><Type size={14} /> Text</>}</span>
+            <small>Page {textEdit.pageIndex + 1}</small>
+          </div>
+          {scan && (
+            <section className="inspector-section" aria-label="Scanned text">
+              <p className="field-help" data-scan-matched-font={scan.status}>
+                {scan.status === 'pending'
+                  ? 'Matching the font…'
+                  : scan.userStyled
+                    ? `Font: ${describeFont(textEdit.fontFamily, textEdit.fontWeight, textEdit.fontStyle, textEdit.fontSize)}`
+                    : scan.style
+                      ? `Matched font: ${describeFont(scan.style.fontFamily, scan.style.fontWeight, scan.style.italic ? 'italic' : 'normal', scan.style.fontSize)}`
+                      : 'The font could not be matched; the words are covered with the paper colour.'}
+              </p>
+              <div className="inspector-field">
+                <span>Change</span>
+                <div className="segmented-control" role="group" aria-label="What the edit changes" style={{ gridTemplateColumns: '1fr 1fr' }}>
+                  {([
+                    ['appearance', 'Page appearance'],
+                    ['recognized-text', 'Recognized text only'],
+                  ] as const).map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      className={scan.mode === mode ? 'is-active' : ''}
+                      aria-pressed={scan.mode === mode}
+                      style={{ fontSize: 11.5, whiteSpace: 'nowrap', padding: '0 4px' }}
+                      onClick={() => onTextChange({ ...textEdit, scan: { ...scan, mode } })}
+                    >{label}</button>
+                  ))}
+                </div>
+              </div>
+              <p className="field-help">
+                Page appearance replaces the printed words. Recognized text only fixes search and copy without changing what you see.
+                Retouching hides the old words but is not secure redaction: the original scan stays in the file underneath.
+              </p>
+            </section>
+          )}
           <section className="inspector-section">
             <h3>Format</h3>
             <label className="inspector-field">
               <span>Font</span>
-              <select aria-label="Font family" value={textEdit.fontFamily} onChange={(event) => onTextChange({
+              <select aria-label="Font family" value={textEdit.fontFamily} onChange={(event) => changeText({
                 ...textEdit,
                 fontFamily: event.target.value,
                 // A retained embedded subset represents the source face. Once
@@ -130,12 +214,12 @@ export function EditInspector({
                 <span>Size</span>
                 <div className="unit-input"><input aria-label="Font size" type="number" min="4" max="96" step="0.5" value={Math.round(textEdit.fontSize * 10) / 10} onChange={(event) => {
                   const size = clamp(Number(event.target.value) || 11, 4, 96)
-                  onTextChange({ ...textEdit, fontSize: size, lineHeight: (textEdit.lineHeight || textEdit.fontSize * 1.18) * size / textEdit.fontSize, preserveSourceMetrics: false, modified: true })
+                  changeText({ ...textEdit, fontSize: size, lineHeight: (textEdit.lineHeight || textEdit.fontSize * 1.18) * size / textEdit.fontSize, preserveSourceMetrics: false, modified: true })
                 }} /><small>pt</small></div>
               </label>
               <label className="inspector-field color-field">
                 <span>Color</span>
-                <input type="color" value={rgbToHex(textEdit.color)} onChange={(event) => onTextChange({ ...textEdit, color: hexToRgb(event.target.value), modified: true })} />
+                <input type="color" value={rgbToHex(textEdit.color)} onChange={(event) => changeText({ ...textEdit, color: hexToRgb(event.target.value), modified: true })} />
               </label>
             </div>
             <div className="inspector-field">
@@ -146,14 +230,14 @@ export function EditInspector({
                   className={(textEdit.fontWeight || 400) >= 600 ? 'is-active' : ''}
                   title="Bold"
                   aria-pressed={(textEdit.fontWeight || 400) >= 600}
-                  onClick={() => onTextChange({ ...textEdit, fontWeight: (textEdit.fontWeight || 400) >= 600 ? 400 : 700, fontKey: undefined, fontData: undefined, preserveSourceMetrics: false, modified: true })}
+                  onClick={() => changeText({ ...textEdit, fontWeight: (textEdit.fontWeight || 400) >= 600 ? 400 : 700, fontKey: undefined, fontData: undefined, preserveSourceMetrics: false, modified: true })}
                 ><Bold size={15} /></button>
                 <button
                   type="button"
                   className={textEdit.fontStyle === 'italic' ? 'is-active' : ''}
                   title="Italic"
                   aria-pressed={textEdit.fontStyle === 'italic'}
-                  onClick={() => onTextChange({ ...textEdit, fontStyle: textEdit.fontStyle === 'italic' ? 'normal' : 'italic', fontKey: undefined, fontData: undefined, preserveSourceMetrics: false, modified: true })}
+                  onClick={() => changeText({ ...textEdit, fontStyle: textEdit.fontStyle === 'italic' ? 'normal' : 'italic', fontKey: undefined, fontData: undefined, preserveSourceMetrics: false, modified: true })}
                 ><Italic size={15} /></button>
               </div>
             </div>
@@ -172,7 +256,7 @@ export function EditInspector({
             <div className="inspector-field-row">
               <label className="inspector-field">
                 <span>Character spacing</span>
-                <div className="unit-input"><input aria-label="Character spacing" type="number" min="-4" max="20" step="0.1" value={Math.round((textEdit.letterSpacing || 0) * 10) / 10} onChange={(event) => onTextChange({ ...textEdit, letterSpacing: clamp(Number(event.target.value) || 0, -4, 20), preserveSourceMetrics: false, modified: true })} /><small>pt</small></div>
+                <div className="unit-input"><input aria-label="Character spacing" type="number" min="-4" max="20" step="0.1" value={Math.round((textEdit.letterSpacing || 0) * 10) / 10} onChange={(event) => changeText({ ...textEdit, letterSpacing: clamp(Number(event.target.value) || 0, -4, 20), preserveSourceMetrics: false, modified: true })} /><small>pt</small></div>
               </label>
               <label className="inspector-field">
                 <span>Rotation</span>
@@ -181,7 +265,7 @@ export function EditInspector({
             </div>
             <label className="inspector-field">
               <span>Line spacing</span>
-              <div className="unit-input"><input aria-label="Line spacing" type="number" min={Math.round(textEdit.fontSize * 0.8 * 10) / 10} max="200" step="0.5" value={Math.round((textEdit.lineHeight || textEdit.fontSize * 1.18) * 10) / 10} onChange={(event) => onTextChange({ ...textEdit, lineHeight: clamp(Number(event.target.value) || textEdit.fontSize * 1.18, textEdit.fontSize * 0.8, 200), modified: true })} /><small>pt</small></div>
+              <div className="unit-input"><input aria-label="Line spacing" type="number" min={Math.round(textEdit.fontSize * 0.8 * 10) / 10} max="200" step="0.5" value={Math.round((textEdit.lineHeight || textEdit.fontSize * 1.18) * 10) / 10} onChange={(event) => changeText({ ...textEdit, lineHeight: clamp(Number(event.target.value) || textEdit.fontSize * 1.18, textEdit.fontSize * 0.8, 200), modified: true })} /><small>pt</small></div>
             </label>
           </section>
           <section className="inspector-section">
@@ -200,10 +284,15 @@ export function EditInspector({
             </div>
             <div className="geometry-grid">
               {(['x', 'y', 'width', 'height'] as const).map((key) => (
-                <label key={key}><span>{key === 'width' ? 'W' : key === 'height' ? 'H' : key.toUpperCase()}</span><input type="number" min={key === 'width' || key === 'height' ? 4 : undefined} step="1" value={Math.round(textEdit.rect[key] * 10) / 10} onChange={(event) => onTextChange({ ...textEdit, rect: { ...textEdit.rect, [key]: Math.max(key === 'width' || key === 'height' ? 4 : 0, Number(event.target.value) || 0) }, modified: true })} /></label>
+                <label key={key}><span>{key === 'width' ? 'W' : key === 'height' ? 'H' : key.toUpperCase()}</span><input type="number" min={key === 'width' || key === 'height' ? 4 : undefined} step="1" value={Math.round(textEdit.rect[key] * 10) / 10} onChange={(event) => onTextChange({
+                  // X/Y move the box with its text; W/H resize it, and the
+                  // first line stays a fixed distance from the top edge.
+                  ...resizeTextEditRect(textEdit, { ...textEdit.rect, [key]: Math.max(key === 'width' || key === 'height' ? 4 : 0, Number(event.target.value) || 0) }),
+                  modified: true,
+                })} /></label>
               ))}
             </div>
-            <p className="field-help">Drag the top grip to move or the handles to resize. Wrap keeps the font size; fit compresses a longer line. Ctrl+Enter applies your edit.</p>
+            <p className="field-help">Drag the top grip to move or the handles to resize. Wrap keeps the font size; fit compresses a longer line. Esc or Ctrl+Enter applies your edit; Cancel discards it.</p>
           </section>
           <div className="inspector-footer">
             <Button icon={Trash2} variant="ghost" className="inspector-delete" onClick={onDeleteSelection}>Delete</Button>

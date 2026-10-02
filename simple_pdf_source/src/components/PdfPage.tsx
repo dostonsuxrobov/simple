@@ -8,16 +8,38 @@ import type {
   DisplayRotation,
   PageObjectEdit,
   PageTextEdit,
+  PdfFormValue,
   PdfOverlay,
   PdfRect,
+  ScanPatch,
   ToolMode,
   TextOverlay,
 } from '../types'
 import { layoutText, resolveTextFit } from '../../electron/text-layout.mjs'
-import { textColorResolver } from '../../electron/text-appearance.mjs'
+import { textPaintResolver } from '../../electron/text-appearance.mjs'
 import { boundedCanvasSize } from '../../electron/canvas-size.mjs'
 import { getPageTextContent, pdfjs, pdfRectToViewport, viewportRectToPdf } from '../lib/pdf'
 import { detectPageObjects } from '../lib/pageObjects'
+import { classifyPage, isPageCoveringImage, type PageScanState } from '../lib/ocr/pageClassifier'
+import { ocrResultForPage } from '../lib/ocr/ocrCache'
+import {
+  createScanEdit,
+  findOcrLine,
+  isSameScanLine,
+  prepareScanEdit,
+  quadBounds,
+  runQuad,
+  scanEditFromOverlay,
+  scanLineKey,
+  scanOverlayDrawing,
+  scanPreparationKey,
+  scanPreparationResult,
+  scanWordsFromOcr,
+  warmScanEditWorker,
+  type ScanLineGeometry,
+  type ScanPreparation,
+} from '../lib/ocr/scanEdit'
+import { resizeTextEditRect } from '../lib/editClipboard'
 import { textBackground } from '../lib/textBackground'
 import { findTextLayerSearchRects } from '../lib/search'
 import {
@@ -83,6 +105,15 @@ interface PdfCommonFont {
   systemFontInfo?: { css?: string; fontFamily?: string }
 }
 
+/** After recognising a page from the Edit-mode offer: open the text the user clicked. */
+export interface PendingEditAt {
+  pageIndex: number
+  /** The clicked point in unrotated PDF space. */
+  x: number
+  y: number
+  token: number
+}
+
 interface PdfPageProps {
   pdf: PDFDocumentProxy
   pageIndex: number
@@ -90,7 +121,7 @@ interface PdfPageProps {
   rotation: number
   tool: ToolMode
   overlays: PdfOverlay[]
-  formValues: Record<string, string | boolean>
+  formValues: Record<string, PdfFormValue>
   textEdit: PageTextEdit | null
   objectEdit: PageObjectEdit | null
   activeSearchMatch: ActiveSearchMatch | null
@@ -112,7 +143,15 @@ interface PdfPageProps {
   onCrop: (rect: PdfRect) => void
   onPlaceSignature: (point: { x: number; y: number }, displayRotation: DisplayRotation) => void
   onNavigate: (pageIndex: number) => void
-  onFormChange: (name: string, value: string | boolean) => void
+  // A method signature on purpose: list boxes send string[] values, and the
+  // viewer in between still declares its pass-through as string | boolean.
+  onFormChange(name: string, value: PdfFormValue): void
+  /** A click in Edit mode landed on a scanned page that has no text yet. */
+  onRequestOcrOffer?: (pageIndex: number, point: { x: number; y: number }, client: { x: number; y: number }) => void
+  pendingEditAt?: PendingEditAt | null
+  onPendingEditAtHandled?: (token: number) => void
+  /** An edit of scanned text finished preparing (patch, words, matched style). */
+  onScanEditPrepared?: (key: string, result: ScanPreparation) => void
 }
 
 const RESIZE_HANDLES: ResizeHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
@@ -160,6 +199,95 @@ function checkboxValueIsChecked(value: unknown) {
   if (value === null || value === undefined) return false
   const normalized = String(value).trim().toLocaleLowerCase()
   return Boolean(normalized) && !['off', 'false', '0', 'no'].includes(normalized)
+}
+
+// Form field flags (PDF 32000-1, 12.7.3.1 and 12.7.4).
+const FIELD_FLAG_PASSWORD = 0x2000
+const FIELD_FLAG_EDITABLE_COMBO = 0x40000
+const FIELD_FLAG_DO_NOT_SPELL_CHECK = 0x400000
+const TEXT_ALIGNMENTS = ['left', 'center', 'right'] as const
+
+interface PdfChoiceOption {
+  exportValue: string
+  displayValue: string
+}
+
+/** pdf.js widget annotation data this page reads (see pdf.js WidgetAnnotation). */
+interface PdfWidgetAnnotation {
+  id: string
+  fieldName: string
+  fieldType?: string
+  fieldValue?: unknown
+  fieldFlags?: number
+  alternativeText?: string
+  readOnly?: boolean
+  hidden?: boolean
+  multiLine?: boolean
+  comb?: boolean
+  maxLen?: number
+  textAlignment?: number | null
+  defaultAppearanceData?: { fontSize?: number }
+  checkBox?: boolean
+  radioButton?: boolean
+  exportValue?: string
+  buttonValue?: string | null
+  combo?: boolean
+  multiSelect?: boolean
+  options?: PdfChoiceOption[]
+}
+
+/** A text field's value: what was typed, else the document's. */
+function formTextValue(value: PdfFormValue | undefined, documentValue: unknown) {
+  if (typeof value === 'string') return value
+  return typeof documentValue === 'string' ? documentValue : ''
+}
+
+/** Whether this check box widget shows as checked. */
+function checkBoxIsOn(annotation: PdfWidgetAnnotation, value: PdfFormValue | undefined) {
+  if (typeof value === 'boolean') return value
+  const current = value === undefined ? annotation.fieldValue : value
+  // pdf.js reports each widget's own on-state; a field whose widgets have
+  // different on-states is checked only on the matching one.
+  return annotation.exportValue ? current === annotation.exportValue : checkboxValueIsChecked(current)
+}
+
+/** Selected export values of a choice field: what was chosen, else the document's. */
+function choiceSelection(value: PdfFormValue | undefined, documentValue: unknown): string[] {
+  const source = value === undefined ? documentValue : value
+  if (Array.isArray(source)) return source.filter((item): item is string => typeof item === 'string')
+  return typeof source === 'string' && source ? [source] : []
+}
+
+/** The editor's font size in CSS pixels: the field's own size, or auto. */
+function formFieldFontSize(annotation: PdfWidgetAnnotation, boxHeight: number, zoom: number) {
+  const declared = Number(annotation.defaultAppearanceData?.fontSize)
+  if (declared > 0) return declared * zoom
+  // Auto size: one line fills a single-line field (up to 12 pt); multi-line
+  // and list fields use a small fixed size, as PDF viewers do.
+  if (annotation.multiLine || (annotation.fieldType === 'Ch' && !annotation.combo)) return 10 * zoom
+  return clamp((boxHeight / zoom - 2) / 1.2, 6, 12) * zoom
+}
+
+/** The text run at (or on the line next to) a point, and a point inside it. */
+function textSpanNear(layer: HTMLElement, clientX: number, clientY: number) {
+  let best: { span: HTMLSpanElement; rect: DOMRect; distance: number } | null = null
+  for (const span of layer.querySelectorAll<HTMLSpanElement>('[data-text-item="true"]')) {
+    if (span.dataset.textWhitespace === 'true' || span.dataset.editCovered === 'true') continue
+    const rect = span.getBoundingClientRect()
+    if (rect.width < 0.5 || rect.height < 1) continue
+    const dx = clientX < rect.left ? rect.left - clientX : clientX > rect.right ? clientX - rect.right : 0
+    const dy = clientY < rect.top ? rect.top - clientY : clientY > rect.bottom ? clientY - rect.bottom : 0
+    // Only the clicked line counts (half a line of slack), not text further away.
+    if (dy > rect.height * 0.5 || dx > rect.height * 3) continue
+    const distance = Math.hypot(dx, dy)
+    if (!best || distance < best.distance) best = { span, rect, distance }
+  }
+  if (!best) return null
+  return {
+    span: best.span,
+    x: clamp(clientX, best.rect.left + 0.5, Math.max(best.rect.left + 0.5, best.rect.right - 0.5)),
+    y: clamp(clientY, best.rect.top + 0.5, Math.max(best.rect.top + 0.5, best.rect.bottom - 0.5)),
+  }
 }
 
 function textViewportSignature(viewport: { width: number; height: number; rotation: number; scale: number }) {
@@ -284,7 +412,7 @@ export const PdfPage = memo(function PdfPage({
   onPageReady, onRequestTextEdit, onTextEditChange, onCommitTextEdit, onCancelTextEdit,
   onRequestObjectEdit, onObjectEditChange, onCommitObjectEdit, onCancelObjectEdit,
   onObjectRegionSelected, onHighlight, onCrop, onPlaceSignature, onNavigate, onFormChange,
-  onTextMarkup, onInk, onRectangle,
+  onTextMarkup, onInk, onRectangle, onRequestOcrOffer, pendingEditAt, onPendingEditAtHandled, onScanEditPrepared,
 }: PdfPageProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const surfaceRef = useRef<HTMLDivElement>(null)
@@ -302,6 +430,12 @@ export const PdfPage = memo(function PdfPage({
   const [renderError, setRenderError] = useState('')
   const [annotations, setAnnotations] = useState<any[]>([])
   const [imageCandidates, setImageCandidates] = useState<DetectedPageObject[]>([])
+  // What the page holds (scan, recognised scan, native text…), for Edit mode.
+  const [scanState, setScanState] = useState<{ page: PDFPageProxy; state: PageScanState | null } | null>(null)
+  // The page the text layer's spans were built from (they survive a document swap until rebuilt).
+  const textLayerPageRef = useRef<PDFPageProxy | null>(null)
+  // Where the current press started, so only a plain click (not a drag) offers recognition.
+  const offerPressRef = useRef<{ x: number; y: number } | null>(null)
   const [cropDraft, setCropDraft] = useState<ViewerRect | null>(null)
   const [cropOrigin, setCropOrigin] = useState<{ x: number; y: number } | null>(null)
   const [regionDraft, setRegionDraft] = useState<ViewerRect | null>(null)
@@ -340,10 +474,12 @@ export const PdfPage = memo(function PdfPage({
   const displayRotation = ((((viewport?.rotation || 0) % 360) + 360) % 360) as DisplayRotation
   // Only the source selection matters. Typing, dragging, and resizing the new
   // text must not repeatedly parse a book or remove a different source region.
+  // Scanned text is hidden by its retouch patch instead: removing its
+  // invisible OCR glyphs would not change the picture (they go on save).
   const removedTextKey = JSON.stringify([
     ...overlays.filter((edit): edit is TextOverlay => edit.type === 'text' && edit.pageIndex === pageIndex),
     ...(textEdit?.pageIndex === pageIndex ? [textEdit] : []),
-  ].filter(edit => edit.cover && edit.originalRect).map(edit => ({
+  ].filter(edit => edit.cover && edit.originalRect && !edit.scan).map(edit => ({
     type: 'text', cover: true, originalRect: edit.originalRect, originalText: edit.originalText,
   })))
   const [backgroundPage, setBackgroundPage] = useState<{ owner: PDFDocumentProxy; key: string; page: PDFPageProxy; disposed: boolean } | null>(null)
@@ -488,6 +624,24 @@ export const PdfPage = memo(function PdfPage({
   }, [page, pageIndex, tool])
 
   useEffect(() => {
+    if (!page || tool !== 'edit') return
+    let active = true
+    classifyPage(page).then((state) => {
+      if (active) setScanState({ page, state })
+    }).catch(() => {
+      // Unknown: behave as on any page with text.
+      if (active) setScanState({ page, state: null })
+    })
+    return () => { active = false }
+  }, [page, tool])
+  const scanKnown = scanState?.page === page
+  const pageScan = scanKnown ? scanState.state : null
+  // Editing recognised text is likely here: load the preparation worker now.
+  useEffect(() => {
+    if (tool === 'edit' && pageScan?.hasOcrText) warmScanEditWorker()
+  }, [tool, pageScan])
+
+  useEffect(() => {
     if (!page || !viewport || canvasReadyViewport !== viewport || !textLayerRef.current) return
     const currentPage = page
     const currentViewport = viewport
@@ -525,12 +679,13 @@ export const PdfPage = memo(function PdfPage({
       }
     }
     layer.replaceChildren()
+    textLayerPageRef.current = null
 
     async function renderText() {
       const content = await getPageTextContent(currentPage)
-      let originalTextColor: (font: string, text: string) => number[] | undefined = () => undefined
+      let originalTextPaint: (font: string, text: string) => { color?: number[]; invisible: boolean } = () => ({ invisible: false })
       try {
-        originalTextColor = textColorResolver(await currentPage.getOperatorList(), pdfjs.OPS)
+        originalTextPaint = textPaintResolver(await currentPage.getOperatorList(), pdfjs.OPS as unknown as Record<string, number>)
       } catch {
         // A damaged/unsupported operator stream can still use canvas sampling.
       }
@@ -550,9 +705,17 @@ export const PdfPage = memo(function PdfPage({
       const flowAxis = { x: -Math.sin(rotationRadians), y: Math.cos(rotationRadians) }
       const readAxis = { x: Math.cos(rotationRadians), y: Math.sin(rotationRadians) }
 
+      // PDF.js encodes most line ends as empty items flagged hasEOL. They get
+      // no span, so carry the marker onto the run that precedes them; copy
+      // uses it (with the line ids below) to keep line breaks and spaces.
+      let previousSpan: HTMLSpanElement | null = null
       for (const [itemIndex, rawItem] of content.items.entries()) {
-        if (!('str' in rawItem) || !rawItem.str) continue
-        const item = rawItem as typeof rawItem & { transform: number[]; width: number; height: number; fontName: string; dir?: string }
+        if (!('str' in rawItem)) continue
+        if (!rawItem.str) {
+          if ((rawItem as { hasEOL?: boolean }).hasEOL && previousSpan) previousSpan.dataset.textEol = 'true'
+          continue
+        }
+        const item = rawItem as typeof rawItem & { transform: number[]; width: number; height: number; fontName: string; dir?: string; hasEOL?: boolean }
         const tx = pdfjs.Util.transform(currentViewport.transform, item.transform)
         const style = styles[item.fontName] || {}
         let fontObject: PdfCommonFont | undefined
@@ -593,8 +756,16 @@ export const PdfPage = memo(function PdfPage({
         span.dataset.fontStyle = fontTraits.style
         span.dataset.pdfFontName = item.fontName
         span.dataset.pdfFontSourceName = sourceFontName
-        const paintColor = originalTextColor(item.fontName, item.str)
-        if (paintColor) span.dataset.pdfTextColor = JSON.stringify(paintColor)
+        const paint = originalTextPaint(item.fontName, item.str)
+        if (paint.color) span.dataset.pdfTextColor = JSON.stringify(paint.color)
+        // Text that paints nothing (render mode 3/7) is an OCR layer over a
+        // scan, Simple's or another tool's: editing it edits the scanned words.
+        if (paint.invisible) {
+          span.dataset.pdfTextInvisible = 'true'
+          if (/(^|\+)GlyphLessFont$/i.test(sourceFontName)) span.dataset.pdfTextOcr = 'simple'
+        }
+        span.dataset.pdfOriginX = String(item.transform[4])
+        span.dataset.pdfTextWidth = String(style.vertical ? item.height : item.width)
         span.dataset.pdfTextScaleX = String(pdfScaleX)
         span.dataset.pdfTextAngle = String(pdfAngle)
         span.dataset.pdfBaselineY = String(item.transform[5])
@@ -637,6 +808,8 @@ export const PdfPage = memo(function PdfPage({
         }
         const advanceWidth = (style.vertical ? item.height : item.width) * currentViewport.scale
         span.dataset.textAdvance = String(advanceWidth)
+        if (item.hasEOL) span.dataset.textEol = 'true'
+        previousSpan = span
         spans.push({
           span,
           width: advanceWidth,
@@ -668,6 +841,9 @@ export const PdfPage = memo(function PdfPage({
         } else {
           lines.push({ flow: item.flow, fontHeight: item.fontHeight, items: [item] })
         }
+      }
+      for (const [lineIndex, line] of lines.entries()) {
+        for (const item of line.items) item.span.dataset.textLine = String(lineIndex)
       }
       // Side-by-side columns share flow clusters, so emitting whole clusters
       // would interleave the columns row by row. Split each cluster at reading
@@ -725,6 +901,7 @@ export const PdfPage = memo(function PdfPage({
 
       layer.appendChild(fragment)
       layer.dataset.viewportSignature = viewportSignature
+      textLayerPageRef.current = currentPage
       layer.style.visibility = ''
       // Read every *untransformed* width before writing transforms. Measuring a
       // rotated bounding box uses the font height as its width; at 90 degrees
@@ -745,7 +922,10 @@ export const PdfPage = memo(function PdfPage({
       // A Range whose endpoints are removed is repainted by Chromium at a
       // seemingly unrelated line. Leave the old layer connected until the
       // pointer/selection is released; the effect above then refreshes it.
-      if (!liveSelectionIntersectsTextLayer(layer)) layer.replaceChildren()
+      if (!liveSelectionIntersectsTextLayer(layer)) {
+        layer.replaceChildren()
+        textLayerPageRef.current = null
+      }
     }
   }, [page, viewport, canvasReadyViewport, zoom, pageIndex, textLayerRefreshVersion])
 
@@ -767,14 +947,22 @@ export const PdfPage = memo(function PdfPage({
     }
   }, [activeSearchKey, activeSearchMatch, pageIndex, textLayerVersion, viewport])
 
+  // Bring a hit into view once per activation. Zoom, rotation, refits and
+  // text-layer rebuilds recompute the geometry too; those only repaint the
+  // highlight, so reading elsewhere is never pulled back to an old hit.
+  const scrolledSearchMatchRef = useRef<ActiveSearchMatch | null>(null)
   useEffect(() => {
     if (!activeSearchKey || searchMatchGeometry.key !== activeSearchKey || !searchMatchGeometry.rects.length) return
+    if (!activeSearchMatch || scrolledSearchMatchRef.current === activeSearchMatch) return
+    const match = activeSearchMatch
     const frame = window.requestAnimationFrame(() => {
-      searchMatchLayerRef.current?.querySelector<HTMLElement>('[data-search-match-rect="true"]')
-        ?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' })
+      const rect = searchMatchLayerRef.current?.querySelector<HTMLElement>('[data-search-match-rect="true"]')
+      if (!rect) return
+      scrolledSearchMatchRef.current = match
+      rect.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' })
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [activeSearchKey, searchMatchGeometry])
+  }, [activeSearchKey, activeSearchMatch, searchMatchGeometry])
 
   useEffect(() => {
     if (!page || !viewport || canvasReadyViewport !== viewport) return
@@ -794,7 +982,17 @@ export const PdfPage = memo(function PdfPage({
   const activeTextDisplayDelta = activeText
     ? (((displayRotation - (activeText.displayRotation ?? 0)) % 360) + 360) % 360
     : 0
-  const activeTextSideways = activeTextDisplayDelta === 90 || activeTextDisplayDelta === 270
+  // Scanned text keeps the saver's frame convention (electron/main.cjs): a
+  // box whose own text angle is near 90 degrees holds its reading width in
+  // its PDF height, which matters on pages scanned (and shown) sideways.
+  const scanFrameSideways = (edit: { angle?: number; originalRect?: PdfRect; displayRotation?: number }) => {
+    const rectAngle = edit.originalRect ? (edit.angle || 0) : 0
+    const frameSideways = Math.abs(Math.sin(rectAngle + (edit.displayRotation || 0) * Math.PI / 180)) > 0.7
+    return frameSideways !== (displayRotation === 90 || displayRotation === 270)
+  }
+  const activeTextSideways = activeText?.scan
+    ? scanFrameSideways(activeText)
+    : activeTextDisplayDelta === 90 || activeTextDisplayDelta === 270
   const activeTextScreenAngle = activeTextDisplayDelta * Math.PI / 180 - (activeText?.angle || 0)
   const activeTextLayout = useMemo(() => activeText && activeTextBox
     ? previewTextLayout(activeText, (activeTextSideways ? activeTextBox.height : activeTextBox.width) / zoom)
@@ -846,6 +1044,11 @@ export const PdfPage = memo(function PdfPage({
     () => overlays.filter((overlay) => overlay.pageIndex === pageIndex),
     [overlays, pageIndex],
   )
+  // On a scanned page the picture covering the page is the scan itself: a
+  // click there offers recognition (or edits recognised text), it never picks
+  // up the whole page. Until the page is classified, such a picture is not
+  // offered either. "Select artwork area" still edits any part of it.
+  const scanCovered = !scanKnown || pageScan?.kind === 'scan' || pageScan?.kind === 'searchable-scan'
   const selectableImageCandidates = useMemo(() => imageCandidates.filter((candidate) => (
     !pageOverlays.some((overlay) => overlay.type === 'object'
       && overlay.cover
@@ -854,7 +1057,8 @@ export const PdfPage = memo(function PdfPage({
       && Math.abs(overlay.originalRect.y - candidate.rect.y) <= 1
       && Math.abs(overlay.originalRect.width - candidate.rect.width) <= 1
       && Math.abs(overlay.originalRect.height - candidate.rect.height) <= 1)
-  )), [imageCandidates, pageOverlays])
+    && !(scanCovered && page && isPageCoveringImage(candidate.rect, page.view))
+  )), [imageCandidates, pageOverlays, scanCovered, page])
 
   useEffect(() => {
     const layer = textLayerRef.current
@@ -892,6 +1096,28 @@ export const PdfPage = memo(function PdfPage({
     })
     return () => window.cancelAnimationFrame(frame)
   }, [pageOverlays, textLayerVersion, viewport])
+
+  // After "Recognize text" from the Edit-mode offer, open the line that was
+  // clicked as soon as the page's new text layer is in place.
+  useEffect(() => {
+    const target = pendingEditAt
+    if (!target || target.pageIndex !== pageIndex || !page || !viewport || pageState?.owner !== pdf || canvasReadyViewport !== viewport) return
+    const layer = textLayerRef.current
+    const surface = surfaceRef.current
+    if (!layer || !surface || textLayerPageRef.current !== page || layer.dataset.viewportSignature !== textViewportSignature(viewport)) return
+    const frame = window.requestAnimationFrame(() => {
+      if (tool === 'edit') {
+        const [x, y] = viewport.convertToViewportPoint(target.x, target.y)
+        const bounds = surface.getBoundingClientRect()
+        const hit = textSpanNear(layer, bounds.left + x, bounds.top + y)
+        if (hit) requestTextEditForSpan(hit.span, hit.x, hit.y)
+      }
+      onPendingEditAtHandled?.(target.token)
+    })
+    return () => window.cancelAnimationFrame(frame)
+    // requestTextEditForSpan reads the render it runs in; the text layer version marks a rebuilt layer.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingEditAt, pageIndex, page, viewport, pageState, pdf, canvasReadyViewport, textLayerVersion, tool])
 
   const localPoint = useCallback((clientX: number, clientY: number) => {
     const bounds = surfaceRef.current?.getBoundingClientRect()
@@ -1126,15 +1352,170 @@ export const PdfPage = memo(function PdfPage({
     }
   }
 
+  /**
+   * The scanned line an invisible (OCR) text run belongs to. pdf.js splits
+   * slanted or widely spaced lines into several runs: neighbouring invisible
+   * runs on the same baseline (within 0.35 em, same angle) and less than 1.5
+   * em apart are joined, in reading order.
+   */
+  function scanLineFromSpan(span: HTMLSpanElement): Omit<ScanLineGeometry, 'pageIndex'> | null {
+    const layer = textLayerRef.current
+    if (!layer) return null
+    const read = (item: HTMLSpanElement) => ({
+      span: item,
+      x: Number(item.dataset.pdfOriginX),
+      y: Number(item.dataset.pdfBaselineY),
+      angle: Number(item.dataset.pdfTextAngle) || 0,
+      width: Number(item.dataset.pdfTextWidth),
+      size: Number(item.dataset.fontSize),
+      text: item.textContent || '',
+    })
+    const clicked = read(span)
+    if (![clicked.x, clicked.y, clicked.width, clicked.size].every(Number.isFinite) || clicked.size <= 0) return null
+    const dir = { x: Math.cos(clicked.angle), y: Math.sin(clicked.angle) }
+    const up = { x: -dir.y, y: dir.x }
+    const along = (item: { x: number; y: number }) => (item.x - clicked.x) * dir.x + (item.y - clicked.y) * dir.y
+    const across = (item: { x: number; y: number }) => (item.x - clicked.x) * up.x + (item.y - clicked.y) * up.y
+    const runs = [...layer.querySelectorAll<HTMLSpanElement>('[data-pdf-text-invisible="true"]')]
+      .map(read)
+      .filter((item) => [item.x, item.y, item.width, item.size].every(Number.isFinite)
+        && Math.abs(item.angle - clicked.angle) <= Math.PI / 180
+        && Math.abs(across(item)) <= 0.35 * clicked.size)
+      .sort((a, b) => along(a) - along(b))
+    let first = runs.findIndex((item) => item.span === span)
+    if (first < 0) return null
+    let last = first
+    const gap = (a: (typeof runs)[number], b: (typeof runs)[number]) => along(b) - (along(a) + a.width)
+    while (first > 0 && gap(runs[first - 1], runs[first]) < 1.5 * clicked.size) first -= 1
+    while (last + 1 < runs.length && gap(runs[last], runs[last + 1]) < 1.5 * clicked.size) last += 1
+    const line = runs.slice(first, last + 1)
+    let text = ''
+    line.forEach((item, index) => {
+      if (index && !/\s$/u.test(text) && !/^\s/u.test(item.text) && gap(line[index - 1], item) > 0.1 * clicked.size) text += ' '
+      text += item.text
+    })
+    text = text.replace(/\s+/gu, ' ').trim()
+    if (!text) return null
+    const start = line[0]
+    const end = line[line.length - 1]
+    const sizes = line.map((item) => item.size).sort((a, b) => a - b)
+    return {
+      text,
+      origin: { x: start.x, y: start.y },
+      dir,
+      length: Math.max(1, along(end) + end.width - along(start)),
+      fontSize: sizes[sizes.length >> 1],
+    }
+  }
+
+  /** Paper and ink colours around a box of the page as rendered. */
+  function sampleBoxColors(box: { left: number; top: number; width: number; height: number }) {
+    const bounds = surfaceRef.current?.getBoundingClientRect()
+    if (!bounds) return { text: [0.04, 0.04, 0.05] as [number, number, number], background: 'rgb(255, 255, 255)' }
+    return sampleCanvasColors(new DOMRect(bounds.left + box.left, bounds.top + box.top, box.width, box.height))
+  }
+
+  /**
+   * Edit the scanned line under an invisible text run (design 4.8.2): the
+   * whole line opens in a matched font over a retouch patch that hides its
+   * printed words. A line edited before reopens as edited.
+   */
+  function requestScanEditForSpan(span: HTMLSpanElement, clientX: number, clientY: number) {
+    if (!viewport || !page) return
+    const line = scanLineFromSpan(span)
+    if (!line) return
+    const committed = pageOverlays.find((overlay): overlay is TextOverlay => overlay.type === 'text'
+      && Boolean(overlay.scan) && isSameScanLine(overlay.scan!, pageIndex, overlay.pageIndex, line.origin, line.dir))
+    textVisualStyleRef.current = null
+    if (committed) {
+      onRequestTextEdit(scanEditFromOverlay(committed))
+      return
+    }
+    // Exact word boxes when this page was recognised in this window.
+    const recognised = findOcrLine(ocrResultForPage(pdf, pageIndex), line.origin, line.dir, line.fontSize)
+    const recognisedWords = recognised?.line.words.map((word) => ({ text: word.text, quad: word.quad }))
+    const words = recognisedWords ? scanWordsFromOcr(recognisedWords, line.text, line.origin, line.dir) : undefined
+    const geometry: ScanLineGeometry = {
+      ...line,
+      pageIndex,
+      words: words ? recognisedWords : undefined,
+      lineSpacing: recognised?.lineSpacing,
+    }
+    const key = scanPreparationKey(pdf, scanLineKey(pageIndex, line.origin, line.dir))
+    const run = { origin: line.origin, dir: line.dir, length: line.length, fontSize: line.fontSize }
+    const colors = sampleBoxColors(pdfRectToViewport(viewport, quadBounds(runQuad(run))))
+    // The caret: along the baseline to the word clicked, then within it.
+    let caretOffset = line.text.length
+    const local = localPoint(clientX, clientY)
+    const knownWords = words ?? scanPreparationResult(key)?.words
+    if (local) {
+      const [x, y] = viewport.convertToPdfPoint(local.x, local.y)
+      const u = (x - line.origin.x) * line.dir.x + (y - line.origin.y) * line.dir.y
+      const tokens = line.text.split(' ')
+      if (knownWords?.length === tokens.length) {
+        let offset = 0
+        let best = { distance: Infinity, offset: line.text.length }
+        knownWords.forEach((word, index) => {
+          const width = Math.max(1e-6, word.end - word.start)
+          const share = Math.max(0, Math.min(1, (u - word.start) / width))
+          const distance = u < word.start ? word.start - u : u > word.end ? u - word.end : 0
+          if (distance < best.distance) best = { distance, offset: offset + Math.round(share * tokens[index].length) }
+          offset += tokens[index].length + 1
+        })
+        caretOffset = best.offset
+      } else {
+        caretOffset = Math.round(Math.max(0, Math.min(1, u / line.length)) * line.text.length)
+      }
+    }
+    const edit = createScanEdit({
+      pageIndex,
+      key,
+      line: geometry,
+      words,
+      color: colors.text,
+      paper: cssColorToPdf(colors.background),
+      caretOffset,
+    })
+    onRequestTextEdit(edit)
+    if (edit.scan?.status !== 'ready') {
+      void prepareScanEdit(page, key, geometry, { nativeDpi: pageScan?.nativeDpi }).then((result) => onScanEditPrepared?.(key, result))
+    }
+  }
+
+  /** Start editing the text run at this point (Edit mode). */
+  function requestTextEditForSpan(span: HTMLSpanElement, clientX: number, clientY: number) {
+    // Invisible text is recognised text over a scan: edit the scanned words,
+    // never the invisible glyphs alone (they would leave the printed words
+    // visible under a box-glyph font).
+    if (span.dataset.pdfTextInvisible === 'true') {
+      requestScanEditForSpan(span, clientX, clientY)
+      return
+    }
+    const edit = textEditFromSpan(span, clientX, clientY)
+    if (edit) onRequestTextEdit(edit)
+  }
+
   function handleClick(event: React.MouseEvent) {
+    const press = offerPressRef.current
+    offerPressRef.current = null
     if ((event.target as HTMLElement).closest('[data-edit-ui="true"]')) return
     if (tool === 'edit') {
       const span = (event.target as HTMLElement).closest<HTMLSpanElement>('[data-text-item="true"]')
       if (span) {
         event.preventDefault()
         event.stopPropagation()
-        const edit = textEditFromSpan(span, event.clientX, event.clientY)
-        if (edit) onRequestTextEdit(edit)
+        requestTextEditForSpan(span, event.clientX, event.clientY)
+        return
+      }
+      // A plain click (not the end of a drag) on a scan that has no text yet.
+      if (pageScan?.kind === 'scan' && onRequestOcrOffer && viewport && !selectingObjectRegion && press
+        && Math.hypot(event.clientX - press.x, event.clientY - press.y) < 5
+        && !(event.target as HTMLElement).closest('button, input, textarea, select, a')) {
+        const point = localPoint(event.clientX, event.clientY)
+        if (point) {
+          const [x, y] = viewport.convertToPdfPoint(point.x, point.y)
+          onRequestOcrOffer(pageIndex, { x, y }, { x: event.clientX, y: event.clientY })
+        }
       }
       return
     }
@@ -1143,7 +1524,7 @@ export const PdfPage = memo(function PdfPage({
     // complete line and must never be mistaken for a focused selection.
     if (tool === 'highlight' || tool === 'underline' || tool === 'strikeout') return
     if (tool === 'sign') {
-      if (!viewport || (event.target as HTMLElement).closest('button, input, textarea')) return
+      if (!viewport || (event.target as HTMLElement).closest('button, input, textarea, select')) return
       const point = localPoint(event.clientX, event.clientY)
       if (!point) return
       const [x, y] = viewport.convertToPdfPoint(point.x, point.y)
@@ -1151,7 +1532,7 @@ export const PdfPage = memo(function PdfPage({
       return
     }
     if (tool !== 'addText' || !viewport || !surfaceRef.current) return
-    if ((event.target as HTMLElement).closest('button, input, textarea')) return
+    if ((event.target as HTMLElement).closest('button, input, textarea, select')) return
     const point = localPoint(event.clientX, event.clientY)
     if (!point) return
     const left = clamp(point.x, 0, Math.max(0, viewport.width - 80))
@@ -1210,10 +1591,12 @@ export const PdfPage = memo(function PdfPage({
   }
 
   function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    offerPressRef.current = null
     if (!viewport) return
     const target = event.target as HTMLElement
-    if (target.closest('[data-edit-ui="true"],button,input,textarea')) return
+    if (target.closest('[data-edit-ui="true"],button,input,textarea,select')) return
     if (tool === 'edit') {
+      if (!selectingObjectRegion && event.button === 0) offerPressRef.current = { x: event.clientX, y: event.clientY }
       if (selectingObjectRegion) {
         const point = localPoint(event.clientX, event.clientY)
         if (!point) return
@@ -1402,7 +1785,10 @@ export const PdfPage = memo(function PdfPage({
       if (handle.includes('s')) bottom = clamp(bottom + dy, top + 18, viewport.height)
     }
     const rect = viewportRectToPdf(viewport, { left, top, right, bottom })
-    if (gesture.target === 'text' && activeText) onTextEditChange({ ...activeText, rect, modified: true })
+    // A native text run keeps its baseline as an offset from the box bottom;
+    // resizing must keep the text where the editor shows it (top-anchored),
+    // or the saved baseline would follow the dragged bottom edge.
+    if (gesture.target === 'text' && activeText) onTextEditChange({ ...resizeTextEditRect(activeText, rect), modified: true })
     if (gesture.target === 'object' && activeObject) onObjectEditChange({ ...activeObject, rect, modified: true })
   }
 
@@ -1443,6 +1829,158 @@ export const PdfPage = memo(function PdfPage({
     }
   }
 
+  /**
+   * An editable control for a form widget: text (multi-line fields keep their
+   * line breaks), check box, radio button, dropdown (editable or not) and
+   * list box. Values are keyed by the field name pdf.js reports; the main
+   * process writes them and reports anything it cannot.
+   */
+  function renderFormField(annotation: PdfWidgetAnnotation, box: ViewerRect) {
+    const name = annotation.fieldName
+    const value = formValues[name]
+    const readOnly = Boolean(annotation.readOnly)
+    const flags = Number(annotation.fieldFlags) || 0
+    const label = annotation.alternativeText || name
+    const common = {
+      'data-form-field': name,
+      'aria-label': label,
+      title: annotation.alternativeText || undefined,
+    }
+    const fontSize = formFieldFontSize(annotation, box.height, zoom)
+    if (annotation.fieldType === 'Tx') {
+      const text = formTextValue(value, annotation.fieldValue).replace(/\r\n?/g, '\n')
+      const maxLength = Number(annotation.maxLen) > 0 ? Number(annotation.maxLen) : undefined
+      const style: CSSProperties = {
+        ...box,
+        fontSize,
+        textAlign: TEXT_ALIGNMENTS[Number(annotation.textAlignment) || 0] ?? 'left',
+      }
+      const spellCheck = !(flags & FIELD_FLAG_DO_NOT_SPELL_CHECK)
+      if (annotation.multiLine) {
+        return (
+          <textarea
+            key={annotation.id}
+            {...common}
+            className="pdf-form-field is-multiline"
+            style={{ ...style, resize: 'none', lineHeight: 1.15, overflow: 'auto' }}
+            value={text}
+            maxLength={maxLength}
+            readOnly={readOnly}
+            spellCheck={spellCheck}
+            onChange={(event) => onFormChange(name, event.target.value)}
+          />
+        )
+      }
+      return (
+        <input
+          key={annotation.id}
+          {...common}
+          type={flags & FIELD_FLAG_PASSWORD ? 'password' : 'text'}
+          className="pdf-form-field"
+          style={style}
+          value={text}
+          maxLength={maxLength}
+          readOnly={readOnly}
+          spellCheck={spellCheck}
+          onChange={(event) => onFormChange(name, event.target.value)}
+        />
+      )
+    }
+    if (annotation.fieldType === 'Btn' && annotation.checkBox) {
+      return (
+        <input
+          key={annotation.id}
+          {...common}
+          type="checkbox"
+          className="pdf-form-checkbox"
+          style={box}
+          checked={checkBoxIsOn(annotation, value)}
+          disabled={readOnly}
+          // This widget's own on-state, so a field whose widgets differ
+          // checks only the one that was clicked.
+          onChange={(event) => onFormChange(name, event.target.checked ? (annotation.exportValue || true) : false)}
+        />
+      )
+    }
+    if (annotation.fieldType === 'Btn' && annotation.radioButton && annotation.buttonValue) {
+      const buttonValue = annotation.buttonValue
+      const selected = value === undefined ? annotation.fieldValue : value
+      return (
+        <input
+          key={annotation.id}
+          {...common}
+          type="radio"
+          name={`pdf-field:${name}`}
+          className="pdf-form-checkbox"
+          style={box}
+          checked={selected === buttonValue}
+          disabled={readOnly}
+          onChange={(event) => { if (event.target.checked) onFormChange(name, buttonValue) }}
+        />
+      )
+    }
+    if (annotation.fieldType === 'Ch') {
+      const options = Array.isArray(annotation.options) ? annotation.options : []
+      const selection = choiceSelection(value, annotation.fieldValue)
+      const style: CSSProperties = { ...box, fontSize, fontFamily: 'inherit', padding: '0 2px' }
+      const optionElements = options.map((option, index) => (
+        <option key={`${index}:${option.exportValue}`} value={option.exportValue}>{option.displayValue || option.exportValue}</option>
+      ))
+      if (annotation.combo) {
+        const current = selection[0] ?? ''
+        if (flags & FIELD_FLAG_EDITABLE_COMBO) {
+          const listId = `pdf-choices-${annotation.id}`
+          return (
+            <span key={annotation.id} style={{ display: 'contents' }}>
+              <input
+                {...common}
+                className="pdf-form-field"
+                style={{ ...style, padding: '1px 4px' }}
+                list={listId}
+                value={current}
+                readOnly={readOnly}
+                onChange={(event) => onFormChange(name, event.target.value)}
+              />
+              <datalist id={listId}>{optionElements}</datalist>
+            </span>
+          )
+        }
+        return (
+          <select
+            key={annotation.id}
+            {...common}
+            className="pdf-form-field"
+            style={style}
+            value={current}
+            disabled={readOnly}
+            onChange={(event) => onFormChange(name, event.target.value)}
+          >
+            {!options.some((option) => option.exportValue === current) && <option value={current}>{current}</option>}
+            {optionElements}
+          </select>
+        )
+      }
+      return (
+        <select
+          key={annotation.id}
+          {...common}
+          className="pdf-form-field is-list"
+          style={style}
+          multiple={Boolean(annotation.multiSelect)}
+          size={Math.max(2, options.length)}
+          value={annotation.multiSelect ? selection : (selection[0] ?? '')}
+          disabled={readOnly}
+          onChange={(event) => onFormChange(name, annotation.multiSelect
+            ? Array.from(event.target.selectedOptions, (option) => option.value)
+            : event.target.value)}
+        >
+          {optionElements}
+        </select>
+      )
+    }
+    return null
+  }
+
   if (!viewport) {
     return <div className="page-loading"><LoaderCircle className="spin" size={20} /><span>Preparing page {pageIndex + 1}…</span></div>
   }
@@ -1463,6 +2001,24 @@ export const PdfPage = memo(function PdfPage({
       transform: `translate(-50%, -50%) rotate(${displayRotation}deg)`,
     }
   }
+  /**
+   * A retouch patch (pixels in unrotated PDF orientation, like object
+   * images), or, while it is not ready or could not be made, the paper
+   * colour over the old words.
+   */
+  const renderScanPatch = (key: string, patch: ScanPatch | undefined, cover: PdfRect | undefined, paper: [number, number, number] | undefined, zIndex: number) => {
+    if (patch) {
+      const box = pdfRectToViewport(viewport, patch.rect)
+      return (
+        <span key={key} className="scan-patch" data-scan-patch="true" aria-hidden="true" style={{ position: 'absolute', ...box, zIndex, overflow: 'hidden', pointerEvents: 'none' }}>
+          <img src={patch.dataUrl} alt="" draggable={false} style={{ display: 'block', width: '100%', height: '100%', ...objectImageStyle(box) }} />
+        </span>
+      )
+    }
+    if (!cover) return null
+    return <span key={key} aria-hidden="true" style={{ position: 'absolute', ...pdfRectToViewport(viewport, cover), zIndex, pointerEvents: 'none', background: colorCss(paper ?? [1, 1, 1]) }} />
+  }
+  const activeScan = activeText?.scan
   const rememberedTextVisual = textVisualStyleRef.current
   const activeTextVisual = activeText
     && rememberedTextVisual?.pageIndex === pageIndex
@@ -1527,34 +2083,19 @@ export const PdfPage = memo(function PdfPage({
             if (annotation.subtype === 'Link') {
               return <button key={annotation.id} type="button" className="pdf-link" style={box} title={annotation.url || 'Go to linked page'} onClick={(event) => { event.stopPropagation(); followAnnotation(annotation) }}><ExternalLink size={10} /></button>
             }
-            if (annotation.subtype === 'Widget' && annotation.fieldType === 'Tx' && annotation.fieldName) {
-              return (
-                <input
-                  key={annotation.id}
-                  className="pdf-form-field"
-                  style={box}
-                  value={String(formValues[annotation.fieldName] ?? annotation.fieldValue ?? '')}
-                  onChange={(event) => onFormChange(annotation.fieldName, event.target.value)}
-                />
-              )
-            }
-            if (annotation.subtype === 'Widget' && annotation.fieldType === 'Btn' && annotation.checkBox && annotation.fieldName) {
-              return (
-                <input
-                  key={annotation.id}
-                  type="checkbox"
-                  className="pdf-form-checkbox"
-                  style={box}
-                  checked={checkboxValueIsChecked(formValues[annotation.fieldName] ?? annotation.fieldValue)}
-                  onChange={(event) => onFormChange(annotation.fieldName, event.target.checked)}
-                />
-              )
+            if (annotation.subtype === 'Widget' && annotation.fieldName && !annotation.hidden) {
+              return renderFormField(annotation as PdfWidgetAnnotation, box)
             }
             return null
           })}
         </div>
 
         <div className="overlay-layer">
+          {/* Retouch patches first, so no patch can cover another edit's new text. */}
+          {pageOverlays.map((overlay) => (overlay.type === 'text' && overlay.scan?.mode === 'appearance' && activeText?.overlayId !== overlay.id
+            // Ready without a patch: there was no printed ink to hide.
+            ? renderScanPatch(`scan-patch-${overlay.id}`, scanOverlayDrawing(overlay).patch, overlay.scan.status === 'ready' ? undefined : overlay.inkRect || overlay.originalRect, overlay.scan.paper, 0)
+            : null))}
           {pageOverlays.map((overlay) => {
             if (overlay.type === 'ink') {
               const points = overlay.points.map((point) => viewport.convertToViewportPoint(point.x, point.y).join(',')).join(' ')
@@ -1634,24 +2175,91 @@ export const PdfPage = memo(function PdfPage({
               )
             }
             if (activeText?.overlayId === overlay.id) return null
+            // An edit of scanned text draws only the words it replaces (the
+            // rest of the line keeps its scanned pixels); a correction of the
+            // recognised text alone draws nothing.
+            const scanDrawing = overlay.scan ? scanOverlayDrawing(overlay) : null
+            const shown: TextOverlay = scanDrawing
+              ? { ...overlay, text: scanDrawing.text, rect: scanDrawing.rect, baselineOffset: scanDrawing.baselineOffset, originalText: scanDrawing.originalText }
+              : overlay
+            const textBox = scanDrawing ? pdfRectToViewport(viewport, scanDrawing.rect) : box
+            const invisibleText = overlay.scan?.mode === 'recognized-text'
             const originalBox = overlay.cover && overlay.originalRect ? pdfRectToViewport(viewport, overlay.inkRect || overlay.originalRect) : null
             const sourceDisplayRotation = overlay.displayRotation ?? 0
             const displayDelta = (((displayRotation - sourceDisplayRotation) % 360) + 360) % 360
-            const sidewaysText = displayDelta === 90 || displayDelta === 270
+            const sidewaysText = overlay.scan ? scanFrameSideways(overlay) : displayDelta === 90 || displayDelta === 270
             const screenAngle = displayDelta * Math.PI / 180 - (overlay.angle || 0)
-            const preview = previewTextLayout(overlay, (sidewaysText ? box.height : box.width) / zoom)
+            const preview = previewTextLayout(shown, (sidewaysText ? textBox.height : textBox.width) / zoom)
             const textScaleX = preview.scaleX
+            const reopen = (event: React.MouseEvent) => {
+              event.stopPropagation()
+              if (tool !== 'edit') return
+              textVisualStyleRef.current = null
+              if (overlay.scan) {
+                onRequestTextEdit(scanEditFromOverlay(overlay))
+                return
+              }
+              onRequestTextEdit({
+                overlayId: overlay.id,
+                pageIndex,
+                rect: overlay.rect,
+                originalRect: overlay.originalRect,
+                originalText: overlay.originalText ?? overlay.text,
+                inkRect: overlay.inkRect,
+                text: overlay.text,
+                fontSize: overlay.fontSize,
+                fontFamily: overlay.fontFamily,
+                fontWeight: overlay.fontWeight,
+                fontStyle: overlay.fontStyle,
+                textFit: overlay.textFit,
+                preserveSourceMetrics: overlay.preserveSourceMetrics,
+                lineHeight: overlay.lineHeight,
+                letterSpacing: overlay.letterSpacing,
+                scaleX: overlay.scaleX,
+                angle: overlay.angle,
+                direction: overlay.direction,
+                fontKey: overlay.fontKey,
+                fontData: overlay.fontData,
+                baselineOffset: overlay.baselineOffset,
+                sourceSpaceWidth: overlay.sourceSpaceWidth,
+                displayRotation: overlay.displayRotation,
+                align: overlay.align || 'left',
+                color: overlay.color,
+                backgroundColor: overlay.backgroundColor,
+                cover: overlay.cover,
+                modified: false,
+                caretOffset: overlay.text.length,
+                selectionStart: overlay.text.length,
+                selectionEnd: overlay.text.length,
+              })
+            }
             return (
               <div key={overlay.id} className="committed-text-group">
+                {overlay.scan && tool === 'edit' && (scanDrawing?.rect !== overlay.rect || invisibleText) && (
+                  // The whole edited line stays one click target, also where
+                  // only some of its words were replaced (or none visibly).
+                  <button
+                    type="button"
+                    data-edit-ui="true"
+                    data-scan-line="true"
+                    className="text-overlay is-editable"
+                    title="Edit scanned text"
+                    aria-label="Edit scanned text"
+                    style={{ ...box, backgroundColor: 'transparent', color: 'transparent' }}
+                    onClick={reopen}
+                  />
+                )}
                 <button
                   type="button"
                   data-edit-ui="true"
                   className={cx('text-overlay', overlay.cover && 'is-replacement', tool === 'edit' && 'is-editable')}
+                  aria-hidden={invisibleText || undefined}
+                  tabIndex={invisibleText ? -1 : undefined}
                   style={{
-                    left: box.left + box.width / 2,
-                    top: box.top + box.height / 2,
-                    width: (sidewaysText ? box.height : box.width) / textScaleX,
-                    height: sidewaysText ? box.width : box.height,
+                    left: textBox.left + textBox.width / 2,
+                    top: textBox.top + textBox.height / 2,
+                    width: (sidewaysText ? textBox.height : textBox.width) / textScaleX,
+                    height: sidewaysText ? textBox.width : textBox.height,
                     fontSize: overlay.fontSize * zoom,
                     fontFamily: overlay.fontFamily,
                     fontWeight: overlay.fontWeight,
@@ -1660,51 +2268,22 @@ export const PdfPage = memo(function PdfPage({
                     letterSpacing: overlay.letterSpacing ? `${overlay.letterSpacing * zoom}px` : undefined,
                     direction: overlay.direction,
                     textAlign: overlay.align || 'left',
-                    color: colorCss(overlay.color),
+                    color: invisibleText ? 'transparent' : colorCss(overlay.color),
                     backgroundColor: originalBox ? 'transparent' : overlay.backgroundColor ? colorCss(overlay.backgroundColor) : undefined,
+                    pointerEvents: invisibleText ? 'none' : undefined,
                     transform: `translate(-50%, -50%) rotate(${screenAngle}rad) scaleX(${textScaleX})`,
                     transformOrigin: 'center',
                     whiteSpace: 'pre',
+                    // A block <button> centres its content vertically; the
+                    // editor and the saved PDF start the text at the top of
+                    // the box. A flex column keeps it there.
+                    display: 'flex',
+                    flexDirection: 'column',
+                    justifyContent: 'flex-start',
+                    alignItems: 'stretch',
                   }}
-                  onClick={(event) => {
-                    event.stopPropagation()
-                    if (tool !== 'edit') return
-                    textVisualStyleRef.current = null
-                    onRequestTextEdit({
-                      overlayId: overlay.id,
-                      pageIndex,
-                      rect: overlay.rect,
-                      originalRect: overlay.originalRect,
-                      originalText: overlay.originalText ?? overlay.text,
-                      inkRect: overlay.inkRect,
-                      text: overlay.text,
-                      fontSize: overlay.fontSize,
-                      fontFamily: overlay.fontFamily,
-                      fontWeight: overlay.fontWeight,
-                      fontStyle: overlay.fontStyle,
-                      textFit: overlay.textFit,
-                      preserveSourceMetrics: overlay.preserveSourceMetrics,
-                      lineHeight: overlay.lineHeight,
-                      letterSpacing: overlay.letterSpacing,
-                      scaleX: overlay.scaleX,
-                      angle: overlay.angle,
-                      direction: overlay.direction,
-                      fontKey: overlay.fontKey,
-                      fontData: overlay.fontData,
-                      baselineOffset: overlay.baselineOffset,
-                      sourceSpaceWidth: overlay.sourceSpaceWidth,
-                      displayRotation: overlay.displayRotation,
-                      align: overlay.align || 'left',
-                      color: overlay.color,
-                      backgroundColor: overlay.backgroundColor,
-                      cover: overlay.cover,
-                      modified: false,
-                      caretOffset: overlay.text.length,
-                      selectionStart: overlay.text.length,
-                      selectionEnd: overlay.text.length,
-                    })
-                  }}
-                >{preview.lines.join('\n')}</button>
+                  onClick={reopen}
+                ><span className="text-overlay-lines" style={{ display: 'block', whiteSpace: 'pre' }}>{preview.lines.join('\n')}</span></button>
               </div>
             )
           })}
@@ -1742,16 +2321,26 @@ export const PdfPage = memo(function PdfPage({
           )
         })}
 
+        {activeScan?.mode === 'appearance' && renderScanPatch('active-scan-patch', activeScan.patch, undefined, activeScan.paper, 7)}
         {activeText && activeTextBox && (
           <div
             className="inline-text-frame"
             data-edit-ui="true"
+            data-scan-edit={activeScan ? activeScan.status : undefined}
             style={{
               ...activeTextBox,
               borderWidth: 0,
-              backgroundColor: activeText.cover && activeText.originalRect
-                ? 'transparent'
-                : activeTextVisual?.backgroundColor || (activeText.backgroundColor ? colorCss(activeText.backgroundColor) : undefined),
+              backgroundColor: activeScan
+                // Scanned text: the patch hides the old words; until it is
+                // ready (or if it fails) the paper colour does. Correcting
+                // only the recognised text keeps the page as it is, so the
+                // typed text gets a light backing to be readable.
+                ? activeScan.mode === 'recognized-text'
+                  ? 'rgba(255, 255, 255, 0.88)'
+                  : activeScan.patch || activeScan.status === 'ready' ? 'transparent' : colorCss(activeScan.paper ?? [1, 1, 1])
+                : activeText.cover && activeText.originalRect
+                  ? 'transparent'
+                  : activeTextVisual?.backgroundColor || (activeText.backgroundColor ? colorCss(activeText.backgroundColor) : undefined),
             }}
           >
             <textarea
@@ -1826,7 +2415,10 @@ export const PdfPage = memo(function PdfPage({
                 }
               }}
               onKeyDown={(event) => {
-                if (event.key === 'Escape') { event.preventDefault(); onCancelTextEdit() }
+                // Escape leaves the box and keeps what was typed (as Acrobat
+                // does); the inspector's Cancel is the way to discard it.
+                // (While an IME composes, Escape only cancels the composition.)
+                if (event.key === 'Escape' && !event.nativeEvent.isComposing) { event.preventDefault(); onCommitTextEdit() }
                 if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); onCommitTextEdit() }
               }}
             />

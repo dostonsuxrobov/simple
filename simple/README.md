@@ -8,7 +8,7 @@
 - `simple_image_source` for viewing, cropping, rotating, painting, saving, printing, and converting images to PDF
 - `simple_video_source` for local video playback and current-frame printing
 
-Choose **Combine files** on the home screen to arrange PDFs, Word documents, Excel/OpenDocument workbooks, PNGs, and JPEGs into one PDF. Reorder files, select page ranges, and save once; the result opens in PDF for review. Source files stay intact. See [the reliability review](RELIABILITY_REVIEW.md) for tested improvements and remaining priorities.
+Choose **Combine files** on the home screen to arrange PDFs, Word documents, Excel/OpenDocument workbooks, CSV files, PNGs, and JPEGs into one PDF. Reorder files, select page ranges, and save once; the result opens in PDF for review. Links inside each PDF keep working, PDFs that carry only a permissions password are combined like any other, and source files stay intact. See [the reliability review](RELIABILITY_REVIEW.md) for tested improvements and remaining priorities.
 
 The five modes stay isolated internally, preserving their renderers, preload bridges, IPC handlers, save behavior, and tests. The bootstrap selects a mode from the file extension before that mode starts. Mixed command-line file lists are split and opened in the correct modes.
 
@@ -25,7 +25,7 @@ npm install
 npm run build
 ```
 
-The result is `release/simple.exe`. Every build reads and rebuilds the current sibling sources, bundles each backend and the Combine worker, stages each renderer, generates `modules/manifest.json` with source hashes, and packages everything into the standalone executable. The finished EXE does not need Node.js, the source folders, or any of the original EXEs. Accurate legacy Word conversion and native edited XLS output use the local office engine described below.
+The result is `release/simple.exe`. Every build reads and rebuilds the current sibling sources, bundles each backend and the Combine worker, stages each renderer, generates `modules/manifest.json` with source hashes, and packages everything into the standalone executable. The finished EXE does not need Node.js, the source folders, or any of the original EXEs. Nothing else is needed on the PC; an office engine that is already there is used as described below.
 
 `npm run watch` watches all five sibling source trees. When one changes, it rebuilds that module and then refreshes the portable EXE. `npm test` verifies routing coverage, staged modules, package associations, source icon integrity, and shared icons.
 
@@ -48,6 +48,8 @@ A portable application cannot silently take over Windows defaults. From the laun
 
 The single EXE contains Electron and all five built modules. Like the original apps, it stores recents/recovery state under the current Windows user's application-data folder. For fast, concurrent workspace launches, the portable wrapper keeps a build-specific extracted runtime under `%LOCALAPPDATA%\\simple\\cache`; a new build gets a new cache key, so updated code cannot reuse a stale runtime. No separate application installation is required.
 
-### Office compatibility engine
+### Optional office engine
 
-Legacy DOC layout, Word-to-PDF combination, and native edited XLS saving use a separate local LibreOffice engine. On this computer it is prepared in `%LOCALAPPDATA%\simple\office-runtime`. For another computer, run `scripts/setup-office-runtime.ps1` or use an installed LibreOffice. A companion `tools/libreoffice/program/soffice.exe` next to the portable EXE is also detected. The setup script verifies the pinned official release checksum and publisher signature and extracts locally; it does not change Windows file associations. Keep the included license files with redistributed runtime copies.
+Simple never needs LibreOffice and never fetches or sets one up. Every format offered in a file picker works without it: older `.doc` files open as text and are saved as `.docx` next to the original, older and OpenDocument workbooks are saved as `.xlsx` next to the original, and Combine lays out Word, Excel, OpenDocument and CSV files itself (an older `.doc` or `.xls` is saved as `.docx` or `.xlsx` in Simple first).
+
+When LibreOffice is already on the PC (a normal installation, a `tools/libreoffice/program/soffice.exe` folder next to the portable EXE, `SIMPLE_LIBREOFFICE_PATH`, or a prepared folder in `%LOCALAPPDATA%\simple\office-runtime`), Simple uses it for original-layout previews and conversions. `SIMPLE_FORCE_NO_OFFICE=1` makes Simple behave as if there were none. `scripts/setup-office-runtime.ps1` is a developer tool for preparing a test PC; the app never runs or mentions it.

@@ -8,4 +8,9 @@ export default defineConfig({
     target: 'es2022',
     sourcemap: false,
   },
+  // The imaging worker is a module worker that code-splits; the default 'iife'
+  // worker format cannot code-split and fails the build.
+  worker: {
+    format: 'es',
+  },
 })

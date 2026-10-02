@@ -1,0 +1,65 @@
+/* src/advanced/integration.css (WP1)
+   Host-side styles for Advanced mode: the Simple toolbar's Advanced button, the Advanced root that
+   replaces the toolbar/content/status bar, its loading and failure panels, and the host dialogs.
+   The editor's own look belongs to the editor (advanced.css, WP6). */
+
+/* The one clearly labelled entry point; its label stays visible when other tool labels collapse. */
+.tool-group .advanced-button {
+  margin-left: 4px;
+  padding: 0 11px;
+  border-color: #c6c6c6;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .05);
+}
+.tool-group .advanced-button:hover:not(:disabled) { border-color: #9a9a9a; background: #fff; }
+.tool-group .advanced-button > span { display: inline; }
+.tool-group .advanced-button.is-busy { cursor: progress; }
+
+@media (max-width: 600px) {
+  .tool-group .advanced-button { padding: 0 8px; }
+  .tool-group .advanced-button > span { display: none; }
+}
+
+/* Takes the place of the hidden Simple toolbar, content and status bar inside .app-shell. */
+.advanced-root {
+  position: relative;
+  min-height: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #e9e9e9;
+}
+
+.advanced-status-panel {
+  margin: auto;
+  max-width: min(440px, calc(100% - 32px));
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 28px;
+  color: #444;
+  font-size: 11px;
+  text-align: center;
+}
+.advanced-status-panel > svg { width: 26px; height: 26px; color: #555; }
+.advanced-status-panel > strong { color: #151515; font-size: 14px; font-weight: 680; }
+.advanced-status-panel > p { margin: 0; color: #5d5d5d; line-height: 1.5; }
+.advanced-status-panel > button {
+  min-height: 34px;
+  margin-top: 6px;
+  padding: 0 14px;
+  border: 1px solid #111;
+  border-radius: 7px;
+  background: #111;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 650;
+}
+.advanced-status-panel > button:hover { background: #292929; }
+
+/* Host dialogs reuse .modal-backdrop / .modal; three actions need a little more room. */
+.advanced-dialog { width: min(460px, calc(100% - 32px)); }
+.advanced-dialog h2 { overflow-wrap: anywhere; }
+.advanced-dialog .modal-actions { flex-wrap: wrap; }
+.advanced-dialog .modal-actions button:disabled { opacity: .5; }

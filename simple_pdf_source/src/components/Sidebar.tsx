@@ -5,18 +5,22 @@ import {
   Bookmark as BookmarkIcon,
   CopyPlus,
   Download,
+  ExternalLink,
   File,
   FilePlus2,
   GripVertical,
   MoreHorizontal,
   PanelLeftClose,
+  Pencil,
   RotateCcw,
   RotateCw,
+  ScanText,
   Search,
   Trash2,
   X,
 } from 'lucide-react'
 import type { ActiveSearchMatch, Bookmark, SearchResult } from '../types'
+import { bookmarkTargetLabel } from '../lib/bookmarks'
 import { getPageTextContent } from '../lib/pdf'
 import { isImportableTransferFile, pageIndicesForTransfer } from '../lib/pageTransfer'
 import { normalizeSearchValue } from '../lib/search'
@@ -30,13 +34,21 @@ const THUMBNAIL_ROW_HEIGHT = 222
 const THUMBNAIL_OVERSCAN = 2
 const INTERNAL_PAGE_DRAG_TYPE = 'application/x-simple-pdf-page'
 
+// Pages the search index read without any text: scans that may need recognising.
+const pagesWithoutText = new WeakMap<PDFDocumentProxy, Set<number>>()
+
 const searchDocument = createDocumentSearch<PDFDocumentProxy>(async (pdf, pageIndex, isCancelled) => {
   if (isCancelled()) return null
   const page = await pdf.getPage(pageIndex + 1)
   if (isCancelled()) return null
   const content = await getPageTextContent(page)
   if (isCancelled()) return null
-  return content.items.map((item) => ('str' in item ? item.str : '')).join(' ')
+  const text = content.items.map((item) => ('str' in item ? item.str : '')).join(' ')
+  let empty = pagesWithoutText.get(pdf)
+  if (!empty) pagesWithoutText.set(pdf, empty = new Set())
+  if (text.trim()) empty.delete(pageIndex)
+  else empty.add(pageIndex)
+  return text
 })
 
 interface SearchOccurrence {
@@ -241,17 +253,27 @@ interface SidebarProps {
   onPageDragStart?: (index: number, event: ReactDragEvent<HTMLButtonElement>) => void
   onImportPagesAt?: (files: File[], insertIndex: number) => void
   onExportPages: () => void
+  /** False when the outline could not be read (or the PDF is read-only): no rename or delete. */
+  bookmarksEditable: boolean
+  /** Go to the bookmark's page, or open its web link. */
+  onOpenBookmark: (bookmark: Bookmark) => void
   onDeleteBookmark: (id: string) => void
   onRenameBookmark: (id: string, label: string) => void
+  /** Opens Recognize text for the pages that need it. */
+  onRecognizeText?: () => void
 }
 
 export function Sidebar({
   pdf, pageIndex, selectedPages, pageRotations, bookmarks, searchRequestId, onClose, onPage, onSelectPage,
   onReorder, onInsertBlank, onAddPages, onDuplicatePages, onRotateLeft, onRotateRight,
   onDeletePages, onPageDragStart, onImportPagesAt, onExportPages,
-  onDeleteBookmark, onRenameBookmark, onActiveSearchMatch,
+  bookmarksEditable, onOpenBookmark, onDeleteBookmark, onRenameBookmark, onActiveSearchMatch, onRecognizeText,
 }: SidebarProps) {
   const [tab, setTab] = useState<SidebarTab>('pages')
+  // Bookmark being renamed in place (Electron has no window.prompt).
+  const [renamingBookmarkId, setRenamingBookmarkId] = useState<string | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const renamingBookmarkRef = useRef<string | null>(null)
   const [draggedPage, setDraggedPage] = useState<number | null>(null)
   const draggedIndicesRef = useRef<number[]>([])
   const autoScrollRef = useRef({ velocity: 0, lastOver: 0, frame: 0 })
@@ -261,6 +283,7 @@ export function Sidebar({
   const [results, setResults] = useState<SearchResult[]>([])
   const [lastSearchedQuery, setLastSearchedQuery] = useState('')
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1)
+  const [textlessPages, setTextlessPages] = useState(0)
   const [pageMenuOpen, setPageMenuOpen] = useState(false)
   const currentRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -356,6 +379,7 @@ export function Sidebar({
     setResults([])
     setLastSearchedQuery('')
     setActiveMatchIndex(-1)
+    setTextlessPages(0)
     onActiveSearchMatch(null)
     setSearchError('')
     setSearching(false)
@@ -439,6 +463,8 @@ export function Sidebar({
       if (!matches || runId !== searchRunRef.current) return
       setResults(matches)
       setLastSearchedQuery(needle)
+      // Every page has been read by now.
+      setTextlessPages(pagesWithoutText.get(pdf)?.size ?? 0)
       if (matches.length) {
         const occurrences = flattenSearchResults(matches)
         let nextIndex: number
@@ -490,6 +516,29 @@ export function Sidebar({
     const direction: 1 | -1 = event.shiftKey ? -1 : 1
     if (!searching && results.length && normalizeSearchValue(query) === lastSearchedQuery) navigateResults(direction)
     else void runSearch(direction)
+  }
+
+  function startRename(bookmark: Bookmark) {
+    if (!bookmarksEditable) return
+    renamingBookmarkRef.current = bookmark.id
+    setRenameDraft(bookmark.label)
+    setRenamingBookmarkId(bookmark.id)
+  }
+
+  // Enter or leaving the field keeps the new name; Escape keeps the old one.
+  // Runs once per rename even though removing the field can also blur it.
+  function finishRename(keep: boolean) {
+    const id = renamingBookmarkRef.current
+    if (!id) return
+    renamingBookmarkRef.current = null
+    setRenamingBookmarkId(null)
+    if (keep) onRenameBookmark(id, renameDraft)
+    // Return focus to the row, unless something else has taken it since.
+    window.setTimeout(() => {
+      const active = document.activeElement
+      if (active && active !== document.body) return
+      document.querySelector<HTMLElement>(`[data-bookmark-id="${CSS.escape(id)}"] .bookmark-main`)?.focus({ preventScroll: true })
+    }, 0)
   }
 
   return (
@@ -580,31 +629,91 @@ export function Sidebar({
           {bookmarks.length ? (
             <div className="bookmark-list">
               {bookmarks
-                .map((bookmark) => (
-                  <div
-                    key={bookmark.id}
-                    className={cx('bookmark-row', bookmark.pageIndex === pageIndex && 'is-current')}
-                    style={{ paddingLeft: Math.min(6, bookmark.depth || 0) * 13 }}
-                  >
-                    <button type="button" className="bookmark-main" onClick={() => onPage(bookmark.pageIndex)}>
-                      <BookmarkIcon size={15} fill="currentColor" />
-                      <span>
-                        <strong style={{ fontWeight: bookmark.bold ? 700 : undefined, fontStyle: bookmark.italic ? 'italic' : undefined }}>{bookmark.label}</strong>
-                        <small>Page {bookmark.pageIndex + 1}</small>
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      className="bookmark-more"
-                      title="Rename bookmark"
-                      onClick={() => {
-                        const label = window.prompt('Bookmark name', bookmark.label)
-                        if (label?.trim()) onRenameBookmark(bookmark.id, label.trim())
+                .map((bookmark) => {
+                  const renaming = renamingBookmarkId === bookmark.id
+                  const titleStyle = { fontWeight: bookmark.bold ? 700 : undefined, fontStyle: bookmark.italic ? 'italic' as const : undefined }
+                  return (
+                    <div
+                      key={bookmark.id}
+                      data-bookmark-id={bookmark.id}
+                      className={cx('bookmark-row', bookmark.pageIndex === pageIndex && 'is-current')}
+                      style={{ paddingLeft: Math.min(6, bookmark.depth || 0) * 13 }}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'F2' || renaming || !bookmarksEditable) return
+                        event.preventDefault()
+                        startRename(bookmark)
                       }}
-                    ><MoreHorizontal size={15} /></button>
-                    <button type="button" className="bookmark-delete" title="Remove bookmark" onClick={() => onDeleteBookmark(bookmark.id)}><X size={14} /></button>
-                  </div>
-                ))}
+                    >
+                      {renaming ? (
+                        <form
+                          className="bookmark-main"
+                          style={{ gridColumn: '1 / -1', cursor: 'default' }}
+                          onSubmit={(event) => { event.preventDefault(); finishRename(true) }}
+                        >
+                          <BookmarkIcon size={15} fill="currentColor" />
+                          <input
+                            autoFocus
+                            aria-label="Bookmark name"
+                            value={renameDraft}
+                            maxLength={500}
+                            onFocus={(event) => event.currentTarget.select()}
+                            onChange={(event) => setRenameDraft(event.target.value)}
+                            onBlur={() => finishRename(true)}
+                            onKeyDown={(event) => {
+                              // Ctrl+S keeps the new name and then saves (the app's
+                              // handler sees the renamed list, rendered in between).
+                              if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 's') {
+                                finishRename(true)
+                                return
+                              }
+                              // Typing here must not reach the document shortcuts (Delete, Ctrl+Z…).
+                              event.stopPropagation()
+                              if (event.key === 'Escape') { event.preventDefault(); finishRename(false) }
+                              if (event.key === 'Enter') { event.preventDefault(); finishRename(true) }
+                            }}
+                            style={{ minWidth: 0, flex: 1, padding: '3px 6px', border: '1px solid var(--border-strong)', borderRadius: 5, font: 'inherit', fontSize: 11.5, ...titleStyle }}
+                          />
+                        </form>
+                      ) : (
+                        <button
+                          type="button"
+                          className="bookmark-main"
+                          title={bookmark.url || undefined}
+                          // The second click of a double-click renames; it must
+                          // not open a web link a second time.
+                          onClick={(event) => { if (event.detail <= 1) onOpenBookmark(bookmark) }}
+                          onDoubleClick={() => startRename(bookmark)}
+                        >
+                          {typeof bookmark.pageIndex !== 'number' && bookmark.url
+                            ? <ExternalLink size={15} />
+                            : <BookmarkIcon size={15} fill={typeof bookmark.pageIndex === 'number' ? 'currentColor' : 'none'} />}
+                          <span>
+                            <strong style={titleStyle}>{bookmark.label}</strong>
+                            <small>{bookmarkTargetLabel(bookmark)}</small>
+                          </span>
+                        </button>
+                      )}
+                      {!renaming && bookmarksEditable && (
+                        <>
+                          <button
+                            type="button"
+                            className="bookmark-more"
+                            title="Rename bookmark (F2)"
+                            aria-label={`Rename bookmark ${bookmark.label}`}
+                            onClick={() => startRename(bookmark)}
+                          ><Pencil size={13} /></button>
+                          <button
+                            type="button"
+                            className="bookmark-delete"
+                            title="Remove bookmark"
+                            aria-label={`Remove bookmark ${bookmark.label}`}
+                            onClick={() => onDeleteBookmark(bookmark.id)}
+                          ><X size={14} /></button>
+                        </>
+                      )}
+                    </div>
+                  )
+                })}
             </div>
           ) : (
             <EmptyState icon={BookmarkIcon} title="No bookmarks yet" detail="Use the bookmark button in the toolbar to save a page." />
@@ -644,6 +753,12 @@ export function Sidebar({
                 : query ? 'Press Enter to search' : 'Search every page'}
           </div>
           {searchError && <div className="inline-error">{searchError}</div>}
+          {!searching && lastSearchedQuery && textlessPages > 0 && onRecognizeText && (
+            <div className="search-ocr-hint" role="note">
+              <span>{textlessPages === 1 ? '1 page has no searchable text — it may be scanned.' : `${textlessPages} pages have no searchable text — they may be scanned.`}</span>
+              <button type="button" onClick={onRecognizeText}><ScanText size={13} aria-hidden="true" />Recognize text</button>
+            </div>
+          )}
           <div className="search-results">
             {results.map((result, index) => (
               <button

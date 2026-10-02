@@ -595,7 +595,11 @@ export interface SimpleCalcAPI {
     format: SpreadsheetExportFormat
     suggestedName: string
     sourceUnmodified?: boolean
+    /** The user agreed to a values-only XLS (no document engine). */
+    acceptLoss?: boolean
   }) => Promise<SpreadsheetExportResult | null>
+  /** What an export to `format` would lose, and whether it needs the user's consent first. */
+  checkExport: (input: { workbook: WorkbookModel; format: SpreadsheetExportFormat }) => Promise<{ format: string; officeEngine: boolean; losses: string[]; confirmationRequired: boolean }>
   renderPrintPreview: (input: {
     documentId: string
     name: string

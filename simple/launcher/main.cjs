@@ -3,23 +3,29 @@
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron')
-const { EXTENSIONS_BY_MODE, groupPathsByMode, MODES, supportedPaths } = require('../electron/routing.cjs')
+const { EXTENSIONS_BY_MODE, MODES, supportedPaths } = require('../electron/routing.cjs')
+// Opens files in their workspaces: one new Simple process per workspace,
+// however many files (a long list travels in a list file, see
+// electron/open-list.cjs), with the routing decision forwarded.
+const { launchValidatedPaths } = require('./open-paths.cjs')
 const { launchDetached, portableExecutablePath } = require('../electron/launch.cjs')
+const formats = require('../shared/electron/formats.cjs')
 const { registerAssociations, unregisterAssociations } = require('./associations.cjs')
-const { atomicWrite, runCombine } = require('./combine-host.cjs')
+const { atomicWrite, runCombine, unlockPdfBytes } = require('./combine-host.cjs')
+const { CombineError, serializeError } = require('./combine-policy.cjs')
+// Checks on the picked files and the save target, with plain file errors.
+const { assertTargetIsNotASource, describeCombinePaths } = require('./combine-paths.cjs')
+const { printHtmlToPdf } = require('../shared/electron/html-to-pdf.cjs')
+const { sweep } = require('../shared/electron/io-core.cjs')
+const { getOfficeEngineStatus } = require('../shared/electron/office-engine.cjs')
 
 let mainWindow = null
 let combineBusy = false
-const COMBINE_EXTENSIONS = ['pdf', 'docx', 'doc', 'xls', 'xlsx', 'ods', 'png', 'jpg', 'jpeg']
 
-async function describeCombinePaths(paths) {
-  if (!Array.isArray(paths) || paths.length > 100) throw new Error('Choose up to 100 files at a time.')
-  return Promise.all(paths.map(async (filePath) => {
-    if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || !COMBINE_EXTENSIONS.includes(path.extname(filePath).slice(1).toLowerCase())) throw new Error('Combine accepts PDFs, Word documents, Excel and ODS spreadsheets, PNGs, and JPEGs.')
-    const stat = await fs.stat(filePath)
-    if (!stat.isFile() || !stat.size || stat.size > 256 * 1024 * 1024) throw new Error(`${path.basename(filePath)} must be a nonempty file smaller than 256 MB.`)
-    return { path: filePath, name: path.basename(filePath), size: stat.size, pages: '' }
-  }))
+/** A failure the Combine window shows as text; never a raw IPC error. */
+function combineFailure(error) {
+  const { code, message } = serializeError(error)
+  return { canceled: false, ok: false, code, message }
 }
 
 function createWindow() {
@@ -50,13 +56,6 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => mainWindow.show())
 }
 
-function launchValidatedPaths(paths) {
-  const valid = supportedPaths(paths)
-  const groups = groupPathsByMode(valid)
-  for (const pathsForMode of groups.values()) launchDetached(pathsForMode)
-  return { opened: valid.length, unsupported: Math.max(0, paths.length - valid.length) }
-}
-
 async function buildInfo() {
   try {
     const manifest = JSON.parse(await fs.readFile(path.join(__dirname, '..', 'modules', 'manifest.json'), 'utf8'))
@@ -69,38 +68,54 @@ async function buildInfo() {
 function registerIpc() {
   ipcMain.handle('launcher:info', buildInfo)
   ipcMain.handle('launcher:combine-add', async (event, paths) => {
-    if (combineBusy) throw new Error('Wait for the current PDF to finish.')
-    if (paths !== undefined) return describeCombinePaths(paths)
-    const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
-      title: 'Add files to combine', properties: ['openFile', 'multiSelections'],
-      filters: [{ name: 'PDF, Word, spreadsheets, and photos', extensions: COMBINE_EXTENSIONS }],
-    })
-    return result.canceled ? [] : describeCombinePaths(result.filePaths)
+    try {
+      if (combineBusy) throw new CombineError('BUSY', 'Wait for the current PDF to finish.')
+      if (paths !== undefined) return await describeCombinePaths(paths)
+      // The registry lists what Combine opens on this PC; .doc and .xls only with a local office engine.
+      const engine = Boolean((await getOfficeEngineStatus())?.available)
+      const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
+        title: 'Add files to combine', properties: ['openFile', 'multiSelections'],
+        filters: formats.dialogFilters('combine', { engine, allFiles: false }),
+      })
+      return result.canceled ? { entries: [], skipped: [] } : await describeCombinePaths(result.filePaths)
+    } catch (error) {
+      return { entries: [], skipped: [], ...combineFailure(error) }
+    }
   })
   ipcMain.handle('launcher:combine-save', async (event, entries) => {
-    if (combineBusy) throw new Error('Wait for the current PDF to finish.')
-    if (!Array.isArray(entries) || entries.length < 2) throw new Error('Add at least two files.')
-    await describeCombinePaths(entries.map((entry) => entry?.path))
+    if (combineBusy) return combineFailure(new CombineError('BUSY', 'Wait for the current PDF to finish.'))
     combineBusy = true
     try {
+      if (!Array.isArray(entries) || entries.length < 2) throw new CombineError('INVALID', 'Add at least two files.')
+      const { skipped } = await describeCombinePaths(entries.map((entry) => entry?.path))
+      if (skipped.length) throw new CombineError(skipped[0].code, `${skipped[0].name}: ${skipped[0].message}`)
       const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender), {
         title: 'Save combined PDF', defaultPath: path.join(path.dirname(entries[0].path), 'Combined.pdf'),
         filters: [{ name: 'PDF document', extensions: ['pdf'] }],
       })
       if (result.canceled || !result.filePath) return { canceled: true }
       const target = path.extname(result.filePath) ? result.filePath : `${result.filePath}.pdf`
-      if (path.extname(target).toLowerCase() !== '.pdf') throw new Error('Choose a .pdf filename for the combined document.')
-      const realTarget = await fs.realpath(target).catch(() => path.resolve(target))
-      for (const entry of entries) {
-        const realSource = await fs.realpath(entry.path)
-        if (realSource.toLowerCase() === realTarget.toLowerCase()) throw new Error('Choose a new filename so the combined PDF keeps your source file intact.')
-      }
+      if (path.extname(target).toLowerCase() !== '.pdf') throw new CombineError('INVALID_NAME', 'Choose a .pdf filename for the combined document.')
+      await assertTargetIsNotASource(entries, target)
       const combined = await runCombine(entries, (progress) => {
         if (!event.sender.isDestroyed()) event.sender.send('launcher:combine-progress', progress)
+      }, {
+        printHtml: (html, options) => printHtmlToPdf(html, options),
+        unlockPdf: (bytes) => unlockPdfBytes(bytes),
+        title: path.basename(target, path.extname(target)),
       })
       await atomicWrite(target, combined.bytes)
-      launchDetached([target])
-      return { canceled: false, name: path.basename(target), pageCount: combined.pageCount }
+      // The result opens in Simple's own PDF workspace, never in another app.
+      // The PDF is saved either way; a failure to open it is reported, not thrown.
+      let openFailure = null
+      try { await launchDetached([target]) } catch (error) { openFailure = error?.message || "Simple couldn't open it." }
+      return {
+        canceled: false, ok: true, name: path.basename(target), pageCount: combined.pageCount,
+        builtIn: Array.isArray(combined.builtIn) ? combined.builtIn : [],
+        opened: !openFailure, ...(openFailure ? { openFailure } : {}),
+      }
+    } catch (error) {
+      return combineFailure(error)
     } finally { combineBusy = false }
   })
   ipcMain.handle('launcher:open', async (event) => {
@@ -108,25 +123,19 @@ function registerIpc() {
     const result = await dialog.showOpenDialog(owner, {
       title: 'Open with simple',
       properties: ['openFile', 'multiSelections'],
-      filters: [
-        { name: 'All supported files', extensions: Object.values(EXTENSIONS_BY_MODE).flat().map((extension) => extension.slice(1)) },
-        { name: 'Documents', extensions: EXTENSIONS_BY_MODE.docs.map((extension) => extension.slice(1)) },
-        { name: 'Spreadsheets', extensions: EXTENSIONS_BY_MODE.calc.map((extension) => extension.slice(1)) },
-        { name: 'PDF and text', extensions: EXTENSIONS_BY_MODE.pdf.map((extension) => extension.slice(1)) },
-        { name: 'Images', extensions: EXTENSIONS_BY_MODE.image.map((extension) => extension.slice(1)) },
-        { name: 'Videos', extensions: EXTENSIONS_BY_MODE.video.map((extension) => extension.slice(1)) },
-      ],
+      // Every routed extension, grouped by workspace, from the format registry.
+      filters: formats.dialogFilters('launcher', { allFiles: false }),
     })
-    if (result.canceled) return { opened: 0, unsupported: 0 }
+    if (result.canceled) return { opened: 0, unsupported: 0, failed: 0 }
     return launchValidatedPaths(result.filePaths)
   })
   ipcMain.handle('launcher:launch-paths', (_event, paths) => {
     if (!Array.isArray(paths) || paths.some((item) => typeof item !== 'string')) throw new Error('Invalid file list.')
     return launchValidatedPaths(paths)
   })
-  ipcMain.handle('launcher:launch-mode', (_event, mode) => {
+  ipcMain.handle('launcher:launch-mode', async (_event, mode) => {
     if (!MODES.includes(mode)) throw new Error('Unknown workspace.')
-    launchDetached([`--simple-mode=${mode}`])
+    await launchDetached([`--simple-mode=${mode}`])
     return true
   })
   ipcMain.handle('launcher:register-file-types', async () => {
@@ -143,9 +152,12 @@ const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
-  app.on('second-instance', (_event, argv) => {
+  app.on('second-instance', (_event, argv, workingDirectory) => {
     const incoming = supportedPaths(argv)
-    if (incoming.length) launchValidatedPaths(incoming)
+    if (incoming.length) {
+      launchValidatedPaths(incoming, { cwd: typeof workingDirectory === 'string' && workingDirectory ? workingDirectory : undefined })
+        .catch((error) => process.stderr.write(`Could not open ${incoming.length} file(s): ${error && error.message}\n`))
+    }
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore()
       mainWindow.focus()
@@ -153,6 +165,9 @@ if (!gotLock) {
   })
   app.whenReady().then(() => {
     app.setAppUserModelId('com.simple.unified')
+    // Finish or undo a combined-PDF save that a crash interrupted. Only paths
+    // recorded in the launcher's own save journal are ever touched.
+    void sweep().catch(() => {})
     registerIpc()
     createWindow()
   })

@@ -112,7 +112,8 @@ function readEntry(bytes, entry) {
   return result
 }
 
-function validateDocxPackage(data) {
+/** Central-directory entries of a validated, non-ZIP64 package, keyed by name. */
+function listZipEntries(data) {
   const bytes = toBytes(data)
   const minimumEocdOffset = Math.max(0, bytes.length - 65_557)
   let eocdOffset = -1
@@ -168,7 +169,14 @@ function validateDocxPackage(data) {
     entries.set(entryName, { name: entryName, compressedSize, uncompressedSize, method, localHeaderOffset })
     cursor = nextCursor
   }
-  if (cursor > centralOffset + centralSize || !entries.has('[Content_Types].xml')) {
+  if (cursor > centralOffset + centralSize) throw new Error('This archive does not contain a complete Word document.')
+  return entries
+}
+
+function validateDocxPackage(data) {
+  const bytes = toBytes(data)
+  const entries = listZipEntries(bytes)
+  if (!entries.has('[Content_Types].xml')) {
     throw new Error('This archive does not contain a complete Word document.')
   }
 
@@ -192,10 +200,200 @@ function validateDocxBytes(data) {
   return bytes
 }
 
+// ---- Files Simple Docs opens (DOC-017, DOC-SIE-15) --------------------------------
+// Word packages open in the editor directly: a template (.dotx/.dotm) as a new untitled
+// document, a macro-enabled file without its macros. RTF, OpenDocument text, web pages,
+// Markdown and plain text are read by the renderer's native importers (src/importers),
+// without LibreOffice or any network access. Everything but a plain .docx saves as a
+// separate .docx, so a source file is never overwritten in another format. The
+// renderer's drop check (OPENABLE_DOCUMENT in src/main.ts) mirrors this table.
+
+/** Largest file the renderer's importers read (src/importers MAX_IMPORT_BYTES). */
+const MAX_IMPORT_BYTES = 100 * 1024 * 1024
+
+const OPEN_FORMATS = Object.freeze({
+  '.docx': 'docx',
+  '.docm': 'docm',
+  '.dotx': 'dotx',
+  '.dotm': 'dotm',
+  '.doc': 'doc',
+  '.rtf': 'rtf',
+  '.odt': 'odt',
+  '.html': 'html',
+  '.htm': 'html',
+  '.md': 'md',
+  '.markdown': 'md',
+  '.txt': 'txt',
+})
+const WORD_PACKAGE_FORMATS = new Set(['docx', 'docm', 'dotx', 'dotm'])
+const IMPORT_FORMATS = new Set(['rtf', 'odt', 'html', 'md', 'txt'])
+const TEMPLATE_CONTENT_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml',
+  'application/vnd.ms-word.template.macroEnabledTemplate.main+xml',
+])
+
+/** Open dialog filters: everything Simple Docs reads first, then each family. */
+const OPEN_DIALOG_FILTERS = Object.freeze([
+  { name: 'All supported documents', extensions: Object.keys(OPEN_FORMATS).map((extension) => extension.slice(1)) },
+  { name: 'Word documents', extensions: ['docx', 'docm', 'doc'] },
+  { name: 'Word templates', extensions: ['dotx', 'dotm'] },
+  { name: 'OpenDocument text', extensions: ['odt'] },
+  { name: 'Rich Text', extensions: ['rtf'] },
+  { name: 'Web pages', extensions: ['html', 'htm'] },
+  { name: 'Markdown', extensions: ['md', 'markdown'] },
+  { name: 'Plain text', extensions: ['txt'] },
+  { name: 'All files', extensions: ['*'] },
+].map((filter) => Object.freeze({ ...filter, extensions: Object.freeze(filter.extensions) })))
+
+const UNSUPPORTED_FILE_MESSAGE = 'Simple Docs can’t open this kind of file. It opens Word documents and templates, OpenDocument text, Rich Text, web pages, Markdown and plain text.'
+
+/** The format a file name declares (see OPEN_FORMATS), or null. */
+function openFormatForName(name) {
+  const match = /\.[^.\\/]+$/.exec(String(name ?? ''))
+  return match ? OPEN_FORMATS[match[0].toLowerCase()] ?? null : null
+}
+
+function isOpenableDocumentPath(filePath) {
+  return typeof filePath === 'string' && openFormatForName(filePath) !== null
+}
+
+const OLE_SIGNATURE = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]
+const ODT_MIMETYPE = 'application/vnd.oasis.opendocument.text'
+
+/** An OpenDocument package's type: the first ZIP entry is a stored "mimetype" (null when it is not). */
+function openDocumentMimetype(bytes) {
+  if (bytes.length < 38 || bytes.readUInt32LE(0) !== 0x04034b50 || bytes.readUInt16LE(8) !== 0) return null
+  const nameLength = bytes.readUInt16LE(26)
+  const extraLength = bytes.readUInt16LE(28)
+  const size = bytes.readUInt32LE(18)
+  if (nameLength !== 8 || bytes.toString('latin1', 30, 38) !== 'mimetype' || size > 200) return null
+  const start = 30 + nameLength + extraLength
+  return bytes.toString('latin1', start, Math.min(bytes.length, start + size)).trim() || null
+}
+
+/**
+ * What a file's bytes are, whatever its name says: 'word' (an OOXML package), 'odt',
+ * 'odf' (an OpenDocument package of unknown type), 'zip' (another archive), 'ole'
+ * (Word 97-2003 or an encrypted package), 'rtf', 'html', 'text', 'binary' or 'empty'.
+ */
+function sniffDocumentBytes(data) {
+  const bytes = toBytes(data)
+  if (!bytes.length) return 'empty'
+  if (bytes.length >= 4 && bytes.readUInt32LE(0) === 0x04034b50) {
+    const mimetype = openDocumentMimetype(bytes)
+    // Text documents and their templates; a spreadsheet or a presentation is not one.
+    if (mimetype) return mimetype.startsWith(ODT_MIMETYPE) ? 'odt' : 'zip'
+    try {
+      const entries = listZipEntries(bytes)
+      if (entries.has('[Content_Types].xml')) return 'word'
+      // Some writers do not put "mimetype" first; the importer checks the type itself.
+      if (entries.has('content.xml') && entries.has('mimetype')) return 'odf'
+    } catch {
+      // A damaged or partial archive; the name decides how it is reported.
+    }
+    return 'zip'
+  }
+  if (OLE_SIGNATURE.every((value, index) => bytes[index] === value)) return 'ole'
+  if ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) {
+    const head = bytes.subarray(2, Math.min(bytes.length, 2050))
+    const littleEndian = bytes[0] === 0xff
+    let text = ''
+    for (let index = 0; index + 1 < head.length; index += 2) text += String.fromCharCode(littleEndian ? head[index] | (head[index + 1] << 8) : (head[index] << 8) | head[index + 1])
+    return /^\s*<(?:!doctype\s+html|html[\s>])/i.test(text) ? 'html' : /^\s*\{\\rtf/.test(text) ? 'rtf' : 'text'
+  }
+  const head = bytes.subarray(0, Math.min(bytes.length, 8192))
+  const start = head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf ? 3 : 0
+  const text = head.toString('latin1', start, Math.min(head.length, start + 2048))
+  if (/^\s*\{\\rtf/.test(text)) return 'rtf'
+  // A PDF can be plain ASCII at its start; it is never a text document.
+  if (text.startsWith('%PDF-') || head.subarray(start).includes(0)) return 'binary'
+  if (/^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<(?:!doctype\s+html|html[\s>]|head[\s>]|body[\s>])/i.test(text)) return 'html'
+  return 'text'
+}
+
+/** Whether an OOXML package carries macros (vbaProject.bin anywhere in it). */
+function packageHasMacros(entries) {
+  for (const name of entries.keys()) if (/(?:^|\/)vbaProject\.bin$/i.test(name)) return true
+  return false
+}
+
+/**
+ * The Word package details the open path needs: whether it is a template, whether it
+ * has macros. Call after validateDocxBytes.
+ */
+function wordPackageInfo(data) {
+  const bytes = toBytes(data)
+  const entries = listZipEntries(bytes)
+  let template = false
+  const contentTypes = entries.get('[Content_Types].xml')
+  if (contentTypes) {
+    const xml = decodeXml(readEntry(bytes, contentTypes))
+    const overridePattern = /<(?:[A-Za-z_][\w.-]*:)?Override\b([^>]*)>/gs
+    for (const match of xml.matchAll(overridePattern)) {
+      if (TEMPLATE_CONTENT_TYPES.has(attributesFromXmlTag(match[1]).get('ContentType'))) template = true
+    }
+  }
+  return { template, macros: packageHasMacros(entries) }
+}
+
+/**
+ * How to open a file: its declared format, corrected by its content. Returns one of
+ * OPEN_FORMATS' values ('docx', 'docm', 'dotx', 'dotm', 'doc', 'rtf', 'odt', 'html',
+ * 'md', 'txt') and whether the name disagreed with the content ('renamed'). Throws a
+ * plain-language error for files Simple Docs cannot read.
+ */
+function documentOpenKind(fileName, data) {
+  const bytes = toBytes(data)
+  const declared = openFormatForName(fileName)
+  const content = sniffDocumentBytes(bytes)
+  if (content === 'empty') throw new Error('This file is empty.')
+  // Word 97-2003 files keep their own reader, which also recognizes RTF, web pages,
+  // web archives and DOCX packages saved with a .doc name.
+  if (declared === 'doc') return { kind: 'doc', renamed: false }
+  if (content === 'rtf') return { kind: 'rtf', renamed: declared !== 'rtf' }
+  if (content === 'odt') return { kind: 'odt', renamed: declared !== 'odt' }
+  if (content === 'odf' && declared === 'odt') return { kind: 'odt', renamed: false }
+  if (content === 'word') {
+    if (WORD_PACKAGE_FORMATS.has(declared)) return { kind: declared, renamed: false }
+    return { kind: 'docx', renamed: true }
+  }
+  if (content === 'ole') {
+    // An encrypted (password-protected) Word package is an OLE file too; its reader explains.
+    if (WORD_PACKAGE_FORMATS.has(declared)) return { kind: declared, renamed: false }
+    return { kind: 'doc', renamed: true }
+  }
+  if (content === 'zip' || content === 'odf' || content === 'binary') {
+    if (WORD_PACKAGE_FORMATS.has(declared)) return { kind: declared, renamed: false }
+    if (IMPORT_FORMATS.has(declared)) throw new Error(`This file is not a readable ${declared === 'odt' ? 'OpenDocument' : 'text'} document.`)
+    throw new Error(UNSUPPORTED_FILE_MESSAGE)
+  }
+  // Text: a web page, Markdown or plain text (or flat OpenDocument XML, or a damaged
+  // RTF file, whose importers explain what is wrong).
+  if (WORD_PACKAGE_FORMATS.has(declared)) {
+    if (content === 'html') return { kind: 'html', renamed: true }
+    return { kind: declared, renamed: false }
+  }
+  if (declared === 'md' || declared === 'txt' || declared === 'odt' || declared === 'rtf') return { kind: declared, renamed: false }
+  // A web page, or a file without a known extension (chosen through "All files").
+  return { kind: content === 'html' || declared === 'html' ? 'html' : 'txt', renamed: false }
+}
+
 module.exports = {
+  IMPORT_FORMATS,
   MAIN_DOCUMENT_CONTENT_TYPES,
   MAX_FILE_BYTES,
+  MAX_IMPORT_BYTES,
+  OPEN_DIALOG_FILTERS,
+  OPEN_FORMATS,
+  UNSUPPORTED_FILE_MESSAGE,
+  WORD_PACKAGE_FORMATS,
   declaredMainDocumentPart,
+  documentOpenKind,
+  isOpenableDocumentPath,
+  listZipEntries,
+  openFormatForName,
+  sniffDocumentBytes,
   validateDocxBytes,
   validateDocxPackage,
+  wordPackageInfo,
 }

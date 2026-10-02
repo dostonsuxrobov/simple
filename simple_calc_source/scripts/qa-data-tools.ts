@@ -64,6 +64,11 @@ import {
   withValidation,
 } from '../src/lib/validation'
 import type { DataValidationModel } from '../src/lib/validation'
+import { listEntryForOption } from '../src/lib/validation'
+import { currentRegionAround, filterHiddenRowSet } from '../src/lib/filter'
+import { sortExpansionRegion } from '../src/lib/sort'
+import { addMonthsToSerial, addWeekdaysToSerial, createAutofillPatch, fillHandleDoubleClickBottom } from '../src/lib/autofill'
+import type { AutofillMode } from '../src/lib/autofill'
 import {
   changeCase,
   convertField,
@@ -908,6 +913,182 @@ test('cleanup: split text to columns', () => {
   applyCellChanges(moved.cells, elsewhere.changes)
   assert.deepEqual([moved.cells.A1.value, moved.cells.C1.value, moved.cells.D1.value, moved.cells.D2.value], ['1;2', 1, 2, 4])
   assert.ok(!splitTextToColumns(moved, { top: 0, bottom: 1, left: 0, right: 1 }, csv, hostFor(moved)).ok)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Fill (fill handle, Fill Down/Right, Auto Fill Options) — CALC-019, calc-grid-interaction-8, CALC-006
+// ---------------------------------------------------------------------------------------------
+
+/** Fill column A (seeds from A1) down by `count` rows; returns the filled values. */
+function fillDown(seeds: Input[], count: number, mode?: AutofillMode, options: { date1904?: boolean; existing?: Record<string, CellData> } = {}) {
+  const sheet = sheetFrom(seeds.map((seed) => [seed]))
+  Object.assign(sheet.cells, options.existing || {})
+  const patch = createAutofillPatch({
+    cells: sheet.cells,
+    source: { top: 0, bottom: seeds.length - 1, left: 0, right: 0 },
+    destination: { top: seeds.length, bottom: seeds.length + count - 1, left: 0, right: 0 },
+    mode,
+    date1904: options.date1904,
+  })
+  const values = Array.from({ length: count }, (_, index) => patch.changes[addressOf(seeds.length + index, 0)]?.value)
+  return { patch, values }
+}
+
+const DATE = { numFmt: 'm/d/yyyy' }
+const dateCell = (year: number, month: number, day: number): CellData => ({ value: serialFromYMD(year, month, day), ...DATE })
+const ymd = (year: number, month: number, day: number) => serialFromYMD(year, month, day)
+
+test('fill: day and month names continue around their list, keeping case', () => {
+  assert.deepEqual(fillDown(['Mon'], 7).values, ['Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun', 'Mon'])
+  assert.deepEqual(fillDown(['monday'], 2).values, ['tuesday', 'wednesday'])
+  assert.deepEqual(fillDown(['FRIDAY'], 3).values, ['SATURDAY', 'SUNDAY', 'MONDAY'])
+  assert.deepEqual(fillDown(['November'], 3).values, ['December', 'January', 'February'])
+  assert.deepEqual(fillDown(['Jan'], 2).values, ['Feb', 'Mar'])
+  assert.deepEqual(fillDown(['May'], 1).values, ['Jun'], 'May reads as the short month list first, as in Excel')
+  assert.deepEqual(fillDown(['April', 'May'], 1).values, ['June'])
+  assert.deepEqual(fillDown(['Jan', 'Mar'], 3).values, ['May', 'Jul', 'Sep'], 'two seeds keep their step')
+  assert.deepEqual(fillDown(['Wed', 'Mon'], 2).values, ['Sat', 'Thu'], 'a backwards step continues backwards')
+  assert.deepEqual(fillDown(['Sun', 'Sept'], 2).values, ['Sun', 'Sept'], 'unknown names repeat')
+})
+
+test('fill: quarters wrap after Q4 in every spelling', () => {
+  assert.deepEqual(fillDown(['Q1'], 4).values, ['Q2', 'Q3', 'Q4', 'Q1'])
+  assert.deepEqual(fillDown(['Qtr 3'], 2).values, ['Qtr 4', 'Qtr 1'])
+  assert.deepEqual(fillDown(['Quarter 4'], 1).values, ['Quarter 1'])
+  assert.deepEqual(fillDown(['1st Quarter'], 4).values, ['2nd Quarter', '3rd Quarter', '4th Quarter', '1st Quarter'])
+  assert.deepEqual(fillDown(['q2', 'q4'], 2).values, ['q2', 'q4'], 'a two-quarter step repeats around the year')
+  assert.deepEqual(fillDown(['Q5'], 1).values, ['Q6'], 'Q5 is not a quarter: its number counts up')
+})
+
+test('fill: text with a trailing number counts up from a single seed (Excel)', () => {
+  assert.deepEqual(fillDown(['Item 1'], 3).values, ['Item 2', 'Item 3', 'Item 4'])
+  assert.deepEqual(fillDown(['A-009'], 2).values, ['A-010', 'A-011'])
+  assert.deepEqual(fillDown(['Item 1', 'Item 3'], 2).values, ['Item 5', 'Item 7'])
+  assert.deepEqual(fillDown(['Item 1'], 2, 'toggle').values, ['Item 1', 'Item 1'], 'Ctrl+drag copies')
+  assert.deepEqual(fillDown(['Total'], 2).values, ['Total', 'Total'])
+})
+
+test('fill: numbers copy alone, count with Ctrl or Fill Series, and extend steps and trends', () => {
+  assert.deepEqual(fillDown([5], 3).values, [5, 5, 5])
+  assert.deepEqual(fillDown([5], 3, 'toggle').values, [6, 7, 8], 'Ctrl+drag a lone number counts up')
+  assert.deepEqual(fillDown([5], 2, 'series').values, [6, 7])
+  assert.deepEqual(fillDown([1, 3], 2).values, [5, 7])
+  assert.deepEqual(fillDown([1, 3], 2, 'toggle').values, [1, 3], 'Ctrl+drag a series copies it')
+  assert.deepEqual(fillDown([0.1, 0.2], 2).values, [0.3, 0.4], 'steps are stored to 15 digits')
+  const trend = fillDown([1, 2, 4], 2).values as number[]
+  assert.ok(Math.abs(trend[0] - 16 / 3) < 1e-9 && Math.abs(trend[1] - 41 / 6) < 1e-9, `uneven seeds follow the best-fit line (${trend})`)
+  assert.deepEqual(fillDown([2, 2], 2).values, [2, 2])
+})
+
+test('fill: dates step by days, months and years', () => {
+  const single = fillDown([dateCell(2026, 1, 15)], 2)
+  assert.deepEqual(single.values, [ymd(2026, 1, 16), ymd(2026, 1, 17)], 'a lone date advances a day')
+  assert.equal(single.patch.changes.A2?.numFmt, 'm/d/yyyy', 'the date format travels with the value')
+  assert.deepEqual(fillDown([dateCell(2026, 1, 15)], 2, 'toggle').values, [ymd(2026, 1, 15), ymd(2026, 1, 15)], 'Ctrl+drag copies a date')
+  assert.deepEqual(fillDown([dateCell(2026, 1, 15), dateCell(2026, 2, 15)], 2).values, [ymd(2026, 3, 15), ymd(2026, 4, 15)], 'one month apart steps by months')
+  assert.deepEqual(fillDown([dateCell(2026, 1, 31), dateCell(2026, 2, 28)], 3).values, [ymd(2026, 3, 31), ymd(2026, 4, 30), ymd(2026, 5, 31)], 'month ends stay month ends (EDATE)')
+  assert.deepEqual(fillDown([dateCell(2024, 1, 1), dateCell(2025, 1, 1)], 1).values, [ymd(2026, 1, 1)], 'a year apart steps by years')
+  assert.deepEqual(fillDown([dateCell(2026, 1, 1), dateCell(2026, 1, 8)], 1).values, [ymd(2026, 1, 15)], 'a week apart steps by days')
+  assert.deepEqual(fillDown([dateCell(2026, 1, 2)], 3, 'weekdays').values, [ymd(2026, 1, 5), ymd(2026, 1, 6), ymd(2026, 1, 7)], 'Fill Weekdays skips the weekend after Friday 2 Jan 2026')
+  assert.deepEqual(fillDown([dateCell(2026, 1, 31)], 2, 'months').values, [ymd(2026, 2, 28), ymd(2026, 3, 31)])
+  assert.deepEqual(fillDown([dateCell(2024, 2, 29)], 1, 'years').values, [ymd(2025, 2, 28)])
+  assert.deepEqual(fillDown([dateCell(2026, 1, 15)], 1, 'days').values, [ymd(2026, 1, 16)])
+  assert.equal(addMonthsToSerial(ymd(2026, 3, 31), -1), ymd(2026, 2, 28))
+  assert.equal(addWeekdaysToSerial(ymd(2026, 1, 5), -1), ymd(2026, 1, 2))
+  const time = fillDown([{ value: 0.375, numFmt: 'h:mm' }], 2).values as number[]
+  assert.ok(Math.abs(time[0] - 10 / 24) < 1e-9 && Math.abs(time[1] - 11 / 24) < 1e-9, 'a lone time adds an hour')
+  assert.deepEqual(single.patch.options, ['copy', 'series', 'formats', 'values', 'days', 'weekdays', 'months', 'years'])
+  assert.deepEqual(fillDown([5], 1).patch.options, ['copy', 'series', 'formats', 'values'])
+})
+
+test('fill: Copy cells (Fill Down / Right) copies dates verbatim and shifts formulas', () => {
+  const sheet = sheetFrom([[dateCell(2026, 1, 15), { formula: 'A1*2' }]])
+  const patch = createAutofillPatch({ cells: sheet.cells, source: { top: 0, bottom: 0, left: 0, right: 1 }, destination: { top: 1, bottom: 3, left: 0, right: 1 }, mode: 'copy' })
+  assert.equal(patch.changes.A2?.value, ymd(2026, 1, 15))
+  assert.equal(patch.changes.A4?.value, ymd(2026, 1, 15), 'Ctrl+D never turns a date into a series')
+  assert.equal(patch.changes.B3?.formula, 'A3*2')
+  const right = createAutofillPatch({ cells: sheetFrom([['Mon']]).cells, source: { top: 0, bottom: 0, left: 0, right: 0 }, destination: { top: 0, bottom: 0, left: 1, right: 2 }, mode: 'copy' })
+  assert.deepEqual([right.changes.B1?.value, right.changes.C1?.value], ['Mon', 'Mon'])
+})
+
+test('fill: formatting only and without formatting', () => {
+  const bold = { font: { bold: true } }
+  const seeds = [{ value: 1, style: bold, numFmt: '0.00' }, { value: 2, style: bold, numFmt: '0.00' }]
+  const existing = { A3: { value: 'keep', style: { fill: { pattern: 'solid', fgColor: { argb: 'FFFF0000' } } } } }
+  const formats = fillDown(seeds, 2, 'formats', { existing })
+  assert.deepEqual(formats.patch.changes.A3, { value: 'keep', style: bold, numFmt: '0.00' }, 'contents stay, the look comes from the seeds')
+  assert.deepEqual(formats.patch.changes.A4, { style: bold, numFmt: '0.00' })
+  const values = fillDown(seeds, 2, 'values', { existing })
+  assert.deepEqual(values.patch.changes.A3, { value: 3, style: existing.A3.style }, 'the series fills, the destination keeps its look')
+  assert.deepEqual(values.patch.changes.A4, { value: 4 })
+})
+
+test('fill: up and left run the series backwards', () => {
+  const sheet = sheetFrom([[], [], ['Wed']])
+  const patch = createAutofillPatch({ cells: sheet.cells, source: { top: 2, bottom: 2, left: 0, right: 0 }, destination: { top: 0, bottom: 1, left: 0, right: 0 } })
+  assert.deepEqual([patch.changes.A1?.value, patch.changes.A2?.value], ['Mon', 'Tue'])
+})
+
+test('fill: double-clicking the fill handle follows the neighbouring data', () => {
+  const sheet = sheetFrom(Array.from({ length: 10 }, (_, row) => [row + 1, row === 0 ? { formula: 'A1*2' } : undefined]))
+  const has = (cells: Record<string, CellData>) => (row: number, col: number) => cellFilled(cells[addressOf(row, col)])
+  assert.equal(fillHandleDoubleClickBottom(has(sheet.cells), { top: 0, bottom: 0, left: 1, right: 1 }), 9, 'fills B2:B10 beside A1:A10')
+  sheet.cells.B6 = { value: 'x' }
+  assert.equal(fillHandleDoubleClickBottom(has(sheet.cells), { top: 0, bottom: 0, left: 1, right: 1 }), 4, 'stops above data already in the column')
+  const right = sheetFrom([[{ formula: 'B1' }, 1], [undefined, 2], [undefined, 3]])
+  assert.equal(fillHandleDoubleClickBottom(has(right.cells), { top: 0, bottom: 0, left: 0, right: 0 }), 2, 'uses the column to the right when the left is empty')
+  assert.equal(fillHandleDoubleClickBottom(has(sheetFrom([[1]]).cells), { top: 0, bottom: 0, left: 0, right: 0 }), null, 'nothing beside: nothing to fill')
+})
+
+function cellFilled(cell: CellData | undefined) {
+  return Boolean(cell && (cell.formula || (cell.value !== undefined && cell.value !== null && cell.value !== '')))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Filtered ranges: visible cells only (calc-grid-interaction-2, CALC-002)
+// ---------------------------------------------------------------------------------------------
+
+test('filter: filter-hidden rows for visible-cells-only commands', () => {
+  assert.deepEqual([...filterHiddenRowSet({ hiddenRows: [3, 5, 7], filteredRows: [3, 5, 9] })].sort((a, b) => a - b), [2, 4], 'only rows a filter hides (and that are still hidden), 0-based')
+  assert.equal(filterHiddenRowSet({ hiddenRows: [3], filteredRows: undefined }).size, 0, 'manually hidden rows are not skipped')
+})
+
+// ---------------------------------------------------------------------------------------------
+// Sort Warning (CALC-001)
+// ---------------------------------------------------------------------------------------------
+
+test('sort: a one-column selection beside data offers to expand', () => {
+  const sheet = sheetFrom([['Name', 'Qty', 'Price'], ['b', 2, 20], ['a', 1, 10], ['c', 3, 30]])
+  assert.deepEqual(sortExpansionRegion(sheet, { top: 0, bottom: 3, left: 1, right: 1 }), { top: 0, bottom: 3, left: 0, right: 2 })
+  assert.deepEqual(sortExpansionRegion(sheet, { top: 1, bottom: 3, left: 0, right: 1 }), { top: 0, bottom: 3, left: 0, right: 2 }, 'a partial block grows to the whole region')
+  assert.equal(sortExpansionRegion(sheet, { top: 0, bottom: 3, left: 0, right: 2 }), null, 'the whole region needs no warning')
+  assert.equal(sortExpansionRegion(sheet, { top: 1, bottom: 1, left: 1, right: 1 }), null, 'a single cell expands on its own')
+  assert.deepEqual(sortExpansionRegion(sheet, { top: 0, bottom: 1_048_575, left: 1, right: 1 }), { top: 0, bottom: 3, left: 0, right: 2 }, 'a whole column is clipped to the data')
+  const alone = sheetFrom([[3, undefined, 'x'], [1, undefined, 'y'], [2]])
+  assert.equal(sortExpansionRegion(alone, { top: 0, bottom: 2, left: 0, right: 0 }), null, 'a blank column apart: nothing beside it')
+  assert.deepEqual(currentRegionAround(sheet, { top: 2, bottom: 2, left: 1, right: 1 }), { top: 0, bottom: 3, left: 0, right: 2 })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Dropdown picks store typed values (calc-grid-interaction-9)
+// ---------------------------------------------------------------------------------------------
+
+test('validation: a dropdown pick maps to the source value', () => {
+  const sheet = sheetFrom([
+    [{ value: 10, numFmt: '$#,##0.00', display: '$10.00' }],
+    [{ value: serialFromYMD(2026, 1, 15), numFmt: 'm/d/yyyy', display: '1/15/2026' }],
+    [{ value: true }],
+    [{ value: '00123' }],
+  ])
+  const host = hostFor(sheet)
+  const ranged: DataValidationModel = { type: 'list', formulae: ['$A$1:$A$4'] }
+  assert.deepEqual(listEntryForOption(ranged, '$10.00', host), { value: 10, text: '$10.00', numFmt: '$#,##0.00', literal: false })
+  assert.deepEqual(listEntryForOption(ranged, '1/15/2026', host), { value: serialFromYMD(2026, 1, 15), text: '1/15/2026', numFmt: 'm/d/yyyy', literal: false })
+  assert.equal(listEntryForOption(ranged, 'TRUE', host)?.value, true)
+  assert.equal(listEntryForOption(ranged, '00123', host)?.value, '00123', 'text in the source stays text')
+  const literal: DataValidationModel = { type: 'list', formulae: ['"1,2,3"'] }
+  assert.deepEqual(listEntryForOption(literal, '2', host), { value: 2, text: '2', literal: true })
+  assert.equal(listEntryForOption(literal, '9', host), null)
 })
 
 // ---------------------------------------------------------------------------------------------

@@ -7,15 +7,19 @@ import {
   Copy,
   FileWarning,
   FolderOpen,
+  Lock,
   Redo2,
   RotateCcw,
   Scissors,
+  Signature,
   Trash2,
   Undo2,
 } from 'lucide-react'
 import { EditInspector } from './components/EditInspector'
 import { ContinuousPdfViewer } from './components/ContinuousPdfViewer'
 import { ExportDialog, type PdfExportSubmission } from './components/ExportDialog'
+import { OcrDialog, OcrExportPrompt, OcrOffer, readAutoOcr, writeAutoOcr, type OcrDialogRequest } from './components/OcrDialog'
+import type { PendingEditAt } from './components/PdfPage'
 import { PrintDialog, type PrintDialogSubmission } from './components/PrintDialog'
 import { SignaturePanel, type SignatureImage } from './components/SignaturePanel'
 import { Sidebar } from './components/Sidebar'
@@ -24,40 +28,107 @@ import { TitleBar } from './components/TitleBar'
 import { Toolbar } from './components/Toolbar'
 import { BusyOverlay, Button, Toast } from './components/ui'
 import { Welcome } from './components/Welcome'
-import { getPageTextContent, getPdfOutlineBookmarks, loadPdf, makeId, normalizeBytes, pdfRectToViewport, viewportRectToPdf } from './lib/pdf'
+import { getPdfOutlineBookmarks, loadPdf, makeId, normalizeBytes, pdfRectToViewport, viewportRectToPdf } from './lib/pdf'
 import {
+  chooseEditPasteSource,
   copyEditSelection as copyPageEditSelection,
+  editClipboardPlainText,
   pasteEditToPage,
+  pastedTextBoxSize,
   type EditClipboardPayload,
 } from './lib/editClipboard'
 import { pageIndicesForTransfer } from './lib/pageTransfer'
 import { convertImageToPng, isConvertibleImage } from './lib/imageTransfer'
 import { extractPdfText, renderPdfPageImage } from './lib/pdfExport'
+import {
+  bookmarkSubtreeSize,
+  bookmarksAfterPageDelete,
+  bookmarksFromOutline,
+  remapBookmarkPages,
+  toolbarBookmarkFor,
+  withoutBookmark,
+} from './lib/bookmarks'
+import { blockingProblems, mayBeEncrypted, problemText, signedCopyName, summarizeProblems } from './lib/openSave'
+import { classifyPage, pageNeedsOcr, type PageScanState } from './lib/ocr/pageClassifier'
+import { abortOcrRun, disposeOcrRuntime, runOcr, summarizeOcrRun, warmUpOcr, type OcrRunOutcome, type OcrRunProgress, type OcrScope } from './lib/ocr/ocrRunner'
+import { bindOcrPage } from './lib/ocr/ocrCache'
+import {
+  applyScanPreparation,
+  disposeScanEditWorker,
+  finalizeScanEdit,
+  scanPreparationResult,
+  settleScanOverlays,
+  type ScanPreparation,
+} from './lib/ocr/scanEdit'
 import { clamp, errorMessage, isTypingTarget, withoutExtension } from './lib/utils'
+import { getSimpleIO } from './simple-io/io-client'
 import type {
   ActiveSearchMatch,
   Bookmark,
   DisplayRotation,
   DocumentPayload,
+  FlattenReport,
   OpenDocument,
   PageObjectEdit,
   PageTextEdit,
+  PdfFormValue,
   PdfOverlay,
   PdfRect,
+  PdfSaveProblem,
   RecentFile,
+  ScanEditInfo,
+  TextOverlay,
   ToolMode,
 } from './types'
 
 interface Snapshot {
   bytes: Uint8Array
   overlays: PdfOverlay[]
-  formValues: Record<string, string | boolean>
+  formValues: Record<string, PdfFormValue>
   bookmarks: Bookmark[]
   bookmarksDirty: boolean
   pageRotations: Record<number, number>
   pageIndex: number
-  dirty: boolean
+  /**
+   * Identifies this exact document state. The document is clean when its
+   * revision is the one last saved, so undoing back to it after a save shows
+   * no unsaved changes, and undoing past it does.
+   */
+  revision: number
 }
+
+/** The edit selected on the page, before it is folded into the document. */
+interface PendingEditState {
+  textEdit: PageTextEdit | null
+  objectEdit: PageObjectEdit | null
+}
+
+/** What a save would write, and what it could not write as asked. */
+interface PreparedOutput {
+  data: Uint8Array
+  warnings: PdfSaveProblem[]
+  failures: PdfSaveProblem[]
+  signatureDetected: boolean
+}
+
+interface SaveReportState {
+  /** 'blocked': nothing written yet; 'partial': written without these changes; 'notes': written, with these notes. */
+  kind: 'blocked' | 'partial' | 'notes'
+  problems: PdfSaveProblem[]
+  onSaveAnyway?: () => void
+}
+
+interface ToastState {
+  message: string
+  action?: string
+  onAction?: () => void
+  /** Stays until dismissed (used for anything the user must read). */
+  sticky?: boolean
+}
+
+// pdf.js PasswordResponses.INCORRECT_PASSWORD
+const PDFJS_INCORRECT_PASSWORD = 2
+const PASSWORD_CANCELLED = 'Opening the protected PDF was cancelled.'
 
 interface PdfContextMenuState {
   x: number
@@ -116,6 +187,20 @@ function remapAfterDelete(index: number, deleted: number[]): number | null {
   return index - deleted.filter((deletedIndex) => deletedIndex < index).length
 }
 
+/** A scan edit's own copy of its geometry (patch images are immutable strings and stay shared). */
+function cloneScanInfo(scan: ScanEditInfo): ScanEditInfo {
+  return {
+    ...scan,
+    lineRect: { ...scan.lineRect },
+    run: { ...scan.run, origin: { ...scan.run.origin }, dir: { ...scan.run.dir } },
+    words: scan.words?.map((word) => ({ ...word, rect: { ...word.rect } })),
+    patch: scan.patch ? { ...scan.patch, rect: { ...scan.patch.rect } } : undefined,
+    replace: scan.replace
+      ? { ...scan.replace, rect: { ...scan.replace.rect }, originalRect: { ...scan.replace.originalRect }, patch: scan.replace.patch ? { ...scan.replace.patch, rect: { ...scan.replace.patch.rect } } : undefined }
+      : undefined,
+  }
+}
+
 function cloneOverlay(overlay: PdfOverlay): PdfOverlay {
   if (overlay.type === 'ink') {
     return { ...overlay, points: overlay.points.map((point) => ({ ...point })) }
@@ -125,11 +210,20 @@ function cloneOverlay(overlay: PdfOverlay): PdfOverlay {
     rect: { ...overlay.rect },
     ...('originalRect' in overlay && overlay.originalRect ? { originalRect: { ...overlay.originalRect } } : {}),
     ...(overlay.type === 'text' && overlay.inkRect ? { inkRect: { ...overlay.inkRect } } : {}),
+    ...(overlay.type === 'text' && overlay.scan ? { scan: cloneScanInfo(overlay.scan) } : {}),
   } as PdfOverlay
 }
 
 function upsertTextEdit(current: PdfOverlay[], edit: PageTextEdit): PdfOverlay[] {
   if (!edit.modified) return current
+  if (edit.scan) {
+    // Scanned text: decide what actually changed (only those words are
+    // replaced). Unchanged text adds nothing, and reverting an edited line
+    // to what the page says removes its edit.
+    const finalized = finalizeScanEdit(edit)
+    if (finalized.kind === 'none') return edit.overlayId ? current.filter((item) => item.id !== edit.overlayId) : current
+    edit = finalized.edit
+  }
   const sourceStart = Number(edit.sourceSelectionStart)
   const sourceEnd = Number(edit.sourceSelectionEnd)
   const sourceItemText = edit.sourceItemText
@@ -191,6 +285,7 @@ function upsertTextEdit(current: PdfOverlay[], edit: PageTextEdit): PdfOverlay[]
     color: edit.color,
     backgroundColor: edit.backgroundColor,
     cover: edit.cover,
+    ...(edit.scan ? { scan: cloneScanInfo(edit.scan) } : {}),
   }
   if (edit.overlayId) return current.map((item) => item.id === edit.overlayId ? overlay : item)
   return [...current, overlay]
@@ -212,6 +307,32 @@ function upsertObjectEdit(current: PdfOverlay[], edit: PageObjectEdit): PdfOverl
   }
   if (edit.overlayId) return current.map((item) => item.id === edit.overlayId ? overlay : item)
   return [...current, overlay]
+}
+
+/** True when committing this text edit would leave nothing on the page (an empty box that replaced nothing). */
+function isEmptyAddedText(edit: PageTextEdit) {
+  return !edit.text && !edit.cover
+}
+
+/** The overlays with the selected edits folded in, exactly as committing them does. */
+function overlaysWithPendingEdits(current: PdfOverlay[], textEdit: PageTextEdit | null, objectEdit: PageObjectEdit | null) {
+  let next = current
+  if (textEdit?.modified) {
+    next = isEmptyAddedText(textEdit)
+      ? (textEdit.overlayId ? next.filter((overlay) => overlay.id !== textEdit.overlayId) : next)
+      : upsertTextEdit(next, textEdit)
+  }
+  if (objectEdit?.modified) next = upsertObjectEdit(next, objectEdit)
+  return next
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('The clipboard image could not be read.'))
+    reader.readAsDataURL(blob)
+  })
 }
 
 async function imageDimensions(dataUrl: string) {
@@ -314,10 +435,12 @@ export default function App() {
   const [documentError, setDocumentError] = useState('')
   const [passwordProtected, setPasswordProtected] = useState(false)
   const [passwordRequest, setPasswordRequest] = useState<{ name: string; wrong: boolean; resolve: (password: string | null) => void } | null>(null)
+  const passwordRequestRef = useRef<{ resolve: (password: string | null) => void } | null>(null)
   const [passwordDraft, setPasswordDraft] = useState('')
   const [dirty, setDirty] = useState(false)
   const [busy, setBusy] = useState('')
-  const [toast, setToast] = useState<{ message: string; action?: string; onAction?: () => void } | null>(null)
+  const [toast, setToast] = useState<ToastState | null>(null)
+  const [saveReport, setSaveReport] = useState<SaveReportState | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [searchRequestId, setSearchRequestId] = useState(0)
   const [activeSearchMatch, setActiveSearchMatch] = useState<ActiveSearchMatch | null>(null)
@@ -327,10 +450,13 @@ export default function App() {
   const [zoomMode, setZoomMode] = useState<'fit' | 'width' | 'custom'>('fit')
   const [tool, setTool] = useState<ToolMode>('select')
   const [overlays, setOverlays] = useState<PdfOverlay[]>([])
-  const [formValues, setFormValues] = useState<Record<string, string | boolean>>({})
+  const [formValues, setFormValues] = useState<Record<string, PdfFormValue>>({})
   const [hasInteractiveForms, setHasInteractiveForms] = useState<boolean | null>(null)
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([])
   const [bookmarksDirty, setBookmarksDirty] = useState(false)
+  // When the document's outline cannot be read, editing the (empty) list and
+  // saving would replace the outline the file really has.
+  const [bookmarksReadOnly, setBookmarksReadOnly] = useState(false)
   const [pageRotations, setPageRotations] = useState<Record<number, number>>({})
   const [bookmarkKey, setBookmarkKey] = useState('')
   const [textEdit, setTextEdit] = useState<PageTextEdit | null>(null)
@@ -355,17 +481,40 @@ export default function App() {
   const panRef = useRef<{ x: number; y: number; scrollLeft: number; scrollTop: number } | null>(null)
   const editClipboardRef = useRef<EditClipboardPayload | null>(null)
   const [hasEditClipboard, setHasEditClipboard] = useState(false)
-  const [pageHasNativeText, setPageHasNativeText] = useState<boolean | null>(null)
+  // Plain text written to the system clipboard with the in-app payload; a
+  // paste compares it with the clipboard to see whether something newer won.
+  const editClipboardTextRef = useRef<string | null>(null)
+  // What the current page holds (scan, recognised scan, born-digital text…).
+  // Cheap: it reuses pdf.js' text and operator lists of the rendered page.
+  const [pageScanState, setPageScanState] = useState<PageScanState | null>(null)
   useEffect(() => {
     let active = true
-    setPageHasNativeText(null)
-    if (pdf && (tool === 'edit' || tool === 'addText')) {
-      pdf.getPage(pageIndex + 1).then(getPageTextContent).then(content => {
-        if (active) setPageHasNativeText(content.items.some(item => 'str' in item && item.str.trim().length > 0))
-      }).catch(() => { /* Keep normal tools when text detection is unavailable. */ })
+    setPageScanState(null)
+    if (pdf) {
+      pdf.getPage(pageIndex + 1).then(classifyPage).then((state) => {
+        if (active) setPageScanState(state)
+      }).catch(() => { /* Keep normal tools when the page cannot be classified. */ })
     }
     return () => { active = false }
-  }, [pdf, pageIndex, tool])
+  }, [pdf, pageIndex])
+  // Recognize text (OCR): the dialog (and its progress), the Edit-mode offer,
+  // the export check, and what to do once the recognised text is in place.
+  const [ocrDialog, setOcrDialog] = useState<{ scope: OcrScope } | null>(null)
+  const [ocrProgress, setOcrProgress] = useState<OcrRunProgress | null>(null)
+  const [ocrStopping, setOcrStopping] = useState(false)
+  const [ocrOffer, setOcrOffer] = useState<{ pageIndex: number; point: { x: number; y: number }; client: { x: number; y: number } } | null>(null)
+  const [ocrExportPrompt, setOcrExportPrompt] = useState<{ job: PdfExportSubmission; pages: number[] } | null>(null)
+  const [pendingEditAt, setPendingEditAt] = useState<PendingEditAt | null>(null)
+  const ocrAbortRef = useRef<AbortController | null>(null)
+  // Bumped when another document opens: a run still finishing must not apply its text.
+  const ocrRunTokenRef = useRef(0)
+  const ocrLanguageRef = useRef('eng')
+  // Cache keys of freshly recognised pages, bound to the next document proxy.
+  const pendingOcrBindingRef = useRef<Map<number, string> | null>(null)
+  // A text export waiting for its pages to be recognised.
+  const pendingExportRef = useRef<PdfExportSubmission | null>(null)
+  // Pages (per document proxy) where the offer was declined or nothing was found: not offered again.
+  const ocrQuietPagesRef = useRef(new WeakMap<PDFDocumentProxy, Set<number>>())
   const fitRequestGenerationRef = useRef(0)
   const editSelectionGenerationRef = useRef(0)
   const lastSelectedPage = useRef(0)
@@ -377,6 +526,18 @@ export default function App() {
   const pendingDocumentSwapRef = useRef<{ commit: () => void; rollback: () => void } | null>(null)
   const skipPdfLoadForBytesRef = useRef<Uint8Array | null>(null)
   const liveStateRef = useRef({ bytes, overlays, formValues, bookmarks, bookmarksDirty, pageRotations, pageIndex, dirty })
+  // Document revisions: every change gets a new number (see Snapshot.revision).
+  const revisionRef = useRef(0)
+  const revisionCounterRef = useRef(0)
+  // -1: this content has never been saved (for example a converted Word file).
+  const savedRevisionRef = useRef(0)
+  // Ctrl+S pressed while a page operation was running: save once it settles.
+  const pendingSaveRef = useRef<{ forceDialog: boolean } | null>(null)
+  // Steps inside the selected edit (inspector changes, nudges, image tools),
+  // so Ctrl+Z undoes the last of them instead of the whole edit.
+  const pendingEditHistoryRef = useRef<{ past: PendingEditState[]; future: PendingEditState[]; at: number }>({ past: [], future: [], at: 0 })
+  // The form field being typed into, so a word is one undo step, not one per letter.
+  const formEditRef = useRef<{ name: string; at: number } | null>(null)
 
   useEffect(() => {
     liveStateRef.current = { bytes, overlays, formValues, bookmarks, bookmarksDirty, pageRotations, pageIndex, dirty }
@@ -388,12 +549,20 @@ export default function App() {
     dragExportBytesRef.current = null
   }, [bytes, overlays, formValues, bookmarks, bookmarksDirty, pageRotations, textEdit, objectEdit])
 
-  const showToast = useCallback((message: string, action?: string, onAction?: () => void) => {
-    setToast({ message, action, onAction })
+  // A scan edit brought back without its preparation (an undo step taken
+  // before the patch arrived) gets the finished one.
+  useEffect(() => {
+    const key = textEdit?.scan?.status === 'pending' ? textEdit.scan.key : ''
+    const result = key ? scanPreparationResult(key) : undefined
+    if (result) setTextEdit((current) => current?.scan?.key === key ? applyScanPreparation(current, result) : current)
+  }, [textEdit])
+
+  const showToast = useCallback((message: string, action?: string, onAction?: () => void, options: { sticky?: boolean } = {}) => {
+    setToast({ message, action, onAction, sticky: options.sticky })
   }, [])
 
   useEffect(() => {
-    if (!toast) return
+    if (!toast || toast.sticky) return
     const timeout = window.setTimeout(() => setToast(null), 4200)
     return () => window.clearTimeout(timeout)
   }, [toast])
@@ -411,12 +580,24 @@ export default function App() {
     let cancelled = false
     let candidatePdf: PDFDocumentProxy | null = null
     let adopted = false
+    let passwordCancelled = false
     setDocumentLoading(true)
     setDocumentError('')
-    loadPdf(bytes, (updatePassword) => {
-      // Encrypted files are unlocked when opened; this only fires if that failed.
-      setPasswordProtected(true)
-      updatePassword('')
+    loadPdf(bytes, (updatePassword, reason) => {
+      // Encrypted files are decrypted to a copy when they are opened, so this
+      // runs only if that detection missed one. Answering '' again would make
+      // pdf.js ask forever: ask the user instead. The file then opens for
+      // reading only, because it cannot be rewritten while it is encrypted.
+      const respond = updatePassword as (password: string | Error) => void
+      void requestPassword(documentFile?.name || 'This PDF', reason === PDFJS_INCORRECT_PASSWORD).then((password) => {
+        if (cancelled || password === null) {
+          passwordCancelled = true
+          respond(new Error(PASSWORD_CANCELLED))
+          return
+        }
+        setPasswordProtected(true)
+        respond(password)
+      })
     }).then(async (nextPdf) => {
       candidatePdf = nextPdf
       if (cancelled) {
@@ -459,6 +640,10 @@ export default function App() {
         if (pendingSwap) {
           pendingSwap.rollback()
           showToast(`The page change was not applied — ${errorMessage(error)}`)
+        } else if (passwordCancelled) {
+          setDocumentFile(null)
+          setBytes(null)
+          showToast(PASSWORD_CANCELLED)
         } else {
           setDocumentError(errorMessage(error))
         }
@@ -490,6 +675,15 @@ export default function App() {
     if (printPreviewPdf) void printPreviewPdf.destroy()
   }, [printPreviewPdf])
 
+  // Recognised text has just become part of the document: index its pages
+  // under the new proxy, so editing them can reuse the exact word boxes.
+  useEffect(() => {
+    const binding = pendingOcrBindingRef.current
+    if (!pdf || !binding) return
+    pendingOcrBindingRef.current = null
+    for (const [index, contentKey] of binding) bindOcrPage(pdf, index, contentKey)
+  }, [pdf])
+
   useEffect(() => {
     let cancelled = false
     if (!pdf) {
@@ -513,18 +707,11 @@ export default function App() {
     getPdfOutlineBookmarks(pdf).then((outline) => {
       if (cancelled) return
       setBookmarkKey(key)
-      const nativeBookmarks: Bookmark[] = outline.flatMap((item) => item.pageIndex === null ? [] : [{
-        id: item.id,
-        pageIndex: item.pageIndex,
-        label: item.title,
-        depth: item.depth,
-        source: 'document' as const,
-        expanded: item.expanded,
-        bold: item.bold,
-        italic: item.italic,
-        color: item.color,
-        url: item.url,
-      }])
+      setBookmarksReadOnly(false)
+      // Every outline item is kept, including headings and web links that do
+      // not go to a page: saving reuses the document's own items, so an edit
+      // to one bookmark never drops, re-parents or re-targets the others.
+      const nativeBookmarks = bookmarksFromOutline(outline)
       if (nativeBookmarks.length) {
         setBookmarks(nativeBookmarks)
         setBookmarksDirty(false)
@@ -548,6 +735,8 @@ export default function App() {
       if (!cancelled) {
         setBookmarkKey(key)
         setBookmarks([])
+        setBookmarksDirty(false)
+        setBookmarksReadOnly(true)
       }
     })
     return () => { cancelled = true }
@@ -565,6 +754,11 @@ export default function App() {
     })
   }
 
+  function nextRevision() {
+    revisionCounterRef.current += 1
+    return revisionCounterRef.current
+  }
+
   function currentSnapshot(): Snapshot | null {
     const live = liveStateRef.current
     if (!live.bytes) return null
@@ -578,25 +772,19 @@ export default function App() {
       bookmarksDirty: live.bookmarksDirty,
       pageRotations: { ...live.pageRotations },
       pageIndex: live.pageIndex,
-      dirty: live.dirty,
+      revision: revisionRef.current,
     }
   }
 
   function capturePageMutation() {
-    let nextOverlays = overlays
-    let committedPendingEdit = false
-    if (textEdit?.modified) {
-      nextOverlays = upsertTextEdit(nextOverlays, textEdit)
-      committedPendingEdit = true
-    }
-    if (objectEdit?.modified) {
-      nextOverlays = upsertObjectEdit(nextOverlays, objectEdit)
-      committedPendingEdit = true
-    }
+    const committedPendingEdit = Boolean(textEdit?.modified || objectEdit?.modified)
+    const nextOverlays = overlaysWithPendingEdits(overlays, textEdit, objectEdit)
     const snapshot = currentSnapshot()
     if (snapshot && committedPendingEdit) {
+      // The state before the page change, with the selected edit applied: a
+      // state that was never saved, so restoring it shows unsaved changes.
       snapshot.overlays = nextOverlays.map(cloneOverlay)
-      snapshot.dirty = true
+      snapshot.revision = nextRevision()
     }
     return { overlays: nextOverlays, snapshot }
   }
@@ -613,6 +801,10 @@ export default function App() {
     setBytes(previousBytes)
   }
 
+  /**
+   * Record the state before a change. Every document change goes through
+   * here, so this is also where the document gets its new revision.
+   */
   function addUndoSnapshot(snapshot: Snapshot) {
     setUndoStack((current) => {
       const bounded = boundHistoryStack([...current, snapshot])
@@ -621,6 +813,8 @@ export default function App() {
     })
     redoStackRef.current = []
     setRedoStack([])
+    revisionRef.current = nextRevision()
+    formEditRef.current = null
   }
 
   function applySnapshotState(snapshot: Snapshot) {
@@ -631,10 +825,43 @@ export default function App() {
     setPageRotations({ ...snapshot.pageRotations })
     setPageIndex(snapshot.pageIndex)
     setSelectedPages(new Set([snapshot.pageIndex]))
-    setDirty(snapshot.dirty)
+    revisionRef.current = snapshot.revision
+    setDirty(snapshot.revision !== savedRevisionRef.current)
+    formEditRef.current = null
+    resetPendingEditHistory()
     setTextEdit(null)
     setObjectEdit(null)
     setSelectingObjectRegion(false)
+  }
+
+  function resetPendingEditHistory() {
+    pendingEditHistoryRef.current = { past: [], future: [], at: 0 }
+  }
+
+  /**
+   * Remember the selected edit before a discrete change to it (an inspector
+   * control, an arrow-key nudge, an image tool) so Ctrl+Z can take back just
+   * that change. Rapid changes (typing a number, dragging a slider) count as one.
+   */
+  function recordPendingEditStep() {
+    const history = pendingEditHistoryRef.current
+    const now = performance.now()
+    if (!history.past.length || now - history.at > 600) {
+      history.past.push({ textEdit, objectEdit })
+      if (history.past.length > 60) history.past.shift()
+    }
+    history.at = now
+    history.future = []
+  }
+
+  function changeTextEditStep(next: PageTextEdit) {
+    recordPendingEditStep()
+    setTextEdit(next)
+  }
+
+  function changeObjectEditStep(next: PageObjectEdit) {
+    recordPendingEditStep()
+    setObjectEdit(next)
   }
 
   function restoreSnapshot(snapshot: Snapshot, onCommit: () => void) {
@@ -664,10 +891,32 @@ export default function App() {
       return
     }
     if (textEdit?.modified || objectEdit?.modified) {
+      const history = pendingEditHistoryRef.current
+      const step = history.past.pop()
+      if (step) {
+        // Take back only the last change made to the selection.
+        history.future.push({ textEdit, objectEdit })
+        history.at = 0
+        setTextEdit(step.textEdit)
+        setObjectEdit(step.objectEdit)
+        return
+      }
+      // Nothing smaller left to undo: apply the edit as one history step and
+      // undo that step, so Redo brings the whole edit back.
+      const before = currentSnapshot()
+      if (!before) return
+      const applied: Snapshot = {
+        ...before,
+        overlays: overlaysWithPendingEdits(before.overlays, textEdit, objectEdit).map(cloneOverlay),
+        revision: nextRevision(),
+      }
+      redoStackRef.current = [applied]
+      setRedoStack([applied])
+      resetPendingEditHistory()
       setTextEdit(null)
       setObjectEdit(null)
       setSelectingObjectRegion(false)
-      showToast('Undid the current edit')
+      showToast('Undid the edit', 'Redo', () => historyActionsRef.current.redo())
       return
     }
     const previous = undoStackRef.current.at(-1)
@@ -689,8 +938,17 @@ export default function App() {
       showToast('Please wait for the current document operation to finish.')
       return
     }
+    const editFuture = pendingEditHistoryRef.current.future
+    if ((textEdit || objectEdit) && editFuture.length) {
+      const step = editFuture.pop()!
+      pendingEditHistoryRef.current.past.push({ textEdit, objectEdit })
+      pendingEditHistoryRef.current.at = 0
+      setTextEdit(step.textEdit)
+      setObjectEdit(step.objectEdit)
+      return
+    }
     if (textEdit?.modified || objectEdit?.modified) {
-      showToast('Finish or cancel the current edit before redoing document changes.')
+      showToast('Finish the current edit before redoing document changes.')
       return
     }
     const next = redoStackRef.current.at(-1)
@@ -707,26 +965,40 @@ export default function App() {
     })
   }
 
-  function requestPassword(name: string, wrong: boolean) {
-    return new Promise<string | null>((resolve) => {
-      setPasswordDraft('')
-      setPasswordRequest({ name, wrong, resolve })
-    })
-  }
+  // Toast actions run later: they must call the current undo and redo, not
+  // the ones of the render that showed the toast.
+  const historyActionsRef = useRef({ undo, redo })
+  historyActionsRef.current = { undo, redo }
 
-  function looksEncrypted(data: Uint8Array) {
-    const tail = data.subarray(Math.max(0, data.length - 262_144))
-    const marker = [0x2f, 0x45, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74] // "/Encrypt"
-    for (let i = 0; i <= tail.length - marker.length; i++) {
-      if (tail[i] === marker[0] && marker.every((byte, j) => tail[i + j] === byte)) return true
-    }
-    return false
+  /**
+   * Ask for a document's password. The dialog is rendered on the home screen
+   * as well as over a document, so an open never waits on a prompt nobody
+   * can see. A newer request replaces (cancels) an unanswered one.
+   */
+  function requestPassword(name: string, wrong: boolean) {
+    passwordRequestRef.current?.resolve(null)
+    return new Promise<string | null>((resolve) => {
+      const request = {
+        name,
+        wrong,
+        resolve: (password: string | null) => {
+          if (passwordRequestRef.current === request) passwordRequestRef.current = null
+          setPasswordRequest((current) => current === request ? null : current)
+          resolve(password)
+        },
+      }
+      passwordRequestRef.current = request
+      setPasswordDraft('')
+      setPasswordRequest(request)
+    })
   }
 
   async function openPayload(payload: DocumentPayload) {
     let fileBytes = normalizeBytes(payload.data)
     let unlocked = false
-    if (looksEncrypted(fileBytes)) {
+    // Files read by the main process arrive with its whole-file answer.
+    const encrypted = typeof payload.encrypted === 'boolean' ? payload.encrypted : mayBeEncrypted(fileBytes)
+    if (encrypted) {
       let attempt = await window.simple.unlockPdf(fileBytes, '')
       let wrong = false
       while (attempt.status === 'needs-password' || attempt.status === 'wrong-password') {
@@ -746,9 +1018,33 @@ export default function App() {
       // An unlocked copy must never silently overwrite the protected original.
       path: unlocked ? null : payload.path,
       sourcePath: payload.sourcePath ?? payload.path,
-      converted: payload.converted || unlocked,
+      converted: payload.converted,
       signatureDetected: payload.signatureDetected,
+      unlocked,
     }
+    revisionRef.current = 0
+    revisionCounterRef.current = 0
+    // A converted file has never been saved as a PDF; an unlocked copy has
+    // no changes yet (Save still asks where to write it, path is null).
+    savedRevisionRef.current = file.converted ? -1 : 0
+    pendingSaveRef.current = null
+    // A recognition still running belongs to the previous document.
+    ocrRunTokenRef.current += 1
+    abortOcrRun(ocrAbortRef.current)
+    ocrAbortRef.current = null
+    void disposeOcrRuntime().catch(() => {})
+    disposeScanEditWorker()
+    pendingOcrBindingRef.current = null
+    pendingExportRef.current = null
+    setOcrDialog(null)
+    setOcrProgress(null)
+    setOcrStopping(false)
+    setOcrOffer(null)
+    setOcrExportPrompt(null)
+    setPendingEditAt(null)
+    resetPendingEditHistory()
+    setSaveReport(null)
+    setBookmarksReadOnly(false)
     setDocumentFile(file)
     setExportDialogOpen(false)
     closePrintDialog()
@@ -778,16 +1074,25 @@ export default function App() {
     setPendingSignature(null)
     setTool('select')
     rememberFile(file)
-    if (unlocked) showToast('Unlocked for editing — Save writes a new copy without the password')
-    else if (file.converted) showToast('Converted to PDF — save to choose where to keep it')
-    else if (file.signatureDetected) showToast('This PDF is digitally signed. Editing can invalidate its signature.')
+    // Signed and unlocked documents get a persistent one-line notice instead.
+    if (file.converted) showToast('Converted to PDF — save to choose where to keep it')
   }
 
-  function canReplaceCurrent() {
-    return !(dirty || textEdit?.modified || objectEdit?.modified) || window.confirm('This document has unsaved changes. Discard them and open another file?')
+  /** Save / Don't Save / Cancel before another document replaces this one (Save is the default). */
+  async function canReplaceCurrent() {
+    if (!(dirty || textEdit?.modified || objectEdit?.modified)) return true
+    const io = getSimpleIO()
+    if (!io) return window.confirm('This document has unsaved changes. Discard them and open another file?')
+    const answer = await io.prompt(documentFile?.path ? 'prompts.unsaved' : 'prompts.unsaved-untitled', { name: documentFile?.name ?? 'this document', kind: 'PDF' })
+    if (answer === 'dont-save') return true
+    if (answer !== 'save') return false
+    await save(false)
+    return revisionRef.current === savedRevisionRef.current
   }
 
   async function openFile() {
+    // Opening is blocked while a password prompt waits for its answer.
+    if (passwordRequestRef.current) return
     setBusy(documentFile ? 'Opening in a new window…' : 'Opening document…')
     try {
       if (documentFile) {
@@ -804,6 +1109,10 @@ export default function App() {
   }
 
   async function openPath(filePath: string) {
+    if (passwordRequestRef.current && !documentFile) {
+      showToast('Answer or cancel the password prompt first.')
+      return
+    }
     setBusy(documentFile ? 'Opening in a new window…' : 'Opening document…')
     try {
       if (documentFile) {
@@ -832,13 +1141,20 @@ export default function App() {
     event.preventDefault()
     dragDepth.current = 0
     setIsDragging(false)
-    if (!canReplaceCurrent()) return
+    if (passwordRequestRef.current) return
+    if (!(await canReplaceCurrent())) return
     const files = Array.from(event.dataTransfer.files)
     const file = files[0]
     if (!file) return
     setBusy('Opening document…')
     try {
-      const payload = await window.simple.openBytes(file.name, await file.arrayBuffer())
+      // A file dropped from disk opens by its path, exactly like Open: Save
+      // writes back to it and it joins Recent files. Files without one
+      // (dragged out of a browser or an archive) open from their bytes.
+      const filePath = window.simple.getPathForFile?.(file) || ''
+      const payload = filePath
+        ? await window.simple.openPath(filePath)
+        : await window.simple.openBytes(file.name, await file.arrayBuffer())
       await openPayload(payload)
       if (files.length > 1) showToast(`Opened ${file.name} — ${files.length - 1} more ${files.length === 2 ? 'file' : 'files'} ignored`)
     } catch (error) {
@@ -849,67 +1165,152 @@ export default function App() {
   }
 
   async function preparedBytes() {
-    if (!bytes) throw new Error('No PDF is open.')
-    let outputOverlays = overlays
-    if (textEdit?.modified) outputOverlays = upsertTextEdit(outputOverlays, textEdit)
-    if (objectEdit?.modified) outputOverlays = upsertObjectEdit(outputOverlays, objectEdit)
-    const hasRotations = Object.values(pageRotations).some((amount) => amount % 360 !== 0)
-    if (!outputOverlays.length && !Object.keys(formValues).length && !hasRotations && !bookmarksDirty) return bytes
-    return normalizeBytes(await window.simple.flattenOverlays(bytes, outputOverlays, formValues, {
-      ...(hasRotations ? { pageRotations } : {}),
-      ...(bookmarksDirty ? { bookmarks } : {}),
-    }))
+    const output = await prepareOutput()
+    const blocking = blockingProblems(output)
+    // Print, export and page drags never hand out a file that silently lacks an edit.
+    if (blocking.length) throw new Error(`Some changes cannot be written: ${summarizeProblems(blocking)}`)
+    return output.data
   }
 
-  async function save(forceDialog = false) {
+  /**
+   * The document as it would be written: the unchanged base plus every edit,
+   * including the one selected on the page. The main process reports what it
+   * could not write exactly as asked (form fields, text that does not fit…)
+   * instead of dropping it.
+   */
+  async function prepareOutput(state = {
+    overlays: overlaysWithPendingEdits(overlays, textEdit, objectEdit),
+    formValues,
+    pageRotations,
+    bookmarks,
+    bookmarksDirty,
+  }): Promise<PreparedOutput> {
+    if (!bytes) throw new Error('No PDF is open.')
+    // An edit of scanned text committed before its patch was ready waits for
+    // it here (briefly): the file never gets new text over the old words.
+    state = { ...state, overlays: await settleScanOverlays(state.overlays) }
+    const hasRotations = Object.values(state.pageRotations).some((amount) => amount % 360 !== 0)
+    if (!state.overlays.length && !Object.keys(state.formValues).length && !hasRotations && !state.bookmarksDirty) {
+      return { data: bytes, warnings: [], failures: [], signatureDetected: false }
+    }
+    const report: FlattenReport = await window.simple.flattenOverlays(bytes, state.overlays, state.formValues, {
+      ...(hasRotations ? { pageRotations: state.pageRotations } : {}),
+      ...(state.bookmarksDirty ? { bookmarks: state.bookmarks } : {}),
+      report: true,
+    })
+    return {
+      data: normalizeBytes(report.data),
+      warnings: Array.isArray(report.warnings) ? report.warnings : [],
+      failures: Array.isArray(report.failures) ? report.failures : [],
+      signatureDetected: report.signatureDetected === true,
+    }
+  }
+
+  /** Ctrl+S during a page operation saves as soon as it settles; it is never ignored. */
+  function queueSave(forceDialog: boolean) {
+    pendingSaveRef.current = { forceDialog: Boolean(pendingSaveRef.current?.forceDialog || forceDialog) }
+    showToast('Will save when the current operation finishes')
+  }
+
+  async function save(forceDialog = false, acceptProblems = false) {
     if (!documentFile || !bytes) return
-    if (documentOperationRef.current) {
-      showToast('Please wait for the current document operation to finish.')
+    if (passwordRequestRef.current) return
+    if (documentOperationRef.current || documentUpdating) {
+      queueSave(forceDialog)
       return
     }
-    if (passwordProtected && dirty) {
-      showToast('Password-protected PDFs are read-only in this version.')
+    if (passwordProtected && (dirty || textEdit?.modified || objectEdit?.modified)) {
+      showToast('This protected PDF is open for reading only, so changes cannot be saved.')
       return
     }
-    if (documentFile.signatureDetected && dirty && !window.confirm('Saving edits can invalidate this PDF’s digital signature. Continue with Save As?')) return
+    setSaveReport(null)
+    // What is being saved: every edit, with the one selected on the page
+    // applied first as an undoable step (exactly as clicking away applies it).
+    const state = {
+      overlays: overlaysWithPendingEdits(overlays, textEdit, objectEdit),
+      formValues,
+      pageRotations,
+      bookmarks,
+      bookmarksDirty,
+    }
+    commitPendingEdits(false)
+    // Typing after the save starts a new undo step.
+    formEditRef.current = null
+    const savedRevision = revisionRef.current
     documentOperationRef.current = true
     setBusy('Saving PDF…')
     try {
-      let retainedOverlays = overlays
-      if (textEdit?.modified) retainedOverlays = upsertTextEdit(retainedOverlays, textEdit)
-      if (objectEdit?.modified) retainedOverlays = upsertObjectEdit(retainedOverlays, objectEdit)
-      const outputBytes = await preparedBytes()
+      const output = await prepareOutput(state)
+      const blocking = blockingProblems(output)
+      if (blocking.length && !acceptProblems) {
+        // Nothing is written yet; the user decides (the edits stay in the document either way).
+        setSaveReport({
+          kind: 'blocked',
+          problems: blocking,
+          onSaveAnyway: () => {
+            setSaveReport(null)
+            // The current save(), not this render's: the edit selected then is committed now.
+            void saveRef.current(forceDialog, true)
+          },
+        })
+        return
+      }
+      // A signed original is never overwritten: Save writes a copy beside it.
+      const signed = documentFile.signatureDetected || output.signatureDetected
       const result = await window.simple.savePdf({
-        data: outputBytes,
-        path: documentFile.signatureDetected ? null : documentFile.path,
-        name: documentFile.name,
-        forceDialog: forceDialog || documentFile.signatureDetected,
+        data: output.data,
+        path: signed ? null : documentFile.path,
+        name: signed ? signedCopyName(documentFile) : documentFile.name,
+        forceDialog: forceDialog || signed,
       })
       if (!result) return
       // Keep the immutable editing base plus the logical overlays in memory.
       // Every later save is regenerated from that base, so a long edit session
       // never feeds already-flattened covers/replacements back into itself.
-      const nextFile = { ...documentFile, bytes, path: result.path, name: result.name, converted: false, signatureDetected: false }
-      const nextBookmarkKey = bookmarkStorageKey(result.path, pdf?.fingerprints?.[0] || `${result.name}:${outputBytes.byteLength}`)
+      const nextFile: OpenDocument = { ...documentFile, bytes, path: result.path, name: result.name, converted: false, signatureDetected: false, unlocked: false }
+      const nextBookmarkKey = bookmarkStorageKey(result.path, pdf?.fingerprints?.[0] || `${result.name}:${output.data.byteLength}`)
       if (bookmarkKey && bookmarkKey !== nextBookmarkKey) localStorage.removeItem(bookmarkKey)
       setBookmarkKey(nextBookmarkKey)
       setDocumentFile(nextFile)
-      setOverlays(retainedOverlays)
-      setTextEdit(null)
-      setObjectEdit(null)
-      setSelectingObjectRegion(false)
-      setDirty(false)
-      setUndoStack([])
-      setRedoStack([])
+      // Undo and Redo survive a save. The document is clean only when every
+      // edit was written and nothing changed while the file was being written.
+      if (!blocking.length) {
+        savedRevisionRef.current = savedRevision
+        if (revisionRef.current === savedRevision) setDirty(false)
+      }
       rememberFile(nextFile)
-      showToast('Saved successfully', 'Show file', () => window.simple.showItem(result.path))
+      const notes = output.warnings.filter((warning) => !warning.dataLoss)
+      const showFile = () => window.simple.showItem(result.path)
+      if (blocking.length) {
+        showToast(`Saved without ${blocking.length === 1 ? '1 change' : `${blocking.length} changes`}; they are still unsaved here`, 'Details', () => setSaveReport({ kind: 'partial', problems: blocking }), { sticky: true })
+      } else if (notes.length) {
+        showToast(`Saved with ${notes.length === 1 ? 'a note' : `${notes.length} notes`}: ${summarizeProblems(notes)}`, 'Details', () => setSaveReport({ kind: 'notes', problems: notes }), { sticky: true })
+      } else if (signed || result.keptSignedOriginal) {
+        showToast('Saved as a copy; the signed original was not changed', 'Show file', showFile)
+      } else {
+        showToast('Saved successfully', 'Show file', showFile)
+      }
     } catch (error) {
-      showToast(errorMessage(error))
+      showToast(`Not saved: ${errorMessage(error)}`, undefined, undefined, { sticky: true })
     } finally {
       documentOperationRef.current = false
       setBusy('')
     }
   }
+
+  const saveRef = useRef(save)
+  saveRef.current = save
+
+  useEffect(() => {
+    const pending = pendingSaveRef.current
+    if (!pending || busy || documentUpdating || documentLoading || documentOperationRef.current) return
+    pendingSaveRef.current = null
+    if (!pending.forceDialog && !dirty && !textEdit?.modified && !objectEdit?.modified) return
+    void save(pending.forceDialog)
+    // Runs when an operation settles (a recognition that found nothing to
+    // add ends without one); save() reads the latest state itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, documentUpdating, documentLoading, ocrProgress])
 
   async function mutate(
     operation: Record<string, unknown>,
@@ -959,6 +1360,194 @@ export default function App() {
 
   function targetPages() {
     return selectedPages.size ? [...selectedPages].sort((a, b) => a - b) : [pageIndex]
+  }
+
+  /** Pages on screen keep their decoded images (image selection reuses them); others are released after reading. */
+  function canReleasePage(index: number) {
+    return !viewerRef.current?.querySelector(`.continuous-page-slot[data-page-index="${index}"] .page-surface`)
+  }
+
+  function openOcrDialog(scope: OcrScope = 'needed') {
+    if (!pdf || !bytes) return
+    if (passwordProtected) {
+      showToast('Password-protected PDFs are read-only in this version.')
+      return
+    }
+    if (documentOperationRef.current) {
+      showToast('Please wait for the current document operation to finish.')
+      return
+    }
+    setOcrOffer(null)
+    setOcrDialog({ scope })
+  }
+
+  function quietOcrPages(source: PDFDocumentProxy, indices: number[]) {
+    let pages = ocrQuietPagesRef.current.get(source)
+    if (!pages) ocrQuietPagesRef.current.set(source, pages = new Set())
+    for (const index of indices) pages.add(index)
+  }
+
+  /**
+   * Recognize text: read the pages, then write their text into the document
+   * as an invisible layer (one undoable change, like every page operation).
+   * The selected edit is applied with it and stays an edit. Stop keeps the
+   * pages finished so far. `editAt` reopens the clicked line afterwards (the
+   * Edit-mode offer); `exportJob` continues a text export.
+   */
+  async function recognizeText(request: OcrDialogRequest & { editAt?: { pageIndex: number; x: number; y: number }; exportJob?: PdfExportSubmission }) {
+    if (!pdf || !bytes || !documentFile) return
+    if (passwordProtected) {
+      showToast('Password-protected PDFs are read-only in this version.')
+      return
+    }
+    if (documentOperationRef.current) {
+      showToast('Please wait for the current document operation to finish.')
+      return
+    }
+    const sourcePdf = pdf
+    const sourceBytes = bytes
+    const token = ++ocrRunTokenRef.current
+    const controller = new AbortController()
+    ocrAbortRef.current = controller
+    ocrLanguageRef.current = request.language
+    const captured = capturePageMutation()
+    documentOperationRef.current = true
+    setOcrOffer(null)
+    setOcrStopping(false)
+    setOcrDialog((current) => current ?? { scope: request.scope })
+    setOcrProgress({ phase: 'checking', done: 0, total: request.pages.length, fraction: 0 })
+    let outcome: OcrRunOutcome | null = null
+    let failure: unknown = null
+    let lastProgress = { at: 0, phase: '', done: -1 }
+    try {
+      outcome = await runOcr(sourcePdf, {
+        pages: request.pages,
+        explicit: request.explicit,
+        language: request.language,
+        replaceExisting: request.replaceExisting,
+        pageRotations: { ...liveStateRef.current.pageRotations },
+        signal: controller.signal,
+        canReleasePage,
+        onProgress: (progress) => {
+          if (ocrRunTokenRef.current !== token) return
+          // At most ten updates a second: rendering the app is not free while pages are read.
+          const now = performance.now()
+          if (now - lastProgress.at < 100 && progress.phase === lastProgress.phase && progress.done === lastProgress.done) return
+          lastProgress = { at: now, phase: progress.phase, done: progress.done }
+          setOcrProgress(progress)
+        },
+      })
+    } catch (error) {
+      failure = error
+    } finally {
+      if (ocrAbortRef.current === controller) ocrAbortRef.current = null
+    }
+    // Another document was opened meanwhile; it has reset the guard and the dialog.
+    if (ocrRunTokenRef.current !== token) return
+    documentOperationRef.current = false
+    setOcrProgress(null)
+    setOcrStopping(false)
+    setOcrDialog(null)
+    if (!outcome) {
+      showToast(`Text was not recognized — ${errorMessage(failure)}`, undefined, undefined, { sticky: true })
+      return
+    }
+    if (liveStateRef.current.bytes !== sourceBytes) return
+    const operation = outcome.operation
+    if (!operation) {
+      // Pages without any text are not offered again for this document.
+      quietOcrPages(sourcePdf, outcome.results.filter((result) => result.wordCount === 0).map((result) => result.pageIndex))
+      if (outcome.fatal) showToast(outcome.fatal.message, undefined, undefined, { sticky: true })
+      else showToast(summarizeOcrRun(outcome, false).message)
+      const job = request.exportJob
+      if (job && !outcome.fatal) window.setTimeout(() => { void runExportAsRef.current(job, { skipScanCheck: true }) }, 0)
+      return
+    }
+    const summary = summarizeOcrRun(outcome, true)
+    const message = outcome.fatal ? `${summary.message} · ${outcome.fatal.message}` : summary.message
+    const contentKeys = outcome.contentKeys
+    // A live selection freezes text-layer rebuilds; the new text must replace the old spans.
+    window.getSelection()?.removeAllRanges()
+    await mutate(operation as unknown as Record<string, unknown>, 'Adding recognized text…', () => {
+      finishPageMutation(captured.overlays)
+      pendingOcrBindingRef.current = contentKeys
+      if (summary.sideways.length) showToast(message, 'Rotate', () => rotatePagesUpright(summary.sideways))
+      else showToast(message, 'Undo', () => historyActionsRef.current.undo())
+      if (request.editAt) setPendingEditAt({ ...request.editAt, token: Date.now() })
+      if (request.exportJob) pendingExportRef.current = request.exportJob
+    }, captured.snapshot)
+  }
+
+  function stopOcr() {
+    const controller = ocrAbortRef.current
+    if (!controller || controller.signal.aborted) return
+    setOcrStopping(true)
+    controller.abort()
+  }
+
+  /** A click in Edit mode on a scanned page without text: offer to recognise it (or just do it). */
+  function requestOcrOffer(index: number, point: { x: number; y: number }, client: { x: number; y: number }) {
+    if (!pdf || passwordProtected || documentOperationRef.current) return
+    if (ocrQuietPagesRef.current.get(pdf)?.has(index)) return
+    setPageIndex(index)
+    setSelectedPages(new Set([index]))
+    lastSelectedPage.current = index
+    if (readAutoOcr()) {
+      void recognizeText({ scope: 'current', pages: [index], explicit: true, language: ocrLanguageRef.current, replaceExisting: false, editAt: { pageIndex: index, ...point } })
+      return
+    }
+    setOcrOffer({ pageIndex: index, point, client })
+    // Most offers are accepted: start the engine while the offer is read.
+    void warmUpOcr(ocrLanguageRef.current)
+  }
+
+  function acceptOcrOffer(automatically: boolean) {
+    const offer = ocrOffer
+    if (!offer) return
+    if (automatically) writeAutoOcr(true)
+    void recognizeText({ scope: 'current', pages: [offer.pageIndex], explicit: true, language: ocrLanguageRef.current, replaceExisting: false, editAt: { pageIndex: offer.pageIndex, ...offer.point } })
+  }
+
+  function declineOcrOffer() {
+    if (ocrOffer && pdf) quietOcrPages(pdf, [ocrOffer.pageIndex])
+    setOcrOffer(null)
+  }
+
+  /** Turn pages that were recognised sideways upright on screen (the toast's Rotate). */
+  function rotatePagesUpright(items: Array<{ pageIndex: number; degrees: number }>) {
+    if (documentOperationRef.current) {
+      showToast('Please wait for the current document operation to finish.')
+      return
+    }
+    if (passwordProtected) {
+      showToast('Password-protected PDFs are read-only in this version.')
+      return
+    }
+    window.getSelection()?.removeAllRanges()
+    const captured = capturePageMutation()
+    if (captured.snapshot) addUndoSnapshot(captured.snapshot)
+    finishPageMutation(captured.overlays)
+    setPageRotations((current) => {
+      const next = { ...current }
+      for (const { pageIndex: index, degrees } of items) {
+        const amount = (((next[index] || 0) + degrees) % 360 + 360) % 360
+        if (amount) next[index] = amount
+        else delete next[index]
+      }
+      return next
+    })
+    setDirty(true)
+    showToast(`${items.length === 1 ? 'Page' : `${items.length} pages`} rotated`, 'Undo', () => historyActionsRef.current.undo())
+  }
+
+  /** Pages among these that are scans without any text (they would export empty). */
+  async function scannedPagesIn(source: PDFDocumentProxy, indices: number[]) {
+    const scanned: number[] = []
+    for (const index of indices) {
+      const page = await source.getPage(index + 1)
+      if (await pageNeedsOcr(page, { release: canReleasePage(index) })) scanned.push(index)
+    }
+    return scanned
   }
 
   async function resolveHasInteractiveForms() {
@@ -1038,7 +1627,7 @@ export default function App() {
         }
         return next
       })
-      setBookmarks((current) => current.map((bookmark) => ({ ...bookmark, pageIndex: bookmark.pageIndex + before(bookmark.pageIndex) })))
+      setBookmarks((current) => remapBookmarkPages(current, (index) => index + before(index)))
       const duplicatedIndices = indices.map((index) => index + through(index))
       setPageIndex(duplicatedIndices[0])
       setSelectedPages(new Set(duplicatedIndices))
@@ -1059,7 +1648,7 @@ export default function App() {
         const index = Number(rawIndex)
         return [index >= insertIndex ? index + 1 : index, amount]
       })))
-      setBookmarks((current) => current.map((bookmark) => ({ ...bookmark, pageIndex: bookmark.pageIndex >= insertIndex ? bookmark.pageIndex + 1 : bookmark.pageIndex })))
+      setBookmarks((current) => remapBookmarkPages(current, (index) => index >= insertIndex ? index + 1 : index))
       setPageIndex(insertIndex)
       setSelectedPages(new Set([insertIndex]))
       showToast('Blank page added')
@@ -1081,10 +1670,8 @@ export default function App() {
         const mapped = remapAfterDelete(overlay.pageIndex, indices)
         return mapped === null ? [] : [{ ...overlay, pageIndex: mapped }]
       }))
-      setBookmarks((current) => current.flatMap((bookmark) => {
-        const mapped = remapAfterDelete(bookmark.pageIndex, indices)
-        return mapped === null ? [] : [{ ...bookmark, pageIndex: mapped }]
-      }))
+      // Mirrors how the main process pruned the document's outline.
+      setBookmarks((current) => bookmarksAfterPageDelete(current, indices))
       setPageRotations((current) => Object.fromEntries(Object.entries(current).flatMap(([rawIndex, amount]) => {
         const mapped = remapAfterDelete(Number(rawIndex), indices)
         return mapped === null ? [] : [[mapped, amount]]
@@ -1092,7 +1679,7 @@ export default function App() {
       const nextPage = clamp(pageIndex - indices.filter((index) => index < pageIndex).length, 0, pdf.numPages - indices.length - 1)
       setPageIndex(nextPage)
       setSelectedPages(new Set([nextPage]))
-      showToast(`${indices.length === 1 ? 'Page' : `${indices.length} pages`} deleted`, 'Undo', undo)
+      showToast(`${indices.length === 1 ? 'Page' : `${indices.length} pages`} deleted`, 'Undo', () => historyActionsRef.current.undo())
     }, captured.snapshot)
   }
 
@@ -1109,12 +1696,12 @@ export default function App() {
       const mapIndex = (oldIndex: number) => order.indexOf(oldIndex)
       finishPageMutation(captured.overlays.map((overlay) => ({ ...overlay, pageIndex: mapIndex(overlay.pageIndex) })))
       setPageRotations((current) => Object.fromEntries(Object.entries(current).map(([rawIndex, amount]) => [mapIndex(Number(rawIndex)), amount])))
-      setBookmarks((current) => current.map((bookmark) => ({ ...bookmark, pageIndex: mapIndex(bookmark.pageIndex) })))
+      setBookmarks((current) => remapBookmarkPages(current, mapIndex))
       const moved = moving.map(mapIndex).sort((a, b) => a - b)
       setPageIndex(moved[0])
       setSelectedPages(new Set(moved))
       lastSelectedPage.current = moved.at(-1) ?? moved[0]
-      showToast(moved.length === 1 ? `Page moved to position ${moved[0] + 1}` : `${moved.length} pages moved to position ${moved[0] + 1}`, 'Undo', undo)
+      showToast(moved.length === 1 ? `Page moved to position ${moved[0] + 1}` : `${moved.length} pages moved to position ${moved[0] + 1}`, 'Undo', () => historyActionsRef.current.undo())
     }, captured.snapshot)
   }
 
@@ -1130,14 +1717,7 @@ export default function App() {
     }
     if (!(await confirmFormSensitiveOperation('Adding pages'))) return
     const insertIndex = pageIndex + 1
-    let sourceOverlays = overlays
-    if (textEdit?.modified) sourceOverlays = upsertTextEdit(sourceOverlays, textEdit)
-    if (objectEdit?.modified) sourceOverlays = upsertObjectEdit(sourceOverlays, objectEdit)
-    const snapshot = currentSnapshot()
-    if (snapshot && (textEdit?.modified || objectEdit?.modified)) {
-      snapshot.overlays = sourceOverlays.map(cloneOverlay)
-      snapshot.dirty = true
-    }
+    const { overlays: sourceOverlays, snapshot } = capturePageMutation()
     documentOperationRef.current = true
     setDocumentUpdating(true)
     let awaitingSwap = false
@@ -1153,7 +1733,7 @@ export default function App() {
             const index = Number(rawIndex)
             return [index >= insertIndex ? index + result.added : index, amount]
           })))
-          setBookmarks((current) => current.map((bookmark) => ({ ...bookmark, pageIndex: bookmark.pageIndex >= insertIndex ? bookmark.pageIndex + result.added : bookmark.pageIndex })))
+          setBookmarks((current) => remapBookmarkPages(current, (index) => index >= insertIndex ? index + result.added : index))
           setPageIndex(insertIndex)
           const insertedPages = Array.from({ length: result.added }, (_, offset) => insertIndex + offset)
           setSelectedPages(new Set(insertedPages))
@@ -1190,14 +1770,7 @@ export default function App() {
       return
     }
     if (!(await confirmFormSensitiveOperation('Adding pages'))) return
-    let sourceOverlays = overlays
-    if (textEdit?.modified) sourceOverlays = upsertTextEdit(sourceOverlays, textEdit)
-    if (objectEdit?.modified) sourceOverlays = upsertObjectEdit(sourceOverlays, objectEdit)
-    const snapshot = currentSnapshot()
-    if (snapshot && (textEdit?.modified || objectEdit?.modified)) {
-      snapshot.overlays = sourceOverlays.map(cloneOverlay)
-      snapshot.dirty = true
-    }
+    const { overlays: sourceOverlays, snapshot } = capturePageMutation()
     documentOperationRef.current = true
     setDocumentUpdating(true)
     let awaitingSwap = false
@@ -1218,10 +1791,7 @@ export default function App() {
             const index = Number(rawIndex)
             return [index >= insertIndex ? index + result.added : index, amount]
           })))
-          setBookmarks((current) => current.map((bookmark) => ({
-            ...bookmark,
-            pageIndex: bookmark.pageIndex >= insertIndex ? bookmark.pageIndex + result.added : bookmark.pageIndex,
-          })))
+          setBookmarks((current) => remapBookmarkPages(current, (index) => index >= insertIndex ? index + result.added : index))
           setPageIndex(insertIndex)
           const insertedPages = Array.from({ length: result.added }, (_, offset) => insertIndex + offset)
           setSelectedPages(new Set(insertedPages))
@@ -1298,11 +1868,31 @@ export default function App() {
     }
   }
 
-  async function runExportAs(job: PdfExportSubmission) {
+  async function runExportAs(job: PdfExportSubmission, options: { skipScanCheck?: boolean } = {}) {
     if (!bytes || !documentFile || !pdf) return
     if (documentOperationRef.current) {
       showToast('Please wait for the current document operation to finish.')
       return
+    }
+    const textExport = job.format === 'docx' || job.format === 'txt' || job.format === 'md' || job.format === 'html'
+    if (textExport && !options.skipScanCheck && !passwordProtected) {
+      // Scanned pages would export empty: offer to recognise their text first.
+      setExportDialogOpen(false)
+      documentOperationRef.current = true
+      setBusy('Checking for scanned pages…')
+      let scanned: number[] = []
+      try {
+        scanned = await scannedPagesIn(pdf, job.pageIndices)
+      } catch {
+        scanned = []
+      } finally {
+        documentOperationRef.current = false
+        setBusy('')
+      }
+      if (scanned.length) {
+        setOcrExportPrompt({ job, pages: scanned })
+        return
+      }
     }
     const fullDocument = job.pageIndices.length === pdf.numPages
       && job.pageIndices.every((index, position) => index === position)
@@ -1385,6 +1975,17 @@ export default function App() {
       setBusy('')
     }
   }
+
+  const runExportAsRef = useRef(runExportAs)
+  runExportAsRef.current = runExportAs
+
+  // A text export waiting for its scanned pages: continue once the recognised text is in place.
+  useEffect(() => {
+    const job = pendingExportRef.current
+    if (!job || busy || documentUpdating || documentLoading || documentOperationRef.current) return
+    pendingExportRef.current = null
+    void runExportAsRef.current(job, { skipScanCheck: true })
+  }, [busy, documentUpdating, documentLoading, pdf])
 
   function closePrintDialog() {
     setPrintDialogOpen(false)
@@ -1550,34 +2151,80 @@ export default function App() {
     showToast('Rectangle added')
   }
 
+  // Typing into one text field is one undoable step until another field (or
+  // anything else) changes or the typing pauses; each choice is its own step.
+  function changeFormValue(name: string, value: PdfFormValue) {
+    if (passwordProtected) {
+      showToast('Password-protected PDFs are read-only in this version.')
+      return
+    }
+    const now = performance.now()
+    const last = formEditRef.current
+    if (typeof value === 'string' && last?.name === name && now - last.at < 1500) {
+      // Still the same step, but a different document state.
+      revisionRef.current = nextRevision()
+    } else {
+      const snapshot = currentSnapshot()
+      if (snapshot) addUndoSnapshot(snapshot)
+    }
+    formEditRef.current = typeof value === 'string' ? { name, at: now } : null
+    setFormValues((current) => ({ ...current, [name]: value }))
+    setDirty(true)
+  }
+
   function commitTextEditValue(edit: PageTextEdit, announce = true) {
+    resetPendingEditHistory()
     if (passwordProtected) {
       setTextEdit(null)
       showToast('Password-protected PDFs are read-only in this version.')
       return
     }
-    if (!edit.modified) {
+    // An unchanged selection, or an added box left empty, changes nothing.
+    if (!edit.modified || (isEmptyAddedText(edit) && !edit.overlayId)) {
+      setTextEdit(null)
+      return
+    }
+    // Scanned text typed back to what the page says: nothing to add (an
+    // earlier edit of the line is taken back, as an undoable step).
+    const unchangedScan = Boolean(edit.scan) && finalizeScanEdit(edit).kind === 'none'
+    if (unchangedScan && !edit.overlayId) {
       setTextEdit(null)
       return
     }
     const snapshot = currentSnapshot()
     if (snapshot) addUndoSnapshot(snapshot)
-    setOverlays((current) => {
-      if (!edit.text && !edit.cover) {
-        return edit.overlayId ? current.filter((overlay) => overlay.id !== edit.overlayId) : current
-      }
-      return upsertTextEdit(current, edit)
-    })
+    setOverlays((current) => overlaysWithPendingEdits(current, edit, null))
     setTextEdit(null)
     setDirty(true)
-    if (announce) showToast(edit.text ? (edit.cover ? 'Text updated' : 'Text added') : 'Text removed')
+    if (announce) showToast(unchangedScan ? 'Scanned text restored' : edit.text ? (edit.cover ? 'Text updated' : 'Text added') : 'Text removed')
   }
 
   function commitTextEdit() {
     if (textEdit) commitTextEditValue(textEdit)
   }
 
+  /**
+   * An edit of scanned text finished preparing: its retouch patch, word
+   * boxes and matched style go into the edit on the page and into an edit of
+   * that line committed meanwhile (not an undo step: it completes the edit).
+   */
+  function mergeScanPreparation(key: string, result: ScanPreparation) {
+    setTextEdit((current) => current?.scan?.key === key ? applyScanPreparation(current, result) : current)
+    setOverlays((current) => {
+      if (!current.some((overlay) => overlay.type === 'text' && overlay.scan?.key === key && overlay.scan.status === 'pending')) return current
+      return current.map((overlay) => {
+        if (overlay.type !== 'text' || overlay.scan?.key !== key || overlay.scan.status !== 'pending') return overlay
+        const merged = applyScanPreparation(overlay, result)
+        const finalized = finalizeScanEdit({ ...merged, originalText: merged.originalText ?? '', modified: true })
+        return finalized.kind === 'edit'
+          ? { ...merged, rect: finalized.edit.rect, baselineOffset: finalized.edit.baselineOffset, scan: finalized.edit.scan } as TextOverlay
+          : merged
+      })
+    })
+  }
+
   function commitObjectEditValue(edit: PageObjectEdit, announce = true) {
+    resetPendingEditHistory()
     if (passwordProtected) {
       setObjectEdit(null)
       showToast('Password-protected PDFs are read-only in this version.')
@@ -1599,10 +2246,23 @@ export default function App() {
     if (objectEdit) commitObjectEditValue(objectEdit)
   }
 
+  /**
+   * Apply whatever is selected on the page (typed text, a moved image, a
+   * placed signature) as one undoable step, the way clicking elsewhere does.
+   * Escape, Save and page changes use this, so an edit is never thrown away.
+   */
+  function commitPendingEdits(announce = false) {
+    editSelectionGenerationRef.current += 1
+    if (textEdit) commitTextEditValue(textEdit, announce)
+    if (objectEdit) commitObjectEditValue(objectEdit, announce)
+    setSelectingObjectRegion(false)
+  }
+
   function beginTextEdit(edit: PageTextEdit) {
     editSelectionGenerationRef.current += 1
     if (textEdit && textEdit !== edit) commitTextEditValue(textEdit, false)
     if (objectEdit) commitObjectEditValue(objectEdit, false)
+    resetPendingEditHistory()
     setObjectEdit(null)
     setSelectingObjectRegion(false)
     setPageIndex(edit.pageIndex)
@@ -1615,6 +2275,7 @@ export default function App() {
     editSelectionGenerationRef.current += 1
     if (textEdit) commitTextEditValue(textEdit, false)
     if (objectEdit && objectEdit !== edit) commitObjectEditValue(objectEdit, false)
+    resetPendingEditHistory()
     setTextEdit(null)
     setSelectingObjectRegion(false)
     setPageIndex(edit.pageIndex)
@@ -1623,11 +2284,27 @@ export default function App() {
     setTool('edit')
   }
 
+  /**
+   * The inspector's Cancel, the one explicit way to discard the selected
+   * edit. Even that can be taken back: the discarded edit waits on Redo.
+   */
   function cancelEditSelection() {
+    const before = textEdit?.modified || objectEdit?.modified ? currentSnapshot() : null
+    if (before) {
+      const applied: Snapshot = {
+        ...before,
+        overlays: overlaysWithPendingEdits(before.overlays, textEdit, objectEdit).map(cloneOverlay),
+        revision: nextRevision(),
+      }
+      redoStackRef.current = [applied]
+      setRedoStack([applied])
+    }
     editSelectionGenerationRef.current += 1
+    resetPendingEditHistory()
     setTextEdit(null)
     setObjectEdit(null)
     setSelectingObjectRegion(false)
+    if (before) showToast('Edit discarded', 'Undo', () => historyActionsRef.current.redo())
   }
 
   function deleteEditSelection() {
@@ -1741,7 +2418,7 @@ export default function App() {
     try {
       const picked = await window.simple.pickImage()
       if (!picked) return
-      setObjectEdit({
+      changeObjectEditStep({
         ...objectEdit,
         // The picked pixels are upright as displayed; store them in unrotated
         // PDF orientation like every other object image.
@@ -1763,7 +2440,7 @@ export default function App() {
       const centerY = objectEdit.rect.y + objectEdit.rect.height / 2
       const width = objectEdit.rect.height
       const height = objectEdit.rect.width
-      setObjectEdit({
+      changeObjectEditStep({
         ...objectEdit,
         dataUrl: rotated,
         rect: { x: centerX - width / 2, y: centerY - height / 2, width, height },
@@ -1781,7 +2458,7 @@ export default function App() {
       const storedDirection = sideways
         ? (direction === 'horizontal' ? 'vertical' : 'horizontal')
         : direction
-      setObjectEdit({
+      changeObjectEditStep({
         ...objectEdit,
         dataUrl: await flipImageData(objectEdit.dataUrl, storedDirection),
         modified: true,
@@ -1793,9 +2470,9 @@ export default function App() {
 
   function duplicateObject() {
     if (!objectEdit?.dataUrl) return
-    editClipboardRef.current = copyPageEditSelection(null, objectEdit)
-    setHasEditClipboard(true)
-    void pasteCurrentEditClipboard()
+    // Duplicate pastes a private copy and leaves the clipboard alone.
+    const payload = copyPageEditSelection(null, objectEdit)
+    if (payload) void pasteCurrentEditClipboard(payload)
   }
 
   function copyCurrentEdit(removeAfterCopy = false) {
@@ -1803,15 +2480,16 @@ export default function App() {
     if (!payload) return false
     editClipboardRef.current = payload
     setHasEditClipboard(true)
-    const plainText = payload.kind === 'text' ? payload.edit.text : payload.edit.label
+    const plainText = editClipboardPlainText(payload)
+    editClipboardTextRef.current = plainText
     void navigator.clipboard?.writeText(plainText).catch(() => {})
     if (removeAfterCopy) deleteEditSelection()
     else showToast(`${payload.kind === 'text' ? 'Text box' : payload.edit.label} copied`)
     return true
   }
 
-  async function pasteCurrentEditClipboard() {
-    if (!pdf || !editClipboardRef.current) return false
+  async function pasteCurrentEditClipboard(source: EditClipboardPayload | null = editClipboardRef.current) {
+    if (!pdf || !source) return false
     try {
       const targetPage = await pdf.getPage(pageIndex + 1)
       const view = targetPage.view
@@ -1821,7 +2499,7 @@ export default function App() {
         width: Math.abs(view[2] - view[0]),
         height: Math.abs(view[3] - view[1]),
       }
-      const payload = editClipboardRef.current
+      const payload = source
       const sourceRotation = (((Number(payload.edit.displayRotation) || 0) % 360 + 360) % 360) as DisplayRotation
       const targetRotation = (((Number(targetPage.rotate || 0) + (pageRotations[pageIndex] || 0)) % 360 + 360) % 360) as DisplayRotation
       const pasted = pasteEditToPage(payload, pageIndex, pageBounds, 0)
@@ -1859,14 +2537,148 @@ export default function App() {
 
   function duplicateText() {
     if (!textEdit) return
-    editClipboardRef.current = copyPageEditSelection(textEdit, null)
-    setHasEditClipboard(true)
-    void pasteCurrentEditClipboard()
+    const payload = copyPageEditSelection(textEdit, null)
+    if (payload) void pasteCurrentEditClipboard(payload)
+  }
+
+  // What other apps last put on the system clipboard. An unreadable clipboard
+  // reports systemReadable false so the in-app payload still pastes.
+  async function readSystemClipboard() {
+    let systemReadable = false
+    let systemText = ''
+    let imageDataUrl: string | null = null
+    try {
+      systemText = await navigator.clipboard.readText()
+      systemReadable = true
+    } catch {
+      // Clipboard access denied or unavailable.
+    }
+    if (!systemText.trim()) {
+      try {
+        const items = await navigator.clipboard.read()
+        systemReadable = true
+        for (const item of items) {
+          const type = item.types.find((candidate) => candidate.startsWith('image/'))
+          if (!type) continue
+          imageDataUrl = await blobToDataUrl(await item.getType(type))
+          break
+        }
+      } catch {
+        // No image, or the format cannot be read.
+      }
+    }
+    return { systemReadable, systemText, imageDataUrl }
+  }
+
+  // Centre of the visible part of a page, as fractions of its displayed size,
+  // so pasted content lands where the user is looking.
+  function visiblePageCenter(index: number) {
+    const viewer = viewerRef.current
+    const surface = viewer?.querySelector<HTMLElement>(`.continuous-page-slot[data-page-index="${index}"] .page-surface`)
+    if (!viewer || !surface) return { x: 0.5, y: 0.5 }
+    const view = viewer.getBoundingClientRect()
+    const page = surface.getBoundingClientRect()
+    const left = Math.max(view.left, page.left)
+    const right = Math.min(view.right, page.right)
+    const top = Math.max(view.top, page.top)
+    const bottom = Math.min(view.bottom, page.bottom)
+    if (page.width < 1 || page.height < 1 || right <= left || bottom <= top) return { x: 0.5, y: 0.5 }
+    return { x: ((left + right) / 2 - page.left) / page.width, y: ((top + bottom) / 2 - page.top) / page.height }
+  }
+
+  async function pasteSystemText(rawText: string) {
+    if (!pdf) return false
+    const text = rawText.replace(/\r\n?/g, '\n').replace(/\s+$/u, '')
+    if (!text) return false
+    try {
+      const page = await pdf.getPage(pageIndex + 1)
+      const displayRotation = ((((page.rotate || 0) + (pageRotations[pageIndex] || 0)) % 360 + 360) % 360) as DisplayRotation
+      const viewport = page.getViewport({ scale: 1, rotation: displayRotation })
+      const fontSize = 12
+      const box = pastedTextBoxSize(text, fontSize, viewport.width * 0.8, viewport.height * 0.9)
+      const center = visiblePageCenter(pageIndex)
+      const left = clamp(center.x * viewport.width - box.width / 2, 0, Math.max(0, viewport.width - box.width))
+      const top = clamp(center.y * viewport.height - box.height / 2, 0, Math.max(0, viewport.height - box.height))
+      beginTextEdit({
+        pageIndex,
+        rect: viewportRectToPdf(viewport, { left, top, right: left + box.width, bottom: top + box.height }),
+        originalText: '',
+        text,
+        fontSize,
+        fontFamily: 'Segoe UI',
+        textFit: box.wraps ? 'wrap' : undefined,
+        displayRotation,
+        align: 'left',
+        color: [0.04, 0.04, 0.05],
+        cover: false,
+        modified: true,
+        caretOffset: text.length,
+        selectionStart: text.length,
+        selectionEnd: text.length,
+      })
+      showToast('Text pasted')
+      return true
+    } catch (error) {
+      showToast(errorMessage(error))
+      return false
+    }
+  }
+
+  async function pasteSystemImage(dataUrl: string) {
+    if (!pdf) return false
+    try {
+      const dimensions = await imageDimensions(dataUrl)
+      const page = await pdf.getPage(pageIndex + 1)
+      const displayRotation = ((((page.rotate || 0) + (pageRotations[pageIndex] || 0)) % 360 + 360) % 360) as DisplayRotation
+      const viewport = page.getViewport({ scale: 1, rotation: displayRotation })
+      const scale = Math.min(1, viewport.width * 0.48 / dimensions.width, viewport.height * 0.48 / dimensions.height)
+      const width = Math.max(36, dimensions.width * scale)
+      const height = Math.max(36, dimensions.height * scale)
+      const center = visiblePageCenter(pageIndex)
+      const left = clamp(center.x * viewport.width - width / 2, 0, Math.max(0, viewport.width - width))
+      const top = clamp(center.y * viewport.height - height / 2, 0, Math.max(0, viewport.height - height))
+      beginObjectEdit({
+        pageIndex,
+        kind: 'image',
+        rect: viewportRectToPdf(viewport, { left, top, right: left + width, bottom: top + height }),
+        dataUrl: await normalizeImageOrientation(dataUrl, displayRotation),
+        opacity: 1,
+        cover: false,
+        displayRotation,
+        label: 'Pasted image',
+        modified: true,
+      })
+      showToast('Image pasted')
+      return true
+    } catch (error) {
+      showToast(errorMessage(error))
+      return false
+    }
+  }
+
+  // Ctrl+V and the Paste commands: the in-app text box or image only while the
+  // system clipboard still holds what Simple copied, otherwise the newer
+  // system text or image.
+  async function pasteFromClipboard() {
+    if (!pdf || passwordProtected) return false
+    const internal = editClipboardRef.current
+    const system = await readSystemClipboard()
+    const source = chooseEditPasteSource({
+      internalText: internal ? (editClipboardTextRef.current ?? editClipboardPlainText(internal)) : null,
+      systemReadable: system.systemReadable,
+      systemText: system.systemText,
+      systemHasImage: Boolean(system.imageDataUrl),
+    })
+    if (source === 'internal') return pasteCurrentEditClipboard(internal)
+    if (source === 'image' && system.imageDataUrl) return pasteSystemImage(system.imageDataUrl)
+    if (source === 'text') return pasteSystemText(system.systemText)
+    return false
   }
 
   const hasContextEditSelection = Boolean(textEdit || objectEdit)
   const canContextUndo = Boolean(textEdit?.modified || objectEdit?.modified || undoStack.length)
-  const canContextRedo = Boolean(redoStack.length && !textEdit?.modified && !objectEdit?.modified)
+  const canContextRedo = Boolean((redoStack.length && !textEdit?.modified && !objectEdit?.modified)
+    || ((textEdit || objectEdit) && pendingEditHistoryRef.current.future.length))
   const canContextPaste = Boolean(hasEditClipboard && !passwordProtected)
   const hasContextCommands = canContextUndo || canContextRedo || hasContextEditSelection || canContextPaste
 
@@ -1956,47 +2768,73 @@ export default function App() {
     }
   }, [contextMenu])
 
-  function toggleBookmark() {
+  function bookmarksEditable() {
     if (passwordProtected) {
       showToast('Password-protected PDFs are read-only in this version.')
-      return
+      return false
     }
+    if (bookmarksReadOnly) {
+      // Saving an edited copy of an outline that could not be read would
+      // replace the bookmarks the file really has.
+      showToast('This PDF’s bookmarks could not be read, so they cannot be changed.')
+      return false
+    }
+    return true
+  }
+
+  // The toolbar button adds or removes its own "Page N" bookmark; a chapter
+  // of the document's outline on the same page is never removed by it.
+  function toggleBookmark() {
+    if (!bookmarksEditable()) return
     const snapshot = currentSnapshot()
     if (snapshot) addUndoSnapshot(snapshot)
-    const existing = bookmarks.find((bookmark) => bookmark.pageIndex === pageIndex)
+    const existing = toolbarBookmarkFor(bookmarks, pageIndex)
     if (existing) {
       setBookmarks((current) => current.filter((bookmark) => bookmark.id !== existing.id))
-      showToast('Bookmark removed')
+      showToast('Bookmark removed', 'Undo', () => historyActionsRef.current.undo())
     } else {
       setBookmarks((current) => [...current, { id: makeId('bookmark'), pageIndex, label: `Page ${pageIndex + 1}`, depth: 0, source: 'simple' }])
-      showToast('Bookmark saved')
+      showToast('Bookmark added — save to keep it in the PDF')
     }
     setBookmarksDirty(true)
     setDirty(true)
   }
 
+  // Removing a bookmark removes the bookmarks nested under it too.
   function deleteBookmark(id: string) {
-    if (passwordProtected) {
-      showToast('Password-protected PDFs are read-only in this version.')
-      return
-    }
+    if (!bookmarksEditable()) return
+    const removed = bookmarkSubtreeSize(bookmarks, id)
+    if (!removed) return
     const snapshot = currentSnapshot()
     if (snapshot) addUndoSnapshot(snapshot)
-    setBookmarks((current) => current.filter((bookmark) => bookmark.id !== id))
+    setBookmarks((current) => withoutBookmark(current, id))
     setBookmarksDirty(true)
     setDirty(true)
+    showToast(removed > 1 ? `Bookmark and ${removed - 1} nested ${removed === 2 ? 'bookmark' : 'bookmarks'} removed` : 'Bookmark removed', 'Undo', () => historyActionsRef.current.undo())
   }
 
   function renameBookmark(id: string, label: string) {
-    if (passwordProtected) {
-      showToast('Password-protected PDFs are read-only in this version.')
-      return
-    }
+    const title = label.trim()
+    const current = bookmarks.find((bookmark) => bookmark.id === id)
+    if (!title || !current || current.label === title) return
+    if (!bookmarksEditable()) return
     const snapshot = currentSnapshot()
     if (snapshot) addUndoSnapshot(snapshot)
-    setBookmarks((current) => current.map((bookmark) => bookmark.id === id ? { ...bookmark, label } : bookmark))
+    setBookmarks((list) => list.map((bookmark) => bookmark.id === id ? { ...bookmark, label: title } : bookmark))
     setBookmarksDirty(true)
     setDirty(true)
+  }
+
+  // Bookmarks that do not go to a page: a web link opens in the browser
+  // (http, https and mailto only); a heading only groups the ones below it.
+  function openBookmark(bookmark: Bookmark) {
+    if (typeof bookmark.pageIndex === 'number') {
+      goToPage(bookmark.pageIndex)
+      return
+    }
+    if (bookmark.url) {
+      window.simple.openExternal(bookmark.url).catch((error) => showToast(errorMessage(error)))
+    }
   }
 
   function goToPage(index: number) {
@@ -2008,6 +2846,50 @@ export default function App() {
     setPageIndex(next)
     setSelectedPages(new Set([next]))
     lastSelectedPage.current = next
+  }
+
+  // PageDown/PageUp in continuous view move one screen at a time, as Acrobat
+  // does, and only step to the neighbouring page (shown from its top) at a
+  // page boundary, so keyboard reading never skips part of a tall page.
+  function scrollByScreen(direction: 1 | -1) {
+    if (!pdf) return
+    const viewer = viewerRef.current
+    const slotFor = (index: number) => viewer?.querySelector<HTMLElement>(`.continuous-page-slot[data-page-index="${index}"]`)
+    const slot = slotFor(pageIndex)
+    if (!viewer || !slot) {
+      goToPage(pageIndex + direction)
+      return
+    }
+    const view = viewer.getBoundingClientRect()
+    const page = slot.getBoundingClientRect()
+    const step = Math.max(40, viewer.clientHeight - 40)
+    if (direction > 0) {
+      const remaining = page.bottom - view.bottom
+      if (remaining > 2) viewer.scrollTop += Math.min(step, remaining)
+      else if (pageIndex < pdf.numPages - 1) goToPage(pageIndex + 1)
+      return
+    }
+    const hidden = view.top - page.top
+    if (hidden > 2) {
+      viewer.scrollTop -= Math.min(step, hidden)
+      return
+    }
+    if (pageIndex <= 0) {
+      viewer.scrollTop = 0
+      return
+    }
+    const previous = slotFor(pageIndex - 1)?.getBoundingClientRect()
+    // A previous page taller than the window is entered from its bottom.
+    const delta = previous ? view.bottom - previous.bottom : 0
+    if (previous && previous.height > viewer.clientHeight && delta > 2) viewer.scrollTop -= Math.min(step, delta)
+    else goToPage(pageIndex - 1)
+  }
+
+  function selectAllDocumentText() {
+    const pages = viewerRef.current?.querySelector('.continuous-pages')
+    const selection = window.getSelection()
+    if (!pages || !selection) return
+    selection.selectAllChildren(pages)
   }
 
   function selectPage(index: number, event: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }) {
@@ -2109,6 +2991,7 @@ export default function App() {
     const selected = textEdit || objectEdit
     if (!pdf || !selected) return
     const generation = editSelectionGenerationRef.current
+    recordPendingEditStep()
     try {
       const page = await pdf.getPage(selected.pageIndex + 1)
       const rotation = (((page.rotate || 0) + (pageRotations[selected.pageIndex] || 0)) % 360 + 360) % 360
@@ -2195,9 +3078,36 @@ export default function App() {
   }
 
   function handleKeyDown(event: KeyboardEvent) {
-    if (event.defaultPrevented) return
+    // Keys typed while an IME composes text belong to the composition.
+    if (event.defaultPrevented || event.isComposing) return
+    // The password prompt owns the keyboard until it is answered (pasting
+    // and selecting inside its field keep working).
+    if (passwordRequestRef.current) return
+    // Ctrl+S is never swallowed: an open dialog closes first, and a save
+    // pressed during a page operation runs as soon as the operation ends.
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLocaleLowerCase() === 's') {
+      event.preventDefault()
+      if (!documentFile) return
+      if (printDialogOpen) closePrintDialog()
+      if (exportDialogOpen) setExportDialogOpen(false)
+      if (ocrDialog && !ocrAbortRef.current) setOcrDialog(null)
+      setOcrExportPrompt(null)
+      setOcrOffer(null)
+      void save(event.shiftKey)
+      return
+    }
+    // While text is being recognised, Escape is Stop (wherever the focus is).
+    if (ocrAbortRef.current) {
+      event.preventDefault()
+      if (event.key === 'Escape') stopOcr()
+      return
+    }
     if (documentUpdating || documentOperationRef.current) {
       event.preventDefault()
+      return
+    }
+    if (saveReport) {
+      if (event.key === 'Escape') { event.preventDefault(); setSaveReport(null) }
       return
     }
     if (printDialogOpen) {
@@ -2210,6 +3120,16 @@ export default function App() {
     if (exportDialogOpen) {
       if (event.key === 'Escape') { event.preventDefault(); setExportDialogOpen(false) }
       else if (event.ctrlKey || event.metaKey) event.preventDefault()
+      return
+    }
+    if (ocrDialog || ocrExportPrompt) {
+      if (event.key === 'Escape') { event.preventDefault(); setOcrDialog(null); setOcrExportPrompt(null) }
+      else if (event.ctrlKey || event.metaKey) event.preventDefault()
+      return
+    }
+    if (ocrOffer && event.key === 'Escape') {
+      event.preventDefault()
+      setOcrOffer(null)
       return
     }
     if (tool === 'sign' && pdf && !pendingSignature) {
@@ -2229,9 +3149,16 @@ export default function App() {
       copyCurrentEdit(key === 'x')
       return
     }
-    if (control && key === 'v' && !typing && editClipboardRef.current && (tool === 'edit' || tool === 'addText')) {
+    if (control && key === 'v' && !typing && (tool === 'edit' || tool === 'addText')) {
       event.preventDefault()
-      void pasteCurrentEditClipboard()
+      void pasteFromClipboard()
+      return
+    }
+    if (control && key === 'a' && !typing && !event.shiftKey && !event.altKey && pdf) {
+      // Select the whole document's text, not just the virtualised pages
+      // that happen to be in the DOM; copy fills the rest (ContinuousPdfViewer).
+      event.preventDefault()
+      selectAllDocumentText()
       return
     }
     if (control && event.key.toLocaleLowerCase() === 'f' && pdf) {
@@ -2246,9 +3173,8 @@ export default function App() {
     }
     if (control && event.key.toLocaleLowerCase() === 'o') { event.preventDefault(); openFile(); return }
     if (control && event.shiftKey && key === 'e') { event.preventDefault(); if (pdf && bytes && documentFile) setExportDialogOpen(true); return }
-    if (control && event.key.toLocaleLowerCase() === 's') { event.preventDefault(); save(event.shiftKey); return }
     if (control && event.key.toLocaleLowerCase() === 'p') { event.preventDefault(); if (pdf && bytes && documentFile) void openPrintDialog(); return }
-    if (control && event.key.toLocaleLowerCase() === 'z') { event.preventDefault(); undo(); return }
+    if (control && key === 'z') { event.preventDefault(); if (event.shiftKey) redo(); else undo(); return }
     if (control && event.key.toLocaleLowerCase() === 'y') { event.preventDefault(); redo(); return }
     if (event.key === 'F4') {
       event.preventDefault()
@@ -2268,7 +3194,21 @@ export default function App() {
         setTool('select')
         return
       }
-      if (textEdit || objectEdit || selectingObjectRegion) cancelEditSelection()
+      const target = event.target instanceof HTMLElement ? event.target : null
+      if (target && typing && target.closest('.edit-inspector')) {
+        // Leaving an inspector field keeps its value and the selection.
+        event.preventDefault()
+        target.blur()
+        return
+      }
+      if (textEdit || objectEdit) {
+        // Escape keeps what was typed, moved or placed, as in Acrobat; only
+        // the inspector's Cancel discards an edit.
+        event.preventDefault()
+        commitPendingEdits(true)
+        return
+      }
+      if (selectingObjectRegion) setSelectingObjectRegion(false)
       else window.getSelection()?.removeAllRanges()
       return
     }
@@ -2279,8 +3219,8 @@ export default function App() {
     else if (control && key === 'd' && (textEdit || objectEdit)) {
       event.preventDefault(); if (textEdit) duplicateText(); else duplicateObject()
     }
-    else if (event.key === 'PageUp') { event.preventDefault(); goToPage(pageIndex - 1) }
-    else if (event.key === 'PageDown') { event.preventDefault(); goToPage(pageIndex + 1) }
+    else if (event.key === 'PageUp') { event.preventDefault(); scrollByScreen(-1) }
+    else if (event.key === 'PageDown') { event.preventDefault(); scrollByScreen(1) }
     else if (control && event.key === 'Home') { event.preventDefault(); goToPage(0) }
     else if (control && event.key === 'End') { event.preventDefault(); goToPage(pdf.numPages - 1) }
     else if (control && (event.key === '+' || event.key === '=')) { event.preventDefault(); setZoomMode('custom'); setZoom((value) => clamp(value + 0.15, 0.35, 4)) }
@@ -2294,7 +3234,9 @@ export default function App() {
     else if (unmodified && event.key.toLocaleLowerCase() === 't') changeTool('addText')
     else if (unmodified && event.key.toLocaleLowerCase() === 'c') changeTool('crop')
     else if (event.key === 'Delete' && (textEdit || objectEdit)) deleteEditSelection()
-    else if (event.key === 'Delete' && (document.activeElement as HTMLElement | null)?.closest('.sidebar')) deletePages()
+    // Pages are deleted only from the Pages panel; Delete on a focused
+    // bookmark or search result must never offer to delete pages.
+    else if (event.key === 'Delete' && (document.activeElement as HTMLElement | null)?.closest('.thumbnails')) deletePages()
   }
 
   const handleKeyDownRef = useRef(handleKeyDown)
@@ -2306,10 +3248,39 @@ export default function App() {
     return () => window.removeEventListener('keydown', listener)
   }, [])
 
+  // The shared window guard asks about unsaved work (Save / Don't Save / Cancel) on
+  // every close path, so the title-bar button simply closes.
   function closeWindow() {
-    if ((dirty || textEdit?.modified || objectEdit?.modified) && !window.confirm('Close simple and discard unsaved changes?')) return
     window.simple.close()
   }
+
+  // Answers for the window guard. Refs keep the handlers registered once while
+  // always reading the latest document state.
+  const ioStateRef = useRef({ dirty: false, saving: false, name: '', untitled: true, save: (_forceDialog?: boolean) => Promise.resolve() as Promise<unknown> })
+  ioStateRef.current = {
+    dirty: Boolean(dirty || textEdit?.modified || objectEdit?.modified),
+    saving: busy === 'Saving PDF…',
+    name: documentFile?.name ?? '',
+    untitled: !documentFile?.path,
+    save,
+  }
+  useEffect(() => {
+    const io = getSimpleIO()
+    if (!io) return undefined
+    const offs = [
+      io.onRequest('close-query', () => {
+        const state = ioStateRef.current
+        return { dirty: state.dirty, saving: state.saving, title: state.name || undefined, kind: 'PDF', untitled: state.untitled }
+      }),
+      io.onRequest('save-now', async () => {
+        await ioStateRef.current.save(false)
+        // save() records the saved revision synchronously; React state may not have re-rendered yet.
+        return revisionRef.current === savedRevisionRef.current
+      }),
+      io.onRequest('discard', () => true),
+    ]
+    return () => offs.forEach((off) => off())
+  }, [])
 
   const closeWindowRef = useRef(closeWindow)
   closeWindowRef.current = closeWindow
@@ -2324,7 +3295,99 @@ export default function App() {
     })
   }
 
+  // After Save reports a problem: show the form field or page it concerns.
+  function revealProblem(problems: PdfSaveProblem[]) {
+    const first = problems[0]
+    if (!first) return
+    if (first.field) {
+      const control = document.querySelector<HTMLElement>(`[data-form-field="${CSS.escape(first.field)}"]`)
+      if (control) {
+        control.scrollIntoView({ block: 'center', inline: 'nearest' })
+        control.focus({ preventScroll: true })
+        return
+      }
+    }
+    if (typeof first.pageIndex === 'number' && pdf) goToPage(first.pageIndex)
+  }
+
   const titleBar = <TitleBar fileName={documentFile?.name} dirty={Boolean(dirty || textEdit?.modified || objectEdit?.modified)} onClose={closeWindow} />
+  const pendingEditModified = Boolean(textEdit?.modified || objectEdit?.modified)
+  const canUndoNow = Boolean(undoStack.length || pendingEditModified)
+  const canRedoNow = Boolean((redoStack.length && !pendingEditModified) || ((textEdit || objectEdit) && pendingEditHistoryRef.current.future.length))
+
+  // Rendered on the home screen and over a document alike: an open that needs
+  // a password must always be able to ask for it.
+  const passwordDialog = passwordRequest && (
+    <div className="export-dialog-overlay" role="presentation">
+      <form
+        className="export-dialog"
+        style={{ width: 400 }}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Password required"
+        onKeyDown={(event) => {
+          if (event.key !== 'Escape') return
+          event.preventDefault()
+          event.stopPropagation()
+          passwordRequest.resolve(null)
+        }}
+        onSubmit={(event) => {
+          event.preventDefault()
+          passwordRequest.resolve(passwordDraft)
+        }}
+      >
+        <div className="export-dialog-header"><strong>Password required</strong></div>
+        <div className="export-dialog-body">
+          <p style={{ margin: '0 0 10px', fontSize: 12 }}>“{passwordRequest.name}” is password protected. Enter the password to open it.</p>
+          <input
+            type="password"
+            autoFocus
+            aria-label="Password"
+            value={passwordDraft}
+            onChange={(event) => setPasswordDraft(event.target.value)}
+            style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--border-strong)', borderRadius: 6 }}
+          />
+          {passwordRequest.wrong && <p role="alert" style={{ margin: '8px 0 0', color: '#b42318', fontSize: 11 }}>That password is incorrect.</p>}
+        </div>
+        <div className="export-dialog-footer">
+          <Button variant="secondary" type="button" onClick={() => passwordRequest.resolve(null)}>Cancel</Button>
+          <Button variant="primary" type="submit">Open</Button>
+        </div>
+      </form>
+    </div>
+  )
+
+  const saveReportBlocked = saveReport?.kind === 'blocked'
+  const saveReportTitle = saveReportBlocked
+    ? 'Not saved: some changes cannot be written as they are'
+    : saveReport?.kind === 'partial' ? 'Saved, but without these changes' : 'Saved, with these notes'
+  const saveReportDialog = saveReport && (
+    <div className="export-dialog-overlay" role="presentation">
+      <div className="export-dialog" style={{ width: 480 }} role="dialog" aria-modal="true" aria-label={saveReportTitle}>
+        <div className="export-dialog-header">
+          <strong>{saveReportTitle}</strong>
+        </div>
+        <div className="export-dialog-body">
+          <ul className="save-report-list" style={{ margin: 0, paddingLeft: 18, fontSize: 12, lineHeight: 1.45, userSelect: 'text' }}>
+            {[...new Set(saveReport.problems.map(problemText))].map((message) => <li key={message}>{message}</li>)}
+          </ul>
+          {saveReportBlocked && (
+            <p style={{ margin: 0, color: 'var(--muted)', fontSize: 11 }}>Nothing was written and your changes are all still here. Fix them and save again, or save now without these changes.</p>
+          )}
+        </div>
+        <div className="export-dialog-footer">
+          {saveReportBlocked ? (
+            <>
+              <Button variant="secondary" autoFocus onClick={() => { const problems = saveReport.problems; setSaveReport(null); revealProblem(problems) }}>Keep editing</Button>
+              <Button variant="primary" onClick={saveReport.onSaveAnyway}>Save anyway</Button>
+            </>
+          ) : (
+            <Button variant="primary" autoFocus onClick={() => setSaveReport(null)}>OK</Button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
 
   if (!documentFile || !bytes) {
     return (
@@ -2340,11 +3403,20 @@ export default function App() {
           onDragEnter={(event) => { event.preventDefault(); dragDepth.current += 1; setIsDragging(true) }}
           onDragLeave={(event) => { event.preventDefault(); dragDepth.current -= 1; if (dragDepth.current <= 0) setIsDragging(false) }}
         />
-        {busy && <BusyOverlay label={busy} />}
+        {busy && !passwordRequest && <BusyOverlay label={busy} />}
+        {passwordDialog}
         {toast && <Toast {...toast} onClose={() => setToast(null)} />}
       </div>
     )
   }
+
+  const documentNotice = passwordProtected
+    ? 'Protected PDF · reading only'
+    : documentFile.signatureDetected
+      ? 'Signed PDF · Save keeps the signed original and saves your changes as a copy'
+      : documentFile.unlocked
+        ? 'Protected PDF · Save writes an unprotected copy; the original is not changed'
+        : ''
 
   return (
     <div
@@ -2360,9 +3432,9 @@ export default function App() {
         zoom={zoom}
         zoomMode={zoomMode}
         tool={tool}
-        bookmarked={bookmarks.some((bookmark) => bookmark.pageIndex === pageIndex)}
-        canUndo={Boolean(undoStack.length)}
-        canRedo={Boolean(redoStack.length)}
+        bookmarked={Boolean(toolbarBookmarkFor(bookmarks, pageIndex))}
+        canUndo={canUndoNow}
+        canRedo={canRedoNow}
         onToggleSidebar={() => {
           if (sidebarOpen) setActiveSearchMatch(null)
           setSidebarOpen((open) => !open)
@@ -2377,6 +3449,7 @@ export default function App() {
         onZoom={changeZoom}
         onFit={changeFit}
         onPrint={() => { if (pdf) void openPrintDialog() }}
+        onRecognizeText={() => openOcrDialog('needed')}
         onBookmark={toggleBookmark}
         onImmersive={() => { void toggleImmersive() }}
       />
@@ -2405,13 +3478,18 @@ export default function App() {
             onPageDragStart={startPageDrag}
             onImportPagesAt={importDroppedPages}
             onExportPages={exportPages}
+            bookmarksEditable={!bookmarksReadOnly && !passwordProtected}
+            onOpenBookmark={openBookmark}
             onDeleteBookmark={deleteBookmark}
             onRenameBookmark={renameBookmark}
+            onRecognizeText={passwordProtected ? undefined : () => openOcrDialog('needed')}
           />
         )}
         <main
           ref={viewerRef}
           className={`viewer${isPanning ? ' is-panning' : ''}`}
+          tabIndex={-1}
+          style={{ outline: 'none' }}
           onPointerDownCapture={(event) => {
             // A secondary click is a menu gesture, never the beginning of an
             // ink, crop, rectangle, artwork-region, or transform gesture.
@@ -2462,7 +3540,10 @@ export default function App() {
               rotations={pageRotations}
               tool={tool}
               overlays={overlays}
-              formValues={formValues}
+              // The viewer passes these through to PdfPage untouched; list
+              // boxes hold string[] values (PdfFormValue), which its prop type
+              // does not spell out yet.
+              formValues={formValues as Record<string, string | boolean>}
               textEdit={textEdit}
               objectEdit={objectEdit}
               activeSearchMatch={activeSearchMatch}
@@ -2474,11 +3555,13 @@ export default function App() {
               onRequestTextEdit={beginTextEdit}
               onTextEditChange={setTextEdit}
               onCommitTextEdit={commitTextEdit}
-              onCancelTextEdit={() => setTextEdit(null)}
+              // Nothing on the page discards an edit (Escape keeps it); only
+              // the inspector's Cancel does.
+              onCancelTextEdit={commitTextEdit}
               onRequestObjectEdit={beginObjectEdit}
               onObjectEditChange={setObjectEdit}
               onCommitObjectEdit={commitObjectEdit}
-              onCancelObjectEdit={() => setObjectEdit(null)}
+              onCancelObjectEdit={commitObjectEdit}
               onObjectRegionSelected={() => setSelectingObjectRegion(false)}
               onHighlight={(index, rects) => addHighlights(rects, index)}
               onTextMarkup={(index, style, rects, displayRotation) => addTextMarkup(style, rects, index, displayRotation)}
@@ -2487,70 +3570,40 @@ export default function App() {
               onCrop={(index, rect) => cropPage(rect, index)}
               onPlaceSignature={(index, point, displayRotation) => { void placeSignature(index, point, displayRotation) }}
               onNavigate={goToPage}
-              onFormChange={(name, value) => {
-                if (passwordProtected) {
-                  showToast('Password-protected PDFs are read-only in this version.')
-                  return
-                }
-                const snapshot = currentSnapshot()
-                if (snapshot) addUndoSnapshot(snapshot)
-                setFormValues((current) => ({ ...current, [name]: value }))
-                setDirty(true)
-              }}
+              onFormChange={changeFormValue}
+              onRequestOcrOffer={requestOcrOffer}
+              pendingEditAt={pendingEditAt}
+              onPendingEditAtHandled={(token) => setPendingEditAt((current) => current?.token === token ? null : current)}
+              onScanEditPrepared={mergeScanPreparation}
             />
           )}
-          {passwordRequest && (
-            <div className="export-dialog-overlay" role="presentation">
-              <form
-                className="export-dialog"
-                style={{ width: 400 }}
-                role="dialog"
-                aria-modal="true"
-                aria-label="Password required"
-                onSubmit={(event) => {
-                  event.preventDefault()
-                  const request = passwordRequest
-                  setPasswordRequest(null)
-                  request.resolve(passwordDraft)
-                }}
-              >
-                <div className="export-dialog-header"><strong>Password required</strong></div>
-                <div className="export-dialog-body">
-                  <p style={{ margin: '0 0 10px', fontSize: 12 }}>“{passwordRequest.name}” is password protected. Enter the password to open and edit it.</p>
-                  <input
-                    type="password"
-                    autoFocus
-                    value={passwordDraft}
-                    onChange={(event) => setPasswordDraft(event.target.value)}
-                    style={{ width: '100%', padding: '7px 9px', border: '1px solid var(--border-strong)', borderRadius: 6 }}
-                  />
-                  {passwordRequest.wrong && <p style={{ margin: '8px 0 0', color: '#b42318', fontSize: 11 }}>That password is incorrect.</p>}
-                </div>
-                <div className="export-dialog-footer">
-                  <Button variant="secondary" type="button" onClick={() => { const request = passwordRequest; setPasswordRequest(null); request.resolve(null) }}>Cancel</Button>
-                  <Button type="submit">Unlock</Button>
-                </div>
-              </form>
+          {documentNotice && pdf && (
+            <div
+              className="readonly-badge document-notice"
+              role="status"
+              // Stay clear of the edit inspector's buttons along the right edge.
+              style={tool === 'edit' || tool === 'addText' ? { right: 17 + 278 } : undefined}
+            >
+              {documentFile.signatureDetected && !passwordProtected ? <Signature size={13} /> : passwordProtected ? <AlertTriangle size={13} /> : <Lock size={13} />}
+              {documentNotice}
             </div>
-          )}
-          {passwordProtected && pdf && (
-            <div className="readonly-badge"><AlertTriangle size={13} /> Protected PDF · reading only</div>
           )}
         </main>
         {(tool === 'edit' || tool === 'addText') && pdf && (
           <EditInspector
             textEdit={textEdit}
-            pageHasNativeText={pageHasNativeText}
+            pageScanState={pageScanState}
+            onRecognizeText={() => openOcrDialog('needed')}
             objectEdit={objectEdit}
             selectingObjectRegion={selectingObjectRegion}
-            onTextChange={setTextEdit}
-            onObjectChange={setObjectEdit}
+            onTextChange={changeTextEditStep}
+            onObjectChange={changeObjectEditStep}
             onCommitText={commitTextEdit}
             onCommitObject={commitObjectEdit}
             onCancelSelection={cancelEditSelection}
             onDeleteSelection={deleteEditSelection}
             onCopySelection={() => { copyCurrentEdit(false) }}
-            onPasteSelection={() => { void pasteCurrentEditClipboard() }}
+            onPasteSelection={() => { void pasteFromClipboard() }}
             canPasteSelection={hasEditClipboard}
             onDuplicateText={duplicateText}
             onAddText={() => { cancelEditSelection(); setTool('addText') }}
@@ -2592,6 +3645,47 @@ export default function App() {
           selectedPages={[...selectedPages].sort((a, b) => a - b)}
           onExport={(submission) => { void runExportAs(submission) }}
           onClose={() => setExportDialogOpen(false)}
+        />
+      )}
+      {ocrDialog && pdf && (
+        <OcrDialog
+          pdf={pdf}
+          documentName={documentFile.name}
+          currentPage={pageIndex}
+          selectedPages={[...selectedPages].sort((a, b) => a - b)}
+          initialScope={ocrDialog.scope}
+          signatureDetected={documentFile.signatureDetected}
+          canReleasePage={canReleasePage}
+          progress={ocrProgress}
+          stopping={ocrStopping}
+          onRecognize={(request) => { void recognizeText(request) }}
+          onStop={stopOcr}
+          onClose={() => { if (!ocrAbortRef.current) setOcrDialog(null) }}
+        />
+      )}
+      {ocrOffer && !ocrDialog && (
+        <OcrOffer
+          x={ocrOffer.client.x}
+          y={ocrOffer.client.y}
+          onRecognize={acceptOcrOffer}
+          onDecline={declineOcrOffer}
+          onDismiss={() => setOcrOffer(null)}
+        />
+      )}
+      {ocrExportPrompt && (
+        <OcrExportPrompt
+          pageCount={ocrExportPrompt.pages.length}
+          onRecognize={() => {
+            const prompt = ocrExportPrompt
+            setOcrExportPrompt(null)
+            void recognizeText({ scope: 'selected', pages: prompt.pages, explicit: true, language: ocrLanguageRef.current, replaceExisting: false, exportJob: prompt.job })
+          }}
+          onExportAnyway={() => {
+            const prompt = ocrExportPrompt
+            setOcrExportPrompt(null)
+            void runExportAs(prompt.job, { skipScanCheck: true })
+          }}
+          onCancel={() => setOcrExportPrompt(null)}
         />
       )}
       {printDialogOpen && printPreviewPdf && (
@@ -2658,7 +3752,7 @@ export default function App() {
             </button>
           )}
           {canContextPaste && (
-            <button type="button" role="menuitem" data-context-action="paste" onClick={() => runContextMenuAction(pasteCurrentEditClipboard, false)}>
+            <button type="button" role="menuitem" data-context-action="paste" onClick={() => runContextMenuAction(pasteFromClipboard, false)}>
               <ClipboardPaste size={15} aria-hidden="true" /><span>Paste</span><kbd>Ctrl+V</kbd>
             </button>
           )}
@@ -2670,7 +3764,9 @@ export default function App() {
         </div>
       )}
       {documentUpdating && <div className="document-update-guard" aria-hidden="true" />}
-      {busy && <BusyOverlay label={busy} />}
+      {busy && !passwordRequest && <BusyOverlay label={busy} />}
+      {saveReportDialog}
+      {passwordDialog}
       {toast && <Toast {...toast} onClose={() => setToast(null)} />}
     </div>
   )

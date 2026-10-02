@@ -1,0 +1,489 @@
+{
+  "schemaVersion": 1,
+  "about": "Every user-facing string of the shared Save / Open / Export / Recovery layer. Edit simple/shared/electron/io-catalog.json, then copy it byte for byte to simple/shared/renderer/io-catalog.json. Placeholders are written {name}. Prompts list their buttons in display order; defaultId and cancelId are button ids.",
+  "appNames": {
+    "pdf": "Simple PDF",
+    "calc": "Simple Spreadsheets",
+    "docs": "Simple Documents",
+    "image": "Simple Images",
+    "video": "Simple Video",
+    "launcher": "Simple"
+  },
+  "kinds": {
+    "pdf": "PDF",
+    "calc": "spreadsheet",
+    "docs": "document",
+    "image": "image",
+    "video": "video"
+  },
+  "placeholders": {
+    "name": "this file",
+    "folder": "this folder",
+    "drive": "this drive",
+    "needed": "some space",
+    "formatLabel": "this format",
+    "altLabel": "another format",
+    "altExt": "another format",
+    "backupPath": "a backup copy",
+    "technical": "no further details",
+    "reason": "Something went wrong while creating the file.",
+    "siblingName": "a new file",
+    "appName": "Simple",
+    "lastAutosave": "the last autosave",
+    "kind": "document",
+    "finalName": "this file",
+    "fullLabel": "the full format",
+    "keeps": "part of the content",
+    "lostList": "some of the content",
+    "lostShort": "some of the content",
+    "time": "earlier"
+  },
+  "detailsLine": "Details: {technical}",
+  "notices": {
+    "CANCELED": "Saving \"{name}\" was canceled. Nothing was changed.",
+    "BLOCKED": "Apply or close the open dialog first, then save again.",
+    "OPEN_IN_ANOTHER_WINDOW": "\"{name}\" is open in another Simple window. Close it there first, or save your changes with a different name.",
+    "NOT_A_FILE": "\"{name}\" is a folder, not a file."
+  },
+  "saveFailed": {
+    "OPEN_IN_ANOTHER_WINDOW": {
+      "message": "\"{name}\" is open in another Simple window.",
+      "detail": "Close it there, then choose Try Again. Or save your changes with the same name in another folder.",
+      "buttons": [
+        { "id": "retry", "label": "Try Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "retry",
+      "cancelId": "cancel"
+    },
+    "LOCKED": {
+      "message": "\"{name}\" is open in another program.",
+      "detail": "Close it there, then choose Try Again. Or save your changes with the same name in another folder.",
+      "buttons": [
+        { "id": "retry", "label": "Try Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "retry",
+      "cancelId": "cancel"
+    },
+    "READ_ONLY": {
+      "message": "\"{name}\" is read-only.",
+      "detail": "Save your changes with the same name in another folder, or with a new name.",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "NO_PERMISSION": {
+      "message": "Simple doesn't have permission to save \"{name}\" in \"{folder}\".",
+      "detail": "Save your changes with the same name in another folder.",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "READ_ONLY_VOLUME": {
+      "message": "Simple can't save on {drive} because it can't be written to.",
+      "detail": "It may be write-protected. Save your changes on another drive.",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "FOLDER_MISSING": {
+      "message": "The folder \"{folder}\" isn't available anymore.",
+      "detail": "It may have been moved, renamed or disconnected. Save your changes in another folder.",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "FILE_UNAVAILABLE": {
+      "message": "Simple can't reach \"{name}\" right now.",
+      "detail": "Another program may be using this file, or its drive or network folder may be unavailable. Try again in a moment, or save your changes in another folder.",
+      "buttons": [
+        { "id": "retry", "label": "Try Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "retry",
+      "cancelId": "cancel"
+    },
+    "DISK_FULL": {
+      "message": "There isn't enough space on {drive} to save \"{name}\".",
+      "detail": "Free up at least {needed}, or save to another drive.",
+      "buttons": [
+        { "id": "retry", "label": "Try Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "retry",
+      "cancelId": "cancel"
+    },
+    "NAME_TOO_LONG": {
+      "message": "The file name or folder path is too long.",
+      "detail": "Choose a shorter name or a folder closer to the top of the drive.",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "INVALID_NAME": {
+      "message": "\"{name}\" can't be used as a file name here.",
+      "detail": "Choose a different name. A file name can't end with a space or a period, can't be the name of a folder that is already there, and can't contain these characters: \\ / : * ? \" < > |",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "CHANGED_ON_DISK": {
+      "message": "\"{name}\" was changed by another program after you opened it.",
+      "detail": "Saving now replaces those changes with yours. To keep both, save your version as a new file.",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "replace", "label": "Replace" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "SOURCE_MISSING": {
+      "message": "\"{name}\" was moved, renamed or deleted after you opened it.",
+      "detail": "Save it again in its original folder, or choose where to save it.",
+      "buttons": [
+        { "id": "recreate", "label": "Save Here Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "recreate",
+      "cancelId": "cancel"
+    },
+    "VERIFY_FAILED": {
+      "message": "Simple couldn't confirm that \"{name}\" was saved correctly, so the original file was kept.",
+      "detail": "Your changes are still open. Try again. If this keeps happening, save to another folder.",
+      "buttons": [
+        { "id": "retry", "label": "Try Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "retry",
+      "cancelId": "cancel"
+    },
+    "VALIDATION_FAILED": {
+      "message": "Simple didn't save \"{name}\" because the new file failed its safety check. Your original file wasn't changed.",
+      "detail": "Your changes are still open. Try again, or save them with Save As in another format.",
+      "buttons": [
+        { "id": "retry", "label": "Try Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "retry",
+      "cancelId": "cancel"
+    },
+    "SERIALIZE_FAILED": {
+      "message": "Simple couldn't create the {formatLabel} file.",
+      "detail": "{reason} Your changes are still open.",
+      "buttons": [
+        { "id": "save-other-format", "label": "Save in Another Format…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-other-format",
+      "cancelId": "cancel"
+    },
+    "NEEDS_OFFICE_ENGINE": {
+      "message": "Simple can't save {formatLabel} files on this PC.",
+      "detail": "Save your changes as {altLabel} instead. \"{name}\" stays unchanged.",
+      "buttons": [
+        { "id": "save-alternative", "label": "Save as {altExt}" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-alternative",
+      "cancelId": "cancel"
+    },
+    "RESTORE_NEEDED": {
+      "message": "Saving \"{name}\" stopped partway, and the original couldn't be put back automatically.",
+      "detail": "The original is safe at \"{backupPath}\". Your changes are still open, so save them with Save As now.",
+      "buttons": [
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "show-original", "label": "Show Original" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-as",
+      "cancelId": "cancel"
+    },
+    "UNKNOWN": {
+      "message": "Simple couldn't save \"{name}\".",
+      "detail": "Your changes are still open. Try again, or save them in another folder.",
+      "buttons": [
+        { "id": "retry", "label": "Try Again" },
+        { "id": "save-as", "label": "Save As…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "retry",
+      "cancelId": "cancel"
+    }
+  },
+  "openFailed": {
+    "DAMAGED": {
+      "message": "Simple couldn't open \"{name}\" because the file is damaged or incomplete.",
+      "detail": "If someone sent it to you, ask them to send it again."
+    },
+    "ENCRYPTED": {
+      "message": "\"{name}\" is password-protected.",
+      "detail": "Simple can't open password-protected {formatLabel} files yet."
+    },
+    "TOO_LARGE": {
+      "message": "\"{name}\" is larger than {limit}, the most Simple can open.",
+      "detail": ""
+    },
+    "UNSUPPORTED": {
+      "message": "Simple can't open {ext} files.",
+      "detail": ""
+    },
+    "NEEDS_OFFICE_ENGINE": {
+      "message": "Simple can't open {formatLabel} files on this PC.",
+      "detail": "Save the file in another format in the program that made it, then open that copy."
+    },
+    "NOT_FOUND": {
+      "message": "\"{name}\" isn't there anymore.",
+      "detail": "It may have been moved, renamed or deleted."
+    },
+    "FOLDER_MISSING": {
+      "message": "The folder \"{folder}\" isn't available anymore.",
+      "detail": "It may have been moved, renamed or disconnected."
+    },
+    "LOCKED": {
+      "message": "Another program is blocking \"{name}\" from being read.",
+      "detail": "Close it there, then try again.",
+      "action": "Try Again"
+    },
+    "FILE_UNAVAILABLE": {
+      "message": "Simple can't reach \"{name}\" right now.",
+      "detail": "Another program may be using this file, or its drive or network folder may be unavailable. Try again in a moment.",
+      "action": "Try Again"
+    },
+    "NO_PERMISSION": {
+      "message": "Simple doesn't have permission to open \"{name}\".",
+      "detail": "Copy it to a folder you can use, such as Documents, and open the copy."
+    },
+    "NAME_TOO_LONG": {
+      "message": "The file name or folder path of \"{name}\" is too long to open.",
+      "detail": "Move it to a folder closer to the top of the drive, or give it a shorter name."
+    },
+    "UNKNOWN": {
+      "message": "Simple couldn't open \"{name}\".",
+      "detail": "Try again. If this keeps happening, copy the file to another folder and open the copy."
+    }
+  },
+  "prompts": {
+    "unsaved": {
+      "message": "Do you want to save the changes to \"{name}\"?",
+      "detail": "Your changes will be lost if you don't save them.",
+      "buttons": [
+        { "id": "save", "label": "Save" },
+        { "id": "dont-save", "label": "Don't Save" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save",
+      "cancelId": "cancel"
+    },
+    "unsaved-untitled": {
+      "message": "Do you want to save this new {kind}?",
+      "detail": "Your changes will be lost if you don't save them.",
+      "buttons": [
+        { "id": "save", "label": "Save…" },
+        { "id": "dont-save", "label": "Don't Save" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save",
+      "cancelId": "cancel"
+    },
+    "lossy-save": {
+      "message": "Save \"{name}\" as {formatLabel}?",
+      "detail": "{formatLabel} keeps only {keeps}. These will be lost: {lostList}. To keep everything, save as {fullLabel}.",
+      "buttons": [
+        { "id": "save-lossy", "label": "Save as {formatLabel}" },
+        { "id": "save-full", "label": "Save as {fullLabel}" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-full",
+      "cancelId": "cancel"
+    },
+    "lossy-close": {
+      "message": "\"{name}\" was saved as {formatLabel}, which doesn't keep {lostShort}.",
+      "detail": "Save a full copy as {fullLabel} before closing?",
+      "buttons": [
+        { "id": "save-full-copy", "label": "Save Full Copy…" },
+        { "id": "close-anyway", "label": "Close Anyway" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-full-copy",
+      "cancelId": "cancel"
+    },
+    "sibling-save": {
+      "message": "Save your changes as \"{siblingName}\"?",
+      "detail": "Simple can't update {formatLabel} files, so your changes go into a new file in the same folder. \"{name}\" stays unchanged.",
+      "buttons": [
+        { "id": "save-sibling", "label": "Save as \"{siblingName}\"" },
+        { "id": "choose-location", "label": "Choose Location…" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-sibling",
+      "cancelId": "cancel"
+    },
+    "replace-existing": {
+      "message": "\"{finalName}\" already exists. Do you want to replace it?",
+      "detail": "",
+      "buttons": [
+        { "id": "replace", "label": "Replace" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "cancel",
+      "cancelId": "cancel"
+    },
+    "encoding-lossy": {
+      "message": "{count} characters can't be saved in {encoding}.",
+      "detail": "Save as UTF-8 instead to keep every character.",
+      "buttons": [
+        { "id": "save-utf8", "label": "Save as UTF-8" },
+        { "id": "save-anyway", "label": "Save in {encoding}" },
+        { "id": "cancel", "label": "Cancel" }
+      ],
+      "defaultId": "save-utf8",
+      "cancelId": "cancel"
+    },
+    "not-responding": {
+      "message": "{appName} isn't responding.",
+      "detail": "Wait for it, or close the window. Changes up to {lastAutosave} will be offered the next time you open {appName}.",
+      "buttons": [
+        { "id": "wait", "label": "Wait" },
+        { "id": "reopen", "label": "Reopen and Recover" },
+        { "id": "close-window", "label": "Close Window" }
+      ],
+      "defaultId": "wait",
+      "cancelId": "wait"
+    },
+    "crashed": {
+      "message": "{appName} stopped unexpectedly.",
+      "detail": "Your work up to {lastAutosave} was kept.",
+      "buttons": [
+        { "id": "reopen", "label": "Reopen and Recover" },
+        { "id": "close", "label": "Close" }
+      ],
+      "defaultId": "reopen",
+      "cancelId": "close"
+    }
+  },
+  "status": {
+    "saving": "Saving…",
+    "saved": "Saved",
+    "unsaved": "Unsaved changes",
+    "notSaved": "Not saved",
+    "savedAs": "Saved as {formatLabel}",
+    "finishingSave": "Finishing save…",
+    "willSaveAgain": "Will save again when the current save finishes",
+    "waitingForExport": "Saving after the export finishes",
+    "waitingForPrint": "Saving after printing finishes",
+    "recovered": "Recovered, not saved yet",
+    "readOnly": "Read-only, use Save As",
+    "autosaveOff": "Autosave is off for this very large file. Save often.",
+    "autosaveFailing": "Autosave isn't working",
+    "exporting": "Exporting…",
+    "exportingPercent": "Exporting… {percent}%"
+  },
+  "toast": {
+    "saved": "Saved",
+    "savedTo": "Saved to {folder}.",
+    "savedNewerPending": "Saved. Newer changes aren't saved yet.",
+    "savedSibling": "Saved as \"{siblingName}\". \"{name}\" wasn't changed.",
+    "savedModernCopy": "Saved your changes as \"{siblingName}\" next to the original, because Simple can't update {formatLabel} files. \"{name}\" wasn't changed.",
+    "savedLossy": "Saved as {formatLabel}. {lostShort} weren't kept.",
+    "savedNoBackup": "Saved (no backup copy: {reason})",
+    "exported": "Exported \"{name}\" to {folder}.",
+    "exportedWithWarnings": "Exported \"{name}\". {count} items couldn't be included.",
+    "exportCanceled": "Export canceled. No file was created.",
+    "openedIn": "Opened in {appName}",
+    "openedInNewWindow": "Opened \"{name}\" in a new window",
+    "alreadyOpen": "\"{name}\" is already open",
+    "notOpened": "{count} files weren't opened: {list} (not supported).",
+    "notOpenedOne": "\"{name}\" wasn't opened (not supported).",
+    "pasteOneFile": "Paste one file at a time, or drag them in.",
+    "actuallyFormat": "This file is actually a {label}.",
+    "shownInFolder": "\"{name}\" is shown in its folder, because Simple can't open this kind of file.",
+    "actions": {
+      "open": "Open",
+      "showInFolder": "Show in Folder",
+      "details": "Details",
+      "undo": "Undo"
+    }
+  },
+  "recovery": {
+    "cardTitle": "Recover unsaved work",
+    "rowSubtitle": "Unsaved changes from {time}",
+    "changedSince": "The file has changed since then. Saving will ask before replacing it.",
+    "sourceMissing": "The original file isn't there anymore. Saving will ask where to save it.",
+    "cannotRestore": "This copy depends on the original file, which has changed or is missing, so it can't be restored.",
+    "restore": "Restore",
+    "discard": "Discard",
+    "banner": "You have unsaved changes to this file from {time}.",
+    "bannerRestore": "Restore them",
+    "bannerDiscard": "Discard",
+    "restoreOpensNewWindow": "Your newer edits stay here, and the recovered changes open in a new window.",
+    "orphanBanner": "Simple recovered {count} unsaved documents.",
+    "orphanBannerOne": "Simple recovered 1 unsaved document.",
+    "show": "Show",
+    "crashScreen": "Simple ran into a problem. Your work up to {time} is safe.",
+    "reloadAndRecover": "Reload and Recover",
+    "saveAs": "Save As…",
+    "untitled": "Untitled {kind}"
+  },
+  "export": {
+    "title": "Export \"{name}\"",
+    "formatHeading": "Format",
+    "optionsHeading": "Options",
+    "openAfter": "Open the file after exporting",
+    "savesTo": "Saves to: {folder}",
+    "change": "Change",
+    "export": "Export…",
+    "cancel": "Cancel",
+    "keepsAndLoses": "Keeps: {keeps}. Not kept: {lost}.",
+    "valuesOnly": "values only",
+    "basicFormatting": "basic formatting",
+    "notAvailable": "Not available on this PC",
+    "multiFileFolder": "{stem} - {format} pages",
+    "multiFileZip": "Save as one .zip file",
+    "warningsTitle": "Some items couldn't be included",
+    "warningsIntro": "\"{name}\" was exported without these items:"
+  },
+  "engine": {
+    "docOpenedAsText": "Opened as text only. Simple can't read the formatting of this older Word file, so your edits will be saved as \"{stem}.docx\" next to the original.",
+    "legacySheet": "Older spreadsheet format. Your edits will be saved as \"{stem}.xlsx\" next to the original, because Simple can't update {formatLabel} files.",
+    "presentationNotSupported": "Simple can't turn PowerPoint files into PDFs on this PC.",
+    "basicFormatting": "This file was opened with basic formatting. Some layout details may look different.",
+    "statusFound": "Older Office files open with full formatting, using LibreOffice found on this PC ({path}).",
+    "statusNotFound": "Older Office and OpenDocument files open with basic formatting, and edits are saved as .docx or .xlsx next to the original."
+  },
+  "versions": {
+    "command": "Restore Previous Version…",
+    "title": "Earlier versions of \"{name}\"",
+    "intro": "Before Simple first replaces a file in a session, it keeps a copy of the file as it was. Open one as a copy to compare it or take things back.",
+    "row": "As it was before {time}",
+    "open": "Open as a Copy",
+    "empty": "There are no earlier versions of \"{name}\" yet.",
+    "unavailable": "Simple can't open this earlier version. It may have been removed."
+  }
+}
