@@ -620,7 +620,8 @@ test('without the bridge the model explains nothing was exported', async () => {
 
 test('shared renderer code stays local: no network, no other programs, no installers', () => {
   for (const file of ['io-client.ts', 'document-session.ts', 'export-model.ts']) {
-    const source = readFileSync(new URL(file, RENDERER), 'utf8')
+    // A Windows checkout (core.autocrlf) has CRLF line endings.
+    const source = readFileSync(new URL(file, RENDERER), 'utf8').replace(/\r\n/g, '\n')
     assert.doesNotMatch(source, /\bopenPath\s*\(/, `${file} opens documents through openInSimple only`)
     assert.doesNotMatch(source, /openExternal/, file)
     assert.doesNotMatch(source, /\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon/, `${file} makes no network requests`)

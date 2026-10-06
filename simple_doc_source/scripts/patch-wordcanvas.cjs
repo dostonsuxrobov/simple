@@ -366,6 +366,47 @@ function simpleOfficeColor(value, fallback) {
     pending.set(file, `${marker}\n${helper}\n${source}`);
   }
 }
+// Installed fonts (simple-font://installed/…) are already available to Chromium
+// by family name, so the editor renders and measures them from Windows instead
+// of decoding a private copy of every face in each window (Malgun Gothic alone
+// held ~64 MB). A family Chromium cannot resolve by name still loads its file.
+// PDF export fetches face bytes itself (unchanged). Faces a family lacks are now
+// synthesized by Chromium, as Word does, instead of drawing the regular face.
+{
+  const file = path.join(base, 'dist-lib/editorApp-vN1g1Ew1.js'), marker = '// SIMPLE_WORDCANVAS_SYSTEM_FONTS_V1';
+  let source = pending.get(file) ?? fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+  if (!source.includes(marker)) {
+    const before = '    try {\n      const Q = await (await fetch(g)).arrayBuffer(), c = Bc[B], e = new FontFace(A, Q, { weight: c.weight, style: c.style });';
+    if (source.split(before).length !== 2) throw new Error('Custom font loader changed upstream. No files written.');
+    source = source.replace(before, `    try {\n      if (simpleSystemFont(A, g)) return !0;\n${before.slice('    try {\n'.length)}`);
+    const helper = `
+const simpleSystemFonts = new Map();
+function simpleSystemFont(family, url) {
+  if (typeof url !== 'string' || !url.startsWith('simple-font://installed/') || typeof document > 'u') return false;
+  let available = simpleSystemFonts.get(family);
+  if (available === undefined) {
+    // A family Chromium resolves changes the width of the probe under at least
+    // one generic fallback (the family may itself be one generic's default).
+    const ctx = document.createElement('canvas').getContext('2d'), probe = 'mmmmmmmmmmlli WW@#0123456789 \\u00c4\\u00d6 \\uac00\\ub098\\ub2e4';
+    const quoted = '"' + family.replace(/["\\\\]/g, '\\\\$&') + '"';
+    available = !!ctx && ['monospace', 'serif', 'sans-serif'].some((generic) => {
+      ctx.font = '72px ' + generic;
+      const base = ctx.measureText(probe).width;
+      ctx.font = '72px ' + quoted + ', ' + generic;
+      return ctx.measureText(probe).width !== base;
+    });
+    simpleSystemFonts.set(family, available);
+  }
+  return available;
+}
+`;
+    // An install patched before this adapter already starts with the SIMPLE_HOOKS
+    // marker line; keep it first, where a fresh install also ends up.
+    const lines = source.split('\n');
+    const head = lines[0].startsWith('// SIMPLE_WORDCANVAS_SIMPLE_HOOKS_V1') ? `${lines.shift()}\n` : '';
+    pending.set(file, `${head}${marker}\n${helper}\n${lines.join('\n')}`);
+  }
+}
 // SIMPLE_HOOKS runs last: its anchors sit outside every region edited above.
 // The marker line carries a fingerprint of the hook source, so an install that
 // holds an older SIMPLE_HOOKS revision fails loudly instead of being skipped.

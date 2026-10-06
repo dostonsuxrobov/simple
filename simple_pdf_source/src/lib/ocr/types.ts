@@ -22,6 +22,14 @@ import type { OcrRotation } from '../../../electron/ocr-geometry.mjs'
 import type { OcrDeskew, PreparePageStats } from '../../../electron/ocr-preprocess.mjs'
 
 /** One recognisable language listed in dist/ocr/manifest.json. */
+/**
+ * Recognition workers one engine pool may run, before the CPU cap (cores - 2).
+ * Measured on 6 cores, 12 scanned pages: 2 workers 0.85 s/page, 4 workers
+ * 0.50 s/page with identical text; each worker holds ~250 MB while it runs and
+ * stops after a minute idle.
+ */
+export const DEFAULT_OCR_WORKERS = 4
+
 export interface OcrLanguageAsset {
   code: string
   label: string

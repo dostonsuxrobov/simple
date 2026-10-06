@@ -83,6 +83,13 @@ if (selfTest) {
     if (otherMode === mode) continue
     void handOff.start(otherMode, pathsForMode.map((filePath) => path.resolve(filePath)))
   }
+  // Remove the unpacked runtimes of earlier builds (see runtime-cache.cjs), well
+  // after start-up so it never competes with opening a file.
+  if (app.isPackaged && process.env.PORTABLE_EXECUTABLE_FILE) {
+    app.whenReady().then(() => {
+      setTimeout(() => { void require('./runtime-cache.cjs').pruneRuntimeCache({ execPath: process.execPath }) }, 20_000)
+    })
+  }
 
   if (mode === 'launcher') {
     require('../launcher/main.cjs')

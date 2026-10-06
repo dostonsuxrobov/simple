@@ -2,7 +2,7 @@ import Tesseract from 'tesseract.js/dist/tesseract.esm.min.js'
 import type { ImageLike, LoggerMessage, Page as TesseractPage, Worker as TesseractWorker, WorkerParams } from 'tesseract.js'
 import { tesseractParameters } from '../../../electron/ocr-preprocess.mjs'
 import { ocrAssetLocation, ocrLanguageCodes, preflightOcrAssets } from './assets'
-import { OcrError, ocrAbortError, type TesseractPsm } from './types'
+import { DEFAULT_OCR_WORKERS, OcrError, ocrAbortError, type TesseractPsm } from './types'
 
 export type { TesseractPage }
 export type OcrEnginePhase = 'loading-core' | 'loading-language' | 'initializing' | 'recognizing'
@@ -10,7 +10,7 @@ export type OcrEnginePhase = 'loading-core' | 'loading-language' | 'initializing
 export interface OcrEngineOptions {
   /** 'eng', or several joined with '+', e.g. 'eng+deu'. */
   language: string
-  /** Upper bound on parallel workers (default 2); also capped by the CPU count. */
+  /** Upper bound on parallel workers (default DEFAULT_OCR_WORKERS); also capped by the CPU count. */
   maxWorkers?: number
   /** Diagnostics and tests only: another ocr/ asset folder (default ./ocr/). */
   assetBase?: string
@@ -369,7 +369,7 @@ let unloadHooked = false
 /** One engine (worker pool) per language and asset folder. */
 export function getOcrEngine(options: OcrEngineOptions): OcrEngine {
   const language = ocrLanguageCodes(options.language).join('+')
-  const maxWorkers = Math.max(1, Math.floor(options.maxWorkers ?? 2))
+  const maxWorkers = Math.max(1, Math.floor(options.maxWorkers ?? DEFAULT_OCR_WORKERS))
   const key = `${language}|${options.assetBase ?? ''}`
   let engine = registry.get(key)
   if (engine) {

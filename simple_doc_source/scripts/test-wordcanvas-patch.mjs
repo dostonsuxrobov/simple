@@ -119,6 +119,19 @@ const editorSource = (await readFile(path.join(packageDir, simpleHooks.file), 'u
 assert.equal(editorSource.split('\n').filter((line) => line.startsWith(simpleHooks.marker)).length, 1, 'SIMPLE_HOOKS applied exactly once');
 assert.ok(editorSource.startsWith(`${simpleHooks.markerLine}\n`), 'installed editor carries the current SIMPLE_HOOKS revision');
 for (const [, after] of simpleHooks.edits) assert.equal(editorSource.split(after).length - 1, 1, `SIMPLE_HOOKS edit present once: ${after.slice(0, 70)}`);
+assert.equal(editorSource.split('\n').filter((line) => line === '// SIMPLE_WORDCANVAS_SYSTEM_FONTS_V1').length, 1, 'system-font adapter applied exactly once');
+assert.equal(editorSource.split('      if (simpleSystemFont(A, g)) return !0;\n      const Q = await (await fetch(g)).arrayBuffer()').length - 1, 1, 'installed fonts resolve from Windows before a private copy is loaded');
+{
+  const helper = editorSource.slice(editorSource.indexOf('const simpleSystemFonts'), editorSource.indexOf('\n}\n', editorSource.indexOf('function simpleSystemFont(')) + 3);
+  // A fake canvas whose width changes only for families listed as installed.
+  const installed = new Set(['"Calibri"', '"Malgun Gothic"']);
+  const context = { font: '', measureText() { return { width: installed.has(this.font.split(', ')[0].replace(/^72px /, '')) ? 2 : 1 }; } };
+  const probe = vm.runInNewContext(`${helper}; simpleSystemFont`, { document: { createElement: () => ({ getContext: () => context }) } });
+  assert.equal(probe('Calibri', 'simple-font://installed/3'), true, 'an installed family Chromium resolves skips the private copy');
+  assert.equal(probe('Malgun Gothic', 'simple-font://installed/9'), true);
+  assert.equal(probe('Missing Font', 'simple-font://installed/4'), false, 'a family Chromium cannot resolve still loads its file');
+  assert.equal(probe('Calibri', 'data:font/ttf;base64,AA=='), false, 'bundled and document fonts always load their bytes');
+}
 assert.equal((editorSource.match(/(^|[^.\w])prompt\(/gm) ?? []).length, 0, 'no engine prompt() remains (it throws in Electron)');
 const remainingAlerts = [...editorSource.matchAll(/(?:^|[^.\w])alert\(`(Could not open the shared document|Share failed)/gm)].length;
 assert.equal((editorSource.match(/(^|[^.\w])alert\(/gm) ?? []).length, remainingAlerts, 'only the collaboration/share alerts remain (unreachable offline)');
