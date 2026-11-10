@@ -93,6 +93,11 @@ interface PageThumbnailProps {
   onDelete: () => void
 }
 
+/** What a thumbnail's rotate button will turn: the whole selection when there is one, else that page. */
+function rotateLabel(index: number, selectedCount: number, direction: 'left' | 'right') {
+  return selectedCount > 1 ? `Rotate ${selectedCount} selected pages ${direction}` : `Rotate page ${index + 1} ${direction}`
+}
+
 function PageThumbnail({
   pdf, index, selected, current, bookmarked, rotation, canDelete, exportPageCount, onClick,
   onDragStart, onExportDragStart, onDragEnd, onDrop, onRotateLeft, onRotateRight, onDelete,
@@ -187,15 +192,15 @@ function PageThumbnail({
           <div className="thumbnail-actions" role="group" aria-label={`Actions for page ${index + 1}`}>
             <button
               type="button"
-              title="Rotate page left"
-              aria-label={`Rotate page ${index + 1} left`}
+              title={rotateLabel(index, exportPageCount, 'left')}
+              aria-label={rotateLabel(index, exportPageCount, 'left')}
               onPointerDown={(event) => event.stopPropagation()}
               onClick={(event) => { event.stopPropagation(); onRotateLeft() }}
             ><RotateCcw size={13} strokeWidth={1.9} /></button>
             <button
               type="button"
-              title="Rotate page right"
-              aria-label={`Rotate page ${index + 1} right`}
+              title={rotateLabel(index, exportPageCount, 'right')}
+              aria-label={rotateLabel(index, exportPageCount, 'right')}
               onPointerDown={(event) => event.stopPropagation()}
               onClick={(event) => { event.stopPropagation(); onRotateRight() }}
             ><RotateCw size={13} strokeWidth={1.9} /></button>
@@ -247,8 +252,9 @@ interface SidebarProps {
   onInsertBlank: () => void
   onAddPages: () => void
   onDuplicatePages: () => void
-  onRotateLeft: () => void
-  onRotateRight: () => void
+  /** The pages to turn: the selection when the clicked page is part of it, else that page alone. */
+  onRotateLeft: (indices: number[]) => void
+  onRotateRight: (indices: number[]) => void
   onDeletePages: () => void
   onPageDragStart?: (index: number, event: ReactDragEvent<HTMLButtonElement>) => void
   onImportPagesAt?: (files: File[], insertIndex: number) => void
@@ -285,6 +291,7 @@ export function Sidebar({
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1)
   const [textlessPages, setTextlessPages] = useState(0)
   const [pageMenuOpen, setPageMenuOpen] = useState(false)
+  const pageMenuRef = useRef<HTMLDivElement>(null)
   const currentRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const lastNonSearchTab = useRef<Exclude<SidebarTab, 'search'>>('pages')
@@ -407,6 +414,21 @@ export function Sidebar({
   useEffect(() => {
     if (tab === 'search') searchInputRef.current?.focus()
   }, [tab])
+
+  // The page actions menu closes on a click elsewhere and on Escape, like the toolbar's More menu.
+  useEffect(() => {
+    if (!pageMenuOpen) return
+    const close = (event: PointerEvent) => { if (!pageMenuRef.current?.contains(event.target as Node)) setPageMenuOpen(false) }
+    // Closing the menu is all this Escape does (it must not also leave the active tool).
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); setPageMenuOpen(false) } }
+    // pointerdown, in capture: the Hand tool cancels the mousedown that would follow.
+    window.addEventListener('pointerdown', close, true)
+    window.addEventListener('keydown', escape, true)
+    return () => {
+      window.removeEventListener('pointerdown', close, true)
+      window.removeEventListener('keydown', escape, true)
+    }
+  }, [pageMenuOpen])
 
   useEffect(() => {
     if (tab !== 'search' || activeResultIndex < 0) return
@@ -586,8 +608,10 @@ export function Sidebar({
                     canDelete={selectedPages.size < pdf.numPages}
                     exportPageCount={selectedPages.has(index) ? selectedPages.size : 1}
                     onClick={(event) => onSelectPage(index, event)}
-                    onRotateLeft={onRotateLeft}
-                    onRotateRight={onRotateRight}
+                    // The clicked page's own selection, as for dragging: a page
+                    // outside the selection is turned alone.
+                    onRotateLeft={() => onRotateLeft(pageIndicesForTransfer(selectedPages, index))}
+                    onRotateRight={() => onRotateRight(pageIndicesForTransfer(selectedPages, index))}
                     onDelete={onDeletePages}
                     onDragStart={(event) => {
                       const indices = pageIndicesForTransfer(selectedPages, index)
@@ -609,7 +633,7 @@ export function Sidebar({
             </div>
           </div>
           <div className="sidebar-footer">
-            <div className="page-action-menu">
+            <div className="page-action-menu" ref={pageMenuRef}>
               <IconButton icon={MoreHorizontal} label="More page actions" active={pageMenuOpen} onClick={() => setPageMenuOpen((open) => !open)} />
               {pageMenuOpen && (
                 <div className="page-actions-popover" role="menu">

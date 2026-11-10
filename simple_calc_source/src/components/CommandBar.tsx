@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useLayoutEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { MoreHorizontal } from 'lucide-react'
+import { ChevronsRight } from 'lucide-react'
 import { FormatPopover } from './ColorPicker'
 import './toolbar.css'
 import type { AnchorRect } from './ColorPicker'
@@ -91,7 +91,7 @@ export function CommandBar({ leading, groups, trailing }: CommandBarProps) {
               const rect = moreRef.current?.getBoundingClientRect()
               if (rect) setMoreAnchor({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom })
             }}
-          ><MoreHorizontal size={16} /></button>
+          ><ChevronsRight size={16} /></button>
         </>
       )}
       <div className="command-spacer" />

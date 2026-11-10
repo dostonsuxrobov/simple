@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('simpleImage', {
   openPath: (filePath) => ipcRenderer.invoke('file:open-path', filePath),
   listSiblings: (filePath) => ipcRenderer.invoke('file:list-siblings', filePath),
   openBytes: (name, data) => ipcRenderer.invoke('file:open-bytes', { name, data }),
+  readPdf: (filePath) => ipcRenderer.invoke('file:read-pdf', filePath),
   openInNewWindow: (filePath) => ipcRenderer.invoke('file:open-in-new-window', filePath),
   newWindow: () => ipcRenderer.invoke('app:new-window'),
   saveImage: (input) => ipcRenderer.invoke('file:save', input),

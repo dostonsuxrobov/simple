@@ -39,6 +39,8 @@ interface PrintDialogProps {
   pageCount: number
   currentPage: number
   selectedPages: number[]
+  /** A job is being sent: it cannot be taken back, so the dialog cannot be closed or submitted again. */
+  printing?: boolean
   onPrint: (submission: PrintDialogSubmission) => void
   onClose: () => void
 }
@@ -103,7 +105,7 @@ function printableIndices(indices: number[] | null, pageCount: number) {
   return indices || Array.from({ length: pageCount }, (_, index) => index)
 }
 
-export function PrintDialog({ documentName, pdf, pageCount, currentPage, selectedPages, onPrint, onClose }: PrintDialogProps) {
+export function PrintDialog({ documentName, pdf, pageCount, currentPage, selectedPages, printing = false, onPrint, onClose }: PrintDialogProps) {
   const [printers, setPrinters] = useState<PrinterSummary[] | null>(null)
   const [deviceName, setDeviceName] = useState('')
   const [copies, setCopies] = useState('1')
@@ -317,7 +319,7 @@ export function PrintDialog({ documentName, pdf, pageCount, currentPage, selecte
   }
 
   function submit() {
-    if (!canPrint) return
+    if (!canPrint || printing) return
     persist()
     onPrint(submission())
   }
@@ -326,7 +328,8 @@ export function PrintDialog({ documentName, pdf, pageCount, currentPage, selecte
     if (event.key === 'Escape') {
       event.preventDefault()
       event.stopPropagation()
-      onClose()
+      // Closing would look like cancelling, but the job still prints.
+      if (!printing) onClose()
       return
     }
     if (event.key === 'Enter' && !(event.target instanceof HTMLButtonElement) && !(event.target instanceof HTMLSelectElement)) {
@@ -347,13 +350,13 @@ export function PrintDialog({ documentName, pdf, pageCount, currentPage, selecte
   }
 
   return (
-    <div className="print-dialog-overlay" onPointerDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="print-dialog-overlay" onPointerDown={(event) => event.target === event.currentTarget && !printing && onClose()}>
       <div className="print-dialog print-layout-dialog" role="dialog" aria-modal="true" aria-label="Print" onKeyDown={handleKeyDown}>
         <header className="print-dialog-header">
           <Printer size={15} strokeWidth={1.8} aria-hidden="true" />
           <strong>Print</strong>
           <span className="print-dialog-document">{documentName}</span>
-          <IconButton icon={X} label="Cancel printing" compact onClick={onClose} />
+          <IconButton icon={X} label="Cancel printing" compact disabled={printing} onClick={onClose} />
         </header>
 
         <div className="print-layout-body">
@@ -487,8 +490,9 @@ export function PrintDialog({ documentName, pdf, pageCount, currentPage, selecte
         </div>
 
         <footer className="print-dialog-footer">
-          <Button variant="secondary" onClick={onClose}>Cancel</Button>
-          <Button icon={Printer} variant="primary" disabled={!canPrint} onClick={submit}>Print</Button>
+          {printing && <span className="print-dialog-status" role="status">Printing…</span>}
+          <Button variant="secondary" disabled={printing} onClick={onClose}>Cancel</Button>
+          <Button icon={Printer} variant="primary" disabled={!canPrint || printing} onClick={submit}>Print</Button>
         </footer>
       </div>
     </div>

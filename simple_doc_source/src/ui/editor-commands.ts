@@ -425,7 +425,7 @@ export function createEditorCommands(context: EditorCommandContext) {
       return result ? result.values.items : null;
     }
     const result = await openFormDialog({
-      title: request.title || "Simple Docs",
+      title: request.title || "simple",
       fields: [{ id: "value", label: request.message.replace(/:\s*$/, ""), value: request.defaultValue ?? "" }],
     });
     return result ? result.values.value : null;

@@ -51,6 +51,8 @@ interface SimpleImageBridge {
   openPath(path: string): Promise<ImagePayload>
   listSiblings(path: string): Promise<string[]>
   openBytes(name: string, data: ArrayBuffer): Promise<ImagePayload>
+  /** A PDF file's bytes, to be drawn as a picture (Advanced layers, the viewer's preview). */
+  readPdf(path: string): Promise<{ data: Uint8Array; name: string; path: string; size: number }>
   openInNewWindow(path?: string): Promise<boolean>
   newWindow(): Promise<boolean>
   saveImage(input: SaveImageInput): Promise<SavedImage | null>

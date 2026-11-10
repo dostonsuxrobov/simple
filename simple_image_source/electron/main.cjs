@@ -348,10 +348,23 @@ function registerIpc() {
     const directory = path.dirname(path.resolve(filePath))
     let entries
     try { entries = await fs.readdir(directory, { withFileTypes: true }) } catch { return [] }
+    // Images only: Next and Previous never step onto a PDF (a PDF is shown here only when it is dropped in).
     return entries
       .filter((entry) => entry.isFile() && !entry.name.startsWith('.') && isSupportedExtension(entry.name))
       .map((entry) => path.join(directory, entry.name))
       .sort((a, b) => path.basename(a).localeCompare(path.basename(b), undefined, { numeric: true, sensitivity: 'base' }))
+  })
+  // A PDF's bytes for the window to draw as a picture (a layer in Advanced, a preview in the viewer).
+  ipcMain.handle('file:read-pdf', async (event, filePath) => {
+    requireCallingWindow(event)
+    if (typeof filePath !== 'string' || !filePath || filePath.length > 32_768 || !/\.pdf$/i.test(filePath)) throw new Error('Choose a PDF file.')
+    const resolved = path.resolve(filePath)
+    const stat = await fs.stat(resolved)
+    if (!stat.isFile()) throw new Error('Choose a PDF file.')
+    if (!stat.size || stat.size > MAX_IMAGE_BYTES) throw new Error('This PDF is empty or larger than the 512 MB safety limit.')
+    const bytes = await fs.readFile(resolved)
+    if (bytes.subarray(0, 1024).indexOf('%PDF-') < 0) throw new Error('This file is not a PDF.')
+    return { data: new Uint8Array(bytes), name: path.basename(resolved), path: resolved, size: stat.size }
   })
   ipcMain.handle('file:open-bytes', (event, input) => {
     requireCallingWindow(event)
@@ -497,7 +510,7 @@ function registerIpc() {
   ipcMain.handle('app:get-version', (event) => { requireCallingWindow(event); return app.getVersion() })
   ipcMain.on('window:set-title', (event, title) => {
     const window = callingWindow(event)
-    if (window) window.setTitle(`${String(title || 'Untitled image')} — Simple Image`)
+    if (window) window.setTitle(`${String(title || 'Untitled image')} — simple`)
   })
   ipcMain.on('window:minimize', (event) => callingWindow(event)?.minimize())
   ipcMain.on('window:toggle-maximize', (event) => {

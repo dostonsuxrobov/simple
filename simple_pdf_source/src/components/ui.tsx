@@ -43,12 +43,14 @@ export function Separator({ vertical = true }: { vertical?: boolean }) {
   return <span className={vertical ? 'separator vertical' : 'separator'} aria-hidden="true" />
 }
 
-export function BusyOverlay({ label }: { label: string }) {
+/** `onCancel` adds a Cancel button, for long work that can stop cleanly between steps. */
+export function BusyOverlay({ label, onCancel }: { label: string; onCancel?: () => void }) {
   return (
     <div className="busy-overlay" role="status" aria-live="polite">
       <div className="busy-card">
         <LoaderCircle className="spin" size={18} />
         <span>{label}</span>
+        {onCancel && <button type="button" className="busy-cancel" onClick={onCancel}>Cancel</button>}
       </div>
     </div>
   )

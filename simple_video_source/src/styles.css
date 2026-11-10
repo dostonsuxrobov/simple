@@ -21,6 +21,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .title-identity { min-width: 250px; flex: 1 1 auto; display: flex; align-items: center; gap: 9px; padding: 0 10px 0 13px; overflow: hidden; }
 .app-mark { width: 24px; height: 24px; display: grid; place-items: center; flex: none; }
 .app-mark svg { width: 21px; height: 21px; stroke-width: 1.7; }
+.app-mark img { width: 20px; height: 20px; object-fit: contain; }
 .app-name { font-size: 13px; font-weight: 650; letter-spacing: -.012em; white-space: nowrap; }
 .title-divider { width: 1px; height: 16px; margin: 0 2px; background: #d8d8d8; }
 .document-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #484848; font-size: 12px; }

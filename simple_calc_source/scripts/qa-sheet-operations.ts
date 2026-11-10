@@ -292,6 +292,22 @@ function rowInsertionFixture(): WorkbookModel {
   assert.equal(result.workbook.sheets[0].rowCount, 13)
 }
 
+// Deleting never moves the active cell (the focus, which the grid scrolls to) across the
+// other axis: a whole row keeps its focus in column A, a whole column in row 1.
+{
+  const source = workbook(sheet())
+  const wholeRow = { anchor: { row: 3, col: source.sheets[0].colCount - 1 }, focus: { row: 3, col: 0 } }
+  const rows = applySelectionStructureCommand(source, 'main', wholeRow, 'delete-rows')
+  assert.deepEqual(rows.operation, { axis: 'row', kind: 'delete', index: 3, count: 1 })
+  assert.deepEqual(rows.selection.focus, { row: 3, col: 0 })
+  const wholeColumn = { anchor: { row: source.sheets[0].rowCount - 1, col: 2 }, focus: { row: 0, col: 2 } }
+  const columns = applySelectionStructureCommand(source, 'main', wholeColumn, 'delete-columns')
+  assert.deepEqual(columns.operation, { axis: 'column', kind: 'delete', index: 2, count: 1 })
+  assert.deepEqual(columns.selection.focus, { row: 0, col: 2 })
+  const cells = applySelectionStructureCommand(source, 'main', { anchor: { row: 2, col: 1 }, focus: { row: 4, col: 3 } }, 'delete-rows')
+  assert.deepEqual(cells.selection, { anchor: { row: 2, col: 1 }, focus: { row: 2, col: 3 } })
+}
+
 // ---- Insert/delete cells (shift) -------------------------------------------------------------
 {
   const base = workbook(sheet({

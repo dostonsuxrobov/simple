@@ -76,6 +76,9 @@ function playbackErrorMessage(code?: number) {
   return 'This video container opened, but its codec is not supported by this computer.'
 }
 
+/** Shown instead of the codec message when the file itself is gone or unreadable. */
+const FILE_UNREADABLE_MESSAGE = 'The video file could not be found or read. It may have been moved, renamed or deleted.'
+
 function canvasBlob(canvas: HTMLCanvasElement, type: 'image/png' | 'image/jpeg', quality?: number) {
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((blob) => {
@@ -148,7 +151,7 @@ function App() {
     closePrintDialog()
     setFile(payload)
     setOpenGeneration((value) => value + 1)
-    window.simpleVideo.setTitle(`${payload.name} — simple video`)
+    window.simpleVideo.setTitle(`${payload.name} — simple`)
     void refreshRecents()
   }, [closePrintDialog, refreshRecents])
 
@@ -378,10 +381,11 @@ function App() {
   const revealControls = useCallback(() => {
     setControlsVisible(true)
     if (hideControlsTimer.current) clearTimeout(hideControlsTimer.current)
-    if (playing && file) {
+    // An open menu or panel belongs to the controls: they stay until it is closed.
+    if (playing && file && !moreOpen && !infoOpen) {
       hideControlsTimer.current = setTimeout(() => setControlsVisible(false), 2600)
     }
-  }, [file, playing])
+  }, [file, infoOpen, moreOpen, playing])
 
   useEffect(() => {
     void refreshRecents()
@@ -531,19 +535,25 @@ function App() {
       } else if (key === 'arrowleft') {
         event.preventDefault()
         seekBy(-5)
+        revealControls()
       } else if (key === 'arrowright') {
         event.preventDefault()
         seekBy(5)
+        revealControls()
       } else if (key === 'j') {
         seekBy(-10)
+        revealControls()
       } else if (key === 'l') {
         seekBy(10)
+        revealControls()
       } else if (key === 'arrowup') {
         event.preventDefault()
         changeVolume(volume + 0.05)
+        revealControls()
       } else if (key === 'arrowdown') {
         event.preventDefault()
         changeVolume(volume - 0.05)
+        revealControls()
       } else if (key === 'm') {
         setMuted((value) => !value)
       } else if (key === 'f') {
@@ -562,7 +572,7 @@ function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [changeVolume, chooseFile, closePrintDialog, copyCurrentFrame, exportBusy, exportOpen, file, frameContextMenu, fullscreen, openExportDialog, openPrintDialog, printOpening, printSession, rate, seekBy, selectRate, shortcutsOpen, togglePlay, volume])
+  }, [changeVolume, chooseFile, closePrintDialog, copyCurrentFrame, exportBusy, exportOpen, file, frameContextMenu, fullscreen, openExportDialog, openPrintDialog, printOpening, printSession, rate, revealControls, seekBy, selectRate, shortcutsOpen, togglePlay, volume])
 
   const handleDragEnter = (event: DragEvent) => {
     event.preventDefault()
@@ -618,7 +628,7 @@ function App() {
     setInfoOpen(false)
     setExportOpen(false)
     closePrintDialog()
-    window.simpleVideo.setTitle('simple video')
+    window.simpleVideo.setTitle('simple')
     void refreshRecents()
   }
 
@@ -638,8 +648,8 @@ function App() {
       {!fullscreen && (
         <header className="titlebar">
           <div className="title-identity drag-region">
-            <span className="app-mark"><FileVideo2 /></span>
-            <span className="app-name">simple video</span>
+            <span className="app-mark"><img src="./brand-icon.png" alt="" /></span>
+            <span className="app-name">simple</span>
             {file && <><span className="title-divider" /><span className="document-title">{file.name}</span></>}
           </div>
           <div className="title-actions">
@@ -671,7 +681,7 @@ function App() {
             onShowShortcuts={() => setShortcutsOpen(true)}
           />
         ) : (
-          <div className={`player-shell${controlsVisible ? '' : ' controls-hidden'}`} onMouseMove={revealControls} onMouseLeave={() => playing && setControlsVisible(false)}>
+          <div className={`player-shell${controlsVisible ? '' : ' controls-hidden'}`} onMouseMove={revealControls} onMouseLeave={() => playing && !moreOpen && !infoOpen && setControlsVisible(false)}>
             <div
               className="video-stage"
               onDoubleClick={() => window.simpleVideo.toggleFullscreen()}
@@ -709,9 +719,20 @@ function App() {
                 onPause={() => setPlaying(false)}
                 onEnded={() => setPlaying(false)}
                 onError={(event) => {
-                  setLoading(false)
-                  const message = playbackErrorMessage(event.currentTarget.error?.code)
-                  setMediaError(message)
+                  const video = event.currentTarget
+                  const code = video.error?.code
+                  void (async () => {
+                    let message = playbackErrorMessage(code)
+                    // Chromium reports a file that has gone missing with the same code as an
+                    // unsupported codec, so ask the main process whether it can still read the file.
+                    if (code !== 1 && code !== 2 && code !== 3) {
+                      const readable = await window.simpleVideo.isReadable(file.path).catch(() => true)
+                      if (!readable) message = FILE_UNREADABLE_MESSAGE
+                    }
+                    if (videoRef.current !== video) return
+                    setLoading(false)
+                    setMediaError(message)
+                  })()
                 }}
               />
               {frameContextMenu && (
@@ -954,7 +975,7 @@ function Welcome({ recents, onOpen, onOpenRecent, onRemoveRecent, onClearRecents
       <div className="welcome-card">
         <div className="welcome-brand">
           <div className="welcome-mark"><FileVideo2 /></div>
-          <div><h1>simple video</h1><p>Watch videos privately, right on this computer.</p></div>
+          <div><h1>simple</h1><p>Watch videos privately, right on this computer.</p></div>
         </div>
         <div className="start-actions">
           <button className="start-card primary-start" type="button" onClick={onOpen}>

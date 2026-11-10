@@ -73,6 +73,8 @@ declare global {
     simpleVideo: {
       openFile: () => Promise<VideoFilePayload | null>
       openPath: (filePath: string) => Promise<VideoFilePayload>
+      /** Whether the file can still be read (asks only; does not open it). */
+      isReadable: (filePath: string) => Promise<boolean>
       openInNewWindow: (filePath?: string | null) => Promise<boolean>
       newWindow: () => Promise<boolean>
       listRecents: () => Promise<RecentVideo[]>

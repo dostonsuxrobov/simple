@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('simpleLauncher', {
     ipcRenderer.on('launcher:combine-progress', listener)
     return () => ipcRenderer.removeListener('launcher:combine-progress', listener)
   },
+  recent: () => ipcRenderer.invoke('launcher:recent'),
+  forgetRecent: (filePath) => ipcRenderer.invoke('launcher:recent-forget', filePath),
   launchMode: (mode) => ipcRenderer.invoke('launcher:launch-mode', mode),
   launchPaths: (paths) => ipcRenderer.invoke('launcher:launch-paths', paths),
   registerFileTypes: () => ipcRenderer.invoke('launcher:register-file-types'),

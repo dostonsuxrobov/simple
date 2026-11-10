@@ -153,7 +153,7 @@ export function createFontPicker(options: FontPickerOptions): FontPicker {
           note.className = "font-option-note";
           note.textContent = "not installed";
           element.append(note);
-          element.title = `${entry.family} isn't installed on this computer. Simple Docs shows it with a similar font.`;
+          element.title = `${entry.family} isn't installed on this computer. Simple shows it with a similar font.`;
         } else if (familyKey(entry.family) === familyKey(current)) {
           element.classList.add("is-current");
         }
@@ -197,7 +197,7 @@ export function createFontPicker(options: FontPickerOptions): FontPicker {
     const missing = Boolean(key) && !view.ready.has(key) && !view.installed.some((name) => familyKey(name) === key) && !view.builtin.some((item) => familyKey(item.family) === key);
     input.value = family;
     box.classList.toggle("is-missing", missing);
-    input.title = missing ? `${family} isn't installed on this computer. Simple Docs shows it with a similar font.` : "Font (type to search)";
+    input.title = missing ? `${family} isn't installed on this computer. Simple shows it with a similar font.` : "Font (type to search)";
   };
 
   const choose = async (index: number) => {

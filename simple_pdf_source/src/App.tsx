@@ -48,7 +48,7 @@ import {
   toolbarBookmarkFor,
   withoutBookmark,
 } from './lib/bookmarks'
-import { blockingProblems, mayBeEncrypted, problemText, signedCopyName, summarizeProblems } from './lib/openSave'
+import { blockingProblems, isMissingFileError, mayBeEncrypted, problemText, signedCopyName, summarizeProblems } from './lib/openSave'
 import { classifyPage, pageNeedsOcr, type PageScanState } from './lib/ocr/pageClassifier'
 import { abortOcrRun, disposeOcrRuntime, runOcr, summarizeOcrRun, warmUpOcr, type OcrRunOutcome, type OcrRunProgress, type OcrScope } from './lib/ocr/ocrRunner'
 import { bindOcrPage } from './lib/ocr/ocrCache'
@@ -136,7 +136,9 @@ interface PdfContextMenuState {
 }
 
 const RECENT_KEY = 'folio:recent-files:v1'
+const SIDEBAR_KEY = 'folio:sidebar:v1'
 const MAX_HISTORY_BYTES = 150 * 1024 * 1024
+const MAX_HISTORY_STEPS = 100
 
 function fittedZoom(viewer: HTMLElement, viewport: { width: number; height: number }, mode: 'fit' | 'width' = 'fit') {
   const availableWidth = Math.max(120, viewer.clientWidth - 104)
@@ -156,7 +158,10 @@ function boundHistoryStack(next: Snapshot[]) {
     const removed = next.shift()
     if (removed && !next.some((item) => item.bytes === removed.bytes)) total -= removed.bytes.byteLength
   }
-  return next.slice(-20)
+  // A step holds a reference to the PDF bytes (limited above) and small copies
+  // of the edits; picture data is shared between steps, not copied. So a long
+  // history costs little.
+  return next.slice(-MAX_HISTORY_STEPS)
 }
 
 function viewerHasActiveTextSelection(viewer: HTMLElement) {
@@ -441,7 +446,13 @@ export default function App() {
   const [busy, setBusy] = useState('')
   const [toast, setToast] = useState<ToastState | null>(null)
   const [saveReport, setSaveReport] = useState<SaveReportState | null>(null)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  // Open the first time; after that the window comes back the way it was left.
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    try { return localStorage.getItem(SIDEBAR_KEY) !== 'closed' } catch { return true }
+  })
+  useEffect(() => {
+    try { localStorage.setItem(SIDEBAR_KEY, sidebarOpen ? 'open' : 'closed') } catch { /* storage is unavailable */ }
+  }, [sidebarOpen])
   const [searchRequestId, setSearchRequestId] = useState(0)
   const [activeSearchMatch, setActiveSearchMatch] = useState<ActiveSearchMatch | null>(null)
   const [pageIndex, setPageIndex] = useState(0)
@@ -454,6 +465,11 @@ export default function App() {
   const [hasInteractiveForms, setHasInteractiveForms] = useState<boolean | null>(null)
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([])
   const [bookmarksDirty, setBookmarksDirty] = useState(false)
+  // bookmarksDirty means "write the bookmarks from this list" and stays on for the session.
+  // This ref is what Save asks: is there a bookmark list that has not been written yet?
+  // (A later bookmark edit marks the document changed like any other edit.)
+  const bookmarksUnwrittenRef = useRef(false)
+  useEffect(() => { if (bookmarksDirty) bookmarksUnwrittenRef.current = true }, [bookmarksDirty])
   // When the document's outline cannot be read, editing the (empty) list and
   // saving would replace the outline the file really has.
   const [bookmarksReadOnly, setBookmarksReadOnly] = useState(false)
@@ -469,6 +485,11 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [isPanning, setIsPanning] = useState(false)
   const [printDialogOpen, setPrintDialogOpen] = useState(false)
+  // A job that was sent cannot be taken back: the dialog stays until it settles.
+  const [printing, setPrinting] = useState(false)
+  // Set by Cancel on the busy overlay; the image export stops before its next page.
+  const imageExportCancelRef = useRef(false)
+  const [imageExporting, setImageExporting] = useState(false)
   const [printPreviewPdf, setPrintPreviewPdf] = useState<PDFDocumentProxy | null>(null)
   const [printPreviewBytes, setPrintPreviewBytes] = useState<Uint8Array | null>(null)
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
@@ -993,6 +1014,50 @@ export default function App() {
     })
   }
 
+  // The main process keeps one window per file and checks at Save whether the
+  // file changed on disk; for both it must know which file this window shows.
+  const reportedPathRef = useRef<string | null>(null)
+  const currentPath = documentFile?.path ?? null
+  useEffect(() => {
+    if (reportedPathRef.current === currentPath) return
+    reportedPathRef.current = currentPath
+    window.simple.setCurrentDocument?.(currentPath)
+  }, [currentPath])
+
+  /** Leave a document that could not be shown: the window is as it was when it started. */
+  function resetToHome() {
+    revisionRef.current = 0
+    revisionCounterRef.current = 0
+    savedRevisionRef.current = 0
+    pendingSaveRef.current = null
+    pendingExportRef.current = null
+    setSaveReport(null)
+    setDocumentFile(null)
+    setBytes(null)
+    setDocumentError('')
+    setPasswordProtected(false)
+    // A converted file starts out unsaved; without a document there is nothing to save.
+    setDirty(false)
+    setPageIndex(0)
+    setActiveSearchMatch(null)
+    setSelectedPages(new Set([0]))
+    setOverlays([])
+    setFormValues({})
+    setHasInteractiveForms(null)
+    setBookmarks([])
+    setBookmarksDirty(false)
+    setBookmarksReadOnly(false)
+    setPageRotations({})
+    setBookmarkKey('')
+    setUndoStack([])
+    setRedoStack([])
+    setTextEdit(null)
+    setObjectEdit(null)
+    setSelectingObjectRegion(false)
+    setPendingSignature(null)
+    setTool('select')
+  }
+
   async function openPayload(payload: DocumentPayload) {
     let fileBytes = normalizeBytes(payload.data)
     let unlocked = false
@@ -1093,9 +1158,12 @@ export default function App() {
   async function openFile() {
     // Opening is blocked while a password prompt waits for its answer.
     if (passwordRequestRef.current) return
-    setBusy(documentFile ? 'Opening in a new window…' : 'Opening document…')
+    // The "couldn't open this PDF" screen has nothing to keep: the next file
+    // opens in this window, as it does from the home screen.
+    const inNewWindow = Boolean(documentFile) && !(documentError && !pdf)
+    setBusy(inNewWindow ? 'Opening in a new window…' : 'Opening document…')
     try {
-      if (documentFile) {
+      if (inNewWindow) {
         await window.simple.openInNewWindow()
         return
       }
@@ -1119,13 +1187,13 @@ export default function App() {
         await window.simple.openInNewWindow(filePath)
         return
       }
-      await openPayload(await window.simple.openPath(filePath))
+      // null: another window already shows this file and came to the front.
+      const payload = await window.simple.openPath(filePath)
+      if (payload) await openPayload(payload)
     } catch (error) {
-      setRecentFiles((current) => {
-        const next = current.filter((item) => item.path !== filePath)
-        localStorage.setItem(RECENT_KEY, JSON.stringify(next))
-        return next
-      })
+      // Only a file that is gone leaves Recent files; a locked, unreadable or
+      // unsupported one may open fine next time.
+      if (isMissingFileError(error)) removeRecent(filePath)
       showToast(errorMessage(error))
     } finally {
       setBusy('')
@@ -1155,6 +1223,8 @@ export default function App() {
       const payload = filePath
         ? await window.simple.openPath(filePath)
         : await window.simple.openBytes(file.name, await file.arrayBuffer())
+      // null: another window already shows this file and came to the front.
+      if (!payload) return
       await openPayload(payload)
       if (files.length > 1) showToast(`Opened ${file.name} — ${files.length - 1} more ${files.length === 2 ? 'file' : 'files'} ignored`)
     } catch (error) {
@@ -1217,6 +1287,12 @@ export default function App() {
     if (passwordRequestRef.current) return
     if (documentOperationRef.current || documentUpdating) {
       queueSave(forceDialog)
+      return
+    }
+    // Nothing changed: writing the file again would only risk replacing a newer copy
+    // (the same file edited in another window or another program).
+    if (!forceDialog && documentFile.path && !dirty && !bookmarksUnwrittenRef.current && !textEdit?.modified && !objectEdit?.modified) {
+      showToast('No changes to save')
       return
     }
     if (passwordProtected && (dirty || textEdit?.modified || objectEdit?.modified)) {
@@ -1288,6 +1364,7 @@ export default function App() {
       } else if (signed || result.keptSignedOriginal) {
         showToast('Saved as a copy; the signed original was not changed', 'Show file', showFile)
       } else {
+        bookmarksUnwrittenRef.current = false
         showToast('Saved successfully', 'Show file', showFile)
       }
     } catch (error) {
@@ -1492,7 +1569,9 @@ export default function App() {
     setPageIndex(index)
     setSelectedPages(new Set([index]))
     lastSelectedPage.current = index
-    if (readAutoOcr()) {
+    // Recognizing text invalidates a digital signature: a signed document
+    // always gets the offer, never the automatic run.
+    if (readAutoOcr() && !documentFile?.signatureDetected) {
       void recognizeText({ scope: 'current', pages: [index], explicit: true, language: ocrLanguageRef.current, replaceExisting: false, editAt: { pageIndex: index, ...point } })
       return
     }
@@ -1575,7 +1654,7 @@ export default function App() {
     return false
   }
 
-  function rotatePages(degrees = 90) {
+  function rotatePages(degrees = 90, indices = targetPages()) {
     if (documentOperationRef.current) {
       showToast('Please wait for the current document operation to finish.')
       return
@@ -1584,7 +1663,6 @@ export default function App() {
       showToast('Password-protected PDFs are read-only in this version.')
       return
     }
-    const indices = targetPages()
     // A live native selection freezes text-layer rebuilds and page pruning;
     // rotated canvases must never sit beneath the old orientation's spans.
     window.getSelection()?.removeAllRanges()
@@ -1945,11 +2023,23 @@ export default function App() {
           })
           if (!session) return
           imageSessionId = session.id
-          for (let position = 0; position < job.pageIndices.length; position += 1) {
+          imageExportCancelRef.current = false
+          setImageExporting(true)
+          let written = 0
+          for (let position = 0; position < job.pageIndices.length && !imageExportCancelRef.current; position += 1) {
             const targetPageIndex = job.pageIndices[position]
             setBusy(`Rendering page ${position + 1} of ${job.pageIndices.length}…`)
             const data = await renderPdfPageImage(exportPdf, targetPageIndex, job.format, job.imageScale, job.jpegQuality)
+            if (imageExportCancelRef.current) break
             await window.simple.writeImageExportPage({ id: session.id, pageNumber: targetPageIndex + 1, data })
+            written += 1
+          }
+          // Cancel pressed while the last page was being written: everything is there, so it counts as done.
+          if (imageExportCancelRef.current && written < job.pageIndices.length) {
+            // The session is still open, so the cleanup below removes the
+            // folder of pages written so far: nothing half-done is left behind.
+            showToast('Export cancelled')
+            return
           }
           exportedPath = await window.simple.finishImageExport(session.id)
           imageSessionId = ''
@@ -1971,9 +2061,16 @@ export default function App() {
     } finally {
       if (imageSessionId) await window.simple.cancelImageExport(imageSessionId).catch(() => false)
       if (ownsExportPdf && exportPdf) await exportPdf.destroy().catch(() => {})
+      setImageExporting(false)
       documentOperationRef.current = false
       setBusy('')
     }
+  }
+
+  /** Cancel on the busy overlay during an image export: stop before the next page. */
+  function cancelImageExportRun() {
+    imageExportCancelRef.current = true
+    setBusy('Cancelling export…')
   }
 
   const runExportAsRef = useRef(runExportAs)
@@ -2022,6 +2119,7 @@ export default function App() {
       return
     }
     documentOperationRef.current = true
+    setPrinting(true)
     setBusy('Printing…')
     try {
       const output = printPreviewBytes || await preparedBytes()
@@ -2048,6 +2146,7 @@ export default function App() {
       showToast(errorMessage(error))
     } finally {
       documentOperationRef.current = false
+      setPrinting(false)
       setBusy('')
     }
   }
@@ -3088,7 +3187,8 @@ export default function App() {
     if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLocaleLowerCase() === 's') {
       event.preventDefault()
       if (!documentFile) return
-      if (printDialogOpen) closePrintDialog()
+      // Not while a job is being sent: the save is queued and the dialog stays.
+      if (printDialogOpen && !printing) closePrintDialog()
       if (exportDialogOpen) setExportDialogOpen(false)
       if (ocrDialog && !ocrAbortRef.current) setOcrDialog(null)
       setOcrExportPrompt(null)
@@ -3104,6 +3204,8 @@ export default function App() {
     }
     if (documentUpdating || documentOperationRef.current) {
       event.preventDefault()
+      // Keys are swallowed during an operation, so the overlay's Cancel gets its own: Escape.
+      if (event.key === 'Escape' && imageExporting && !imageExportCancelRef.current) cancelImageExportRun()
       return
     }
     if (saveReport) {
@@ -3113,7 +3215,7 @@ export default function App() {
     if (printDialogOpen) {
       // The dialog owns Escape and Enter itself; ignore every other shortcut
       // so typing a range or tabbing between fields cannot switch tools.
-      if (event.key === 'Escape') { event.preventDefault(); closePrintDialog() }
+      if (event.key === 'Escape') { event.preventDefault(); if (!printing) closePrintDialog() }
       else if (event.ctrlKey || event.metaKey) event.preventDefault()
       return
     }
@@ -3176,7 +3278,7 @@ export default function App() {
     if (control && event.key.toLocaleLowerCase() === 'p') { event.preventDefault(); if (pdf && bytes && documentFile) void openPrintDialog(); return }
     if (control && key === 'z') { event.preventDefault(); if (event.shiftKey) redo(); else undo(); return }
     if (control && event.key.toLocaleLowerCase() === 'y') { event.preventDefault(); redo(); return }
-    if (event.key === 'F4') {
+    if (event.key === 'F4' && pdf) {
       event.preventDefault()
       if (sidebarOpen) setActiveSearchMatch(null)
       setSidebarOpen((open) => !open)
@@ -3208,8 +3310,11 @@ export default function App() {
         commitPendingEdits(true)
         return
       }
-      if (selectingObjectRegion) setSelectingObjectRegion(false)
-      else window.getSelection()?.removeAllRanges()
+      if (selectingObjectRegion) { setSelectingObjectRegion(false); return }
+      const selected = window.getSelection()
+      if (selected && !selected.isCollapsed) { selected.removeAllRanges(); return }
+      // With nothing left to cancel, Escape leaves the editing tool: back to reading.
+      if (tool !== 'hand' && tool !== 'select') changeTool('select')
       return
     }
     if (!pdf || typing) return
@@ -3440,8 +3545,10 @@ export default function App() {
           setSidebarOpen((open) => !open)
         }}
         onOpen={openFile}
+        documentReady={Boolean(pdf)}
         onSave={() => save(false)}
-        onExport={() => setExportDialogOpen(true)}
+        onSaveAs={() => save(true)}
+        onExport={() => { if (pdf) setExportDialogOpen(true) }}
         onUndo={undo}
         onRedo={redo}
         onTool={changeTool}
@@ -3450,7 +3557,7 @@ export default function App() {
         onFit={changeFit}
         onPrint={() => { if (pdf) void openPrintDialog() }}
         onRecognizeText={() => openOcrDialog('needed')}
-        onBookmark={toggleBookmark}
+        onBookmark={() => { if (pdf) toggleBookmark() }}
         onImmersive={() => { void toggleImmersive() }}
       />
 
@@ -3472,8 +3579,8 @@ export default function App() {
             onInsertBlank={insertBlankPage}
             onAddPages={addPages}
             onDuplicatePages={duplicatePages}
-            onRotateLeft={() => rotatePages(-90)}
-            onRotateRight={() => rotatePages(90)}
+            onRotateLeft={(indices) => rotatePages(-90, indices)}
+            onRotateRight={(indices) => rotatePages(90, indices)}
             onDeletePages={deletePages}
             onPageDragStart={startPageDrag}
             onImportPagesAt={importDroppedPages}
@@ -3526,7 +3633,7 @@ export default function App() {
               <p>{documentError}</p>
               <div>
                 <Button icon={FolderOpen} variant="primary" onClick={openFile}>Open another file</Button>
-                <Button variant="secondary" onClick={() => { setDocumentFile(null); setBytes(null) }}>Back home</Button>
+                <Button variant="secondary" onClick={resetToHome}>Back home</Button>
               </div>
             </div>
           )}
@@ -3630,7 +3737,8 @@ export default function App() {
         )}
       </div>
 
-      {pdf && <StatusBar tool={tool} pageIndex={pageIndex} pageCount={pdf.numPages} selectionCount={selectedPages.size} />}
+      {/* While reading, the toolbar already shows the page; the bar appears with a tool's hint or a page selection. */}
+      {pdf && ((tool !== 'hand' && tool !== 'select') || selectedPages.size > 1) && <StatusBar tool={tool} pageIndex={pageIndex} pageCount={pdf.numPages} selectionCount={selectedPages.size} />}
       {tool === 'sign' && pdf && !pendingSignature && (
         <SignaturePanel
           onUse={setPendingSignature}
@@ -3695,8 +3803,9 @@ export default function App() {
           pageCount={printPreviewPdf.numPages}
           currentPage={pageIndex}
           selectedPages={[...selectedPages].sort((a, b) => a - b)}
+          printing={printing}
           onPrint={(submission) => { void runPrintJob(submission) }}
-          onClose={closePrintDialog}
+          onClose={() => { if (!printing) closePrintDialog() }}
         />
       )}
       {contextMenu && (
@@ -3764,7 +3873,7 @@ export default function App() {
         </div>
       )}
       {documentUpdating && <div className="document-update-guard" aria-hidden="true" />}
-      {busy && !passwordRequest && <BusyOverlay label={busy} />}
+      {busy && !passwordRequest && <BusyOverlay label={busy} onCancel={imageExporting ? cancelImageExportRun : undefined} />}
       {saveReportDialog}
       {passwordDialog}
       {toast && <Toast {...toast} onClose={() => setToast(null)} />}

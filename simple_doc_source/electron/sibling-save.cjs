@@ -19,7 +19,7 @@ async function proposedSiblingPath(sourcePath, extension = '.docx') {
     if (sameFilePath(candidate, sourcePath)) continue
     if (!await exists(candidate)) return candidate
   }
-  throw new Error('Simple Docs could not find a free file name beside the original document.')
+  throw new Error('Simple could not find a free file name beside the original document.')
 }
 
 /**
@@ -47,7 +47,7 @@ async function writeBesideSource(sourcePath, data, write, extension = '.docx') {
       throw error
     }
   }
-  throw new Error('Simple Docs could not find a free file name beside the original document.')
+  throw new Error('Simple could not find a free file name beside the original document.')
 }
 
 module.exports = { proposedSiblingPath, writeBesideSource }

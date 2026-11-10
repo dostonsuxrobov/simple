@@ -91,7 +91,7 @@ function safeExtractedPart(document, methodName, options, warnings) {
   try {
     return normalizeLegacyText(document[methodName](options))
   } catch {
-    warnings.push(`Simple Docs could not recover ${methodName.replace(/^get/, '').toLowerCase()} text from this file.`)
+    warnings.push(`Simple could not recover ${methodName.replace(/^get/, '').toLowerCase()} text from this file.`)
     return ''
   }
 }
@@ -105,7 +105,7 @@ function readLegacyDocumentParts(document) {
   try {
     body = normalizeLegacyText(document.getBody({ filterUnicode: false }))
   } catch (error) {
-    throw new Error('Simple Docs could not recover the document body from this legacy .doc file.', { cause: error })
+    throw new Error('Simple could not recover the document body from this legacy .doc file.', { cause: error })
   }
 
   const warnings = []
@@ -278,7 +278,7 @@ async function convertMarkupDocument(bytes, kind, options = {}) {
     else if (kind === 'word2003') flow = word2003ToFlow(bytes)
     else flow = htmlToFlow(bytes)
   } catch (error) {
-    throw new Error(`Simple Docs could not read this ${label} document. ${error instanceof Error ? error.message : ''}`.trim(), { cause: error })
+    throw new Error(`Simple could not read this ${label} document. ${error instanceof Error ? error.message : ''}`.trim(), { cause: error })
   }
   const hasObjects = flow.blocks.some((block) => block.type === 'table' || block.runs?.some((run) => run.image))
   if (!flow.blocks.length || (!flowText(flow.blocks).trim() && !hasObjects)) {
@@ -293,7 +293,7 @@ function actionableImportError(error) {
   if (/password|encrypted|encryption/i.test(message)) {
     return new Error('Password-protected legacy Word documents are not supported. Remove the password in Word, then try the .doc file again.', { cause: error })
   }
-  return new Error('Simple Docs could not import this legacy .doc file. Open it in Word or LibreOffice, save it as .docx, and try again.', { cause: error })
+  return new Error('Simple could not import this legacy .doc file. Open it in Word or LibreOffice, save it as .docx, and try again.', { cause: error })
 }
 
 async function convertLegacyDocToDocx(data, options = {}) {
@@ -302,7 +302,7 @@ async function convertLegacyDocToDocx(data, options = {}) {
     const docxBytes = validateDocxBytes(inputBytes)
     return {
       data: docxBytes,
-      warnings: ['This .doc filename contained a modern DOCX document. Simple Docs opened its original editable content and will save it with the correct .docx extension.'],
+      warnings: ['This .doc filename contained a modern DOCX document. Simple opened its original editable content and will save it with the correct .docx extension.'],
     }
   }
 

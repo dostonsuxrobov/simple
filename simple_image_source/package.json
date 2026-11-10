@@ -38,6 +38,7 @@
     "cross-env": "^7.0.3",
     "electron": "^43.4.1",
     "electron-builder": "^26.15.3",
+    "pdfjs-dist": "4.10.38",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
     "wait-on": "^8.0.1"

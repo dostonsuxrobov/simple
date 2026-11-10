@@ -21,6 +21,8 @@ const { getOfficeEngineStatus } = require('../shared/electron/office-engine.cjs'
 
 let mainWindow = null
 let combineBusy = false
+/** Close was asked for during a Combine: done as soon as the PDF is saved. */
+let closeWhenCombined = false
 
 /** A failure the Combine window shows as text; never a raw IPC error. */
 function combineFailure(error) {
@@ -30,10 +32,10 @@ function combineFailure(error) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1040,
-    height: 720,
-    minWidth: 820,
-    minHeight: 600,
+    width: 720,
+    height: 620,
+    minWidth: 520,
+    minHeight: 420,
     show: false,
     frame: false,
     title: 'simple',
@@ -51,6 +53,12 @@ function createWindow() {
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (url !== mainWindow.webContents.getURL()) event.preventDefault()
+  })
+  mainWindow.on('close', (event) => {
+    if (!combineBusy) return
+    event.preventDefault()
+    closeWhenCombined = true
+    void dialog.showMessageBox(mainWindow, { type: 'info', title: 'simple', buttons: ['OK'], noLink: true, message: 'The combined PDF is still being made.', detail: 'This window closes as soon as it is saved.' })
   })
   mainWindow.loadFile(path.join(__dirname, 'index.html'))
   mainWindow.once('ready-to-show', () => mainWindow.show())
@@ -116,7 +124,10 @@ function registerIpc() {
       }
     } catch (error) {
       return combineFailure(error)
-    } finally { combineBusy = false }
+    } finally {
+      combineBusy = false
+      if (closeWhenCombined) { closeWhenCombined = false; setImmediate(() => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close() }) }
+    }
   })
   ipcMain.handle('launcher:open', async (event) => {
     const owner = BrowserWindow.fromWebContents(event.sender)
@@ -133,9 +144,19 @@ function registerIpc() {
     if (!Array.isArray(paths) || paths.some((item) => typeof item !== 'string')) throw new Error('Invalid file list.')
     return launchValidatedPaths(paths)
   })
+  // The start screen's list (electron/recent-files.cjs); the profile root is shared by every Simple process.
+  const recentRoot = () => process.env.SIMPLE_USER_DATA_DIR || path.dirname(app.getPath('userData'))
+  ipcMain.handle('launcher:recent', async () => (await require('../electron/recent-files.cjs').listRecentAsync(recentRoot())).map((entry) => ({
+    ...entry, label: formats.data.workspaces?.[entry.mode]?.label || '',
+  })))
+  ipcMain.handle('launcher:recent-forget', (_event, filePath) => {
+    if (typeof filePath === 'string') require('../electron/recent-files.cjs').forgetRecent(recentRoot(), filePath)
+    return true
+  })
   ipcMain.handle('launcher:launch-mode', async (_event, mode) => {
     if (!MODES.includes(mode)) throw new Error('Unknown workspace.')
-    await launchDetached([`--simple-mode=${mode}`])
+    // --simple-new: a new empty window even when that workspace already has one open.
+    await launchDetached([`--simple-mode=${mode}`, '--simple-new'])
     return true
   })
   ipcMain.handle('launcher:register-file-types', async () => {

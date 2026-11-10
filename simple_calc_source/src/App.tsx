@@ -37,6 +37,7 @@ import {
   Menu,
   MessageSquarePlus,
   Minus,
+  MoreHorizontal,
   PaintBucket,
   Percent,
   RotateCw,
@@ -59,6 +60,7 @@ import {
   FilterX,
   Highlighter,
   Paintbrush,
+  PenLine,
   Palette,
   Sigma,
   SlidersHorizontal,
@@ -4192,7 +4194,7 @@ function TitleBar({ fileName, dirty, onClose }: { fileName?: string; dirty: bool
     <header className="titlebar">
       <div className="titlebar-drag">
         <img src={appIcon} alt="" />
-        <span className="product-name">simple_calc</span>
+        <span className="product-name">simple</span>
         {fileName && <><span className="title-separator">/</span><span className="document-title">{fileName}</span></>}
         {dirty && <span className="dirty-dot" title="Unsaved changes" />}
       </div>
@@ -4313,6 +4315,8 @@ export default function App() {
   const [showFormulas, setShowFormulas] = useState(false)
   const [showNotes, setShowNotes] = useState(true)
   const [immersive, setImmersive] = useState(false)
+  // A viewer first: menus and the formatting tools appear with Tools.
+  const [toolsOpen, setToolsOpen] = useState(false)
   const [textPrompt, setTextPrompt] = useState<TextPromptState | null>(null)
   const [nameBoxDraft, setNameBoxDraft] = useState<string | null>(null)
   const [nameBoxInvalid, setNameBoxInvalid] = useState(false)
@@ -4342,6 +4346,8 @@ export default function App() {
   const [previewPageBreaks, setPreviewPageBreaks] = useState<SpreadsheetPreviewPage[] | null>(null)
   const [showPageBreaks, setShowPageBreaks] = useState(true)
   const [menuSearchRequest, setMenuSearchRequest] = useState(0)
+  // Searching the menus from the keyboard brings them into view.
+  useEffect(() => { if (menuSearchRequest) setToolsOpen(true) }, [menuSearchRequest])
   /** The AutoComplete suggestion showing in the cell editor: typed text and the entry it completes. */
   const autoCompleteRef = useRef<{ sheetId: string; address: string; typed: string; match: string } | null>(null)
   /** Each sheet's zoom (Excel keeps one per sheet view), and the sheet `zoom` belongs to. */
@@ -5688,6 +5694,22 @@ export default function App() {
   }, [filteredOutRows, mutateWorkbook])
 
   const [formatPainter, setFormatPainter] = useState<{ cells: Array<Array<Pick<CellData, 'style' | 'numFmt'>>>; sticky: boolean } | null>(null)
+  // Paint format has no visible sign once the tools are hidden: it must not go on painting.
+  useEffect(() => { if (!toolsOpen) setFormatPainter(null) }, [toolsOpen])
+  // What belongs to one workbook does not follow into the next one (sheet and chart ids
+  // repeat between files, so trace arrows and an open chart editor would land on it).
+  useEffect(() => {
+    setFormatPainter(null)
+    setTraceState(null)
+    setChartEditorId(null)
+    setSelectedChartId(null)
+  }, [documentFile?.documentId])
+  // Alt+/ searches the menus, which are hidden in the viewer: bring them into view for it.
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => { if (event.altKey && !event.ctrlKey && (event.key === '/' || event.code === 'Slash')) setToolsOpen(true) }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
   const formatPainterRef = useRef(formatPainter)
   formatPainterRef.current = formatPainter
   const startFormatPainter = useCallback((sticky: boolean) => {
@@ -6056,7 +6078,8 @@ export default function App() {
     try {
       // An active cell moved inside the range (Enter/Tab) no longer spans it: pass the range.
       const span = selectionBounds(selection)
-      const operand = selection.range ? { anchor: { row: span.top, col: span.left }, focus: { row: span.bottom, col: span.right } } : selection
+      // The focus stays at the near corner, so the view is not pulled to the range's far end.
+      const operand = selection.range ? { anchor: { row: span.bottom, col: span.right }, focus: { row: span.top, col: span.left } } : selection
       const result = applySelectionStructureCommand(current, current.activeSheetId, operand, command)
       const withCharts = transformWorkbookChartsForStructure(result.workbook, current.activeSheetId, result.operation)
       const [next, patches, inversePatches] = produceWithPatches(current, (draft) => { Object.assign(draft, withCharts) })
@@ -7865,6 +7888,11 @@ export default function App() {
   const deleteActiveSheet = useCallback(async () => {
     if (!workbook || workbook.sheets.length <= 1) { setToast('A workbook needs at least one sheet.'); return }
     if (!(await confirmRef.current(`Delete “${activeSheet?.name}”? This can be undone.`))) return
+    // The sheet shown next (the same choice as below) comes back as it was left: its own
+    // selection and zoom, like switching to it, not cell A1 over wherever it was scrolled.
+    const removedIndex = workbook.sheets.findIndex((sheet) => sheet.id === workbook.activeSheetId)
+    const remaining = workbook.sheets.filter((_, position) => position !== removedIndex)
+    const shown = remaining.slice(Math.max(0, removedIndex - 1)).find((sheet) => sheet.state === 'visible') || remaining.find((sheet) => sheet.state === 'visible') || remaining[0]
     mutateWorkbook((next) => {
       const index = next.sheets.findIndex((sheet) => sheet.id === next.activeSheetId)
       const [removed] = next.sheets.splice(index, 1)
@@ -7876,7 +7904,11 @@ export default function App() {
         removeSheetScopedNames(next, index)
       }
     })
-    setSelection({ anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    setSelection((shown && (sheetSelectionsRef.current.get(shown.id) || savedSheetSelection(shown))) || { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    if (shown) {
+      zoomSheetRef.current = shown.id
+      setZoom(sheetZoomRef.current.get(shown.id) ?? savedSheetZoom(shown) ?? 1)
+    }
   }, [activeSheet?.name, mutateWorkbook, workbook])
 
   const moveSheet = useCallback((sheetId: string, targetIndex: number) => {
@@ -9588,7 +9620,7 @@ export default function App() {
         { id: 'help-shortcuts', label: 'Keyboard shortcuts', shortcut: 'Ctrl+/', icon: <Keyboard size={13} />, action: () => setShortcutsOpen(true) },
         { id: 'help-search-menus', label: 'Search the menus', shortcut: 'Alt+/', icon: <Search size={13} />, action: () => setMenuSearchRequest((value) => value + 1) },
         {
-          id: 'help-about', label: 'About simple_calc', separatorBefore: true, icon: <CircleHelp size={13} />, action: () => {
+          id: 'help-about', label: 'About simple', separatorBefore: true, icon: <CircleHelp size={13} />, action: () => {
             void window.simpleCalc.getVersion().catch(() => '').then((version) => informRef.current('simple_calc', `${version ? `Version ${version}. ` : ''}A spreadsheet editor that keeps your files on this computer: nothing is uploaded.`))
           },
         },
@@ -9821,16 +9853,14 @@ export default function App() {
     ]
   })()
   return (
-    <div className={`app-root workbook-app${immersive ? ' is-fullscreen' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
+    <div className={`app-root workbook-app${immersive ? ' is-fullscreen' : ''}${toolsOpen ? '' : ' is-viewer'}`} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
       {titleBar}
+      {/* Stays mounted while hidden (see .is-viewer): its shortcuts and command search keep working. */}
       <SpreadsheetMenus menus={menuDefinitions} extraCommands={paletteCommands} searchRequest={menuSearchRequest} />
       <CommandBar
         leading={<>
-          <IconButton label="New spreadsheet" onClick={() => { void newWorkbook() }}><FilePlus2 size={16} /></IconButton>
           <IconButton label="Open spreadsheet (Ctrl+O)" onClick={() => { void openWorkbook() }}><FolderOpen size={16} /></IconButton>
           <button type="button" className="save-command" onClick={() => { void saveWorkbook(false) }} title="Save (Ctrl+S)"><Save size={16} /><span>Save</span></button>
-          <IconButton label="Export As (Ctrl+Shift+E) — XLSX, ODS, CSV, TSV, PDF, or HTML" onClick={() => { if (flushPendingEditsRef.current()) setExportOpen(true) }}><Download size={16} /></IconButton>
-          <IconButton label="Print (Ctrl+P)" onClick={openPrintDialog}><Printer size={16} /></IconButton>
         </>}
         groups={[
           {
@@ -10005,8 +10035,17 @@ export default function App() {
               <IconButton label="Format cells (Ctrl+1)" onClick={() => setFormatDialogTab('number')}><SlidersHorizontal size={15} /></IconButton>
             </>,
           },
-        ]}
-        trailing={<span className="format-badge">{documentFile.sourceFormat.toUpperCase()}</span>}
+        ].filter((group) => toolsOpen || group.id === 'zoom')}
+        trailing={<>
+          {/* The same order in every window: Open, Save, Tools, Print, More. */}
+          <span className="format-badge">{documentFile.sourceFormat.toUpperCase()}</span>
+          <button type="button" className={`tools-toggle${toolsOpen ? ' is-on' : ''}`} aria-pressed={toolsOpen} title="Menus, formatting, formulas and data tools" onClick={() => setToolsOpen((open) => !open)}><PenLine size={15} /><span>Tools</span></button>
+          <IconButton label="Print (Ctrl+P)" onClick={openPrintDialog}><Printer size={16} /></IconButton>
+          <ToolbarMenuButton label="More" icon={<MoreHorizontal size={16} />} items={[
+            { id: 'more-export', label: 'Export As…', shortcut: 'Ctrl+Shift+E', icon: <Download size={14} />, action: () => { if (flushPendingEditsRef.current()) setExportOpen(true) } },
+            { id: 'more-new', label: 'New spreadsheet', icon: <FilePlus2 size={14} />, action: () => { void newWorkbook() } },
+          ]} />
+        </>}
       />
 
       {documentFile.warnings.length > 0 && (

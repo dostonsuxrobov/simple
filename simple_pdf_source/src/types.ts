@@ -428,7 +428,10 @@ export interface ImageExportSession {
 export interface SimpleApi {
   openFile: () => Promise<DocumentPayload | null>
   openInNewWindow: (filePath?: string) => Promise<boolean>
-  openPath: (filePath: string) => Promise<DocumentPayload>
+  /** null: another window already shows this file; it was brought to the front instead. */
+  openPath: (filePath: string) => Promise<DocumentPayload | null>
+  /** Tells the main process which file this window shows (null: none, or an unsaved copy). */
+  setCurrentDocument?: (filePath: string | null) => void
   openBytes: (name: string, data: ArrayBuffer) => Promise<DocumentPayload>
   /** The path of a dropped file on disk, or '' when it has none (for example a browser download). */
   getPathForFile?: (file: File) => string
@@ -465,6 +468,8 @@ export interface SimpleApi {
    * Write the PDF. Without a path, or with forceDialog, a Save dialog opens on
    * `name` (a full path opens it in that folder). A validly signed original is
    * never overwritten: the dialog offers a copy and `keptSignedOriginal` is set.
+   * A file that changed on disk since this window read it is replaced only
+   * after asking. null: the user cancelled; nothing was written.
    */
   savePdf: (input: { data: Uint8Array; path: string | null; name: string; forceDialog: boolean }) => Promise<{ path: string; name: string; keptSignedOriginal?: boolean } | null>
   showItem: (filePath: string) => Promise<void>

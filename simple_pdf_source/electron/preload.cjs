@@ -47,6 +47,7 @@ contextBridge.exposeInMainWorld('simple', {
   openFile: () => ipcRenderer.invoke('file:open-dialog'),
   openInNewWindow: (filePath) => ipcRenderer.invoke('file:open-in-new-window', filePath),
   openPath: (filePath) => ipcRenderer.invoke('file:open-path', filePath),
+  setCurrentDocument: (filePath) => ipcRenderer.send('file:current-document', filePath),
   openBytes,
   getPathForFile,
   unlockPdf: (data, password) => ipcRenderer.invoke('pdf:unlock', data, password),

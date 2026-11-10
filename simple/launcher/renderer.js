@@ -239,3 +239,63 @@ dropTarget.addEventListener('drop', (event) => {
 void window.simpleLauncher.info().then((info) => {
   document.documentElement.dataset.packaged = String(info.packaged)
 })
+
+// ---- Recent files and the More menu ----
+
+async function renderRecent() {
+  let entries = []
+  try { entries = await window.simpleLauncher.recent() } catch { entries = [] }
+  const list = $('#recent-list')
+  list.replaceChildren()
+  for (const entry of entries) {
+    const row = document.createElement('li')
+    const open = document.createElement('button')
+    open.className = 'recent-open'
+    open.title = entry.path
+    const kind = document.createElement('span')
+    kind.className = 'recent-kind'
+    const extension = /\.([^.\\/]+)$/.exec(entry.name)
+    kind.textContent = (extension ? extension[1] : '').toUpperCase().slice(0, 5)
+    const text = document.createElement('span')
+    text.className = 'recent-text'
+    const name = document.createElement('strong')
+    name.textContent = entry.name
+    const folder = document.createElement('small')
+    folder.textContent = entry.folder
+    text.append(name, folder)
+    open.append(kind, text)
+    open.addEventListener('click', () => run(
+      () => window.simpleLauncher.launchPaths([entry.path]),
+      (result) => openedMessage(result, 'That file could not be opened.'),
+    ))
+    const forget = document.createElement('button')
+    forget.className = 'recent-forget'
+    forget.textContent = '×'
+    forget.title = 'Remove from this list'
+    forget.setAttribute('aria-label', `Remove ${entry.name} from this list`)
+    forget.addEventListener('click', async () => { await window.simpleLauncher.forgetRecent(entry.path); void renderRecent() })
+    row.append(open, forget)
+    list.append(row)
+  }
+  $('#recent-empty').hidden = entries.length > 0
+}
+void renderRecent()
+// Files opened from here or from Windows show up when the window is used again.
+// (At most every few seconds: each refresh looks at every listed file on disk.)
+let lastRecentRefresh = Date.now()
+window.addEventListener('focus', () => {
+  if (Date.now() - lastRecentRefresh < 4000) return
+  lastRecentRefresh = Date.now()
+  void renderRecent()
+})
+
+const moreButton = $('#more')
+const moreMenu = $('#more-menu')
+function setMore(open) {
+  moreMenu.hidden = !open
+  moreButton.setAttribute('aria-expanded', String(open))
+}
+moreButton.addEventListener('click', () => setMore(moreMenu.hidden))
+moreMenu.addEventListener('click', (event) => { if (event.target.closest('button')) setMore(false) })
+document.addEventListener('mousedown', (event) => { if (!event.target.closest('.menu-anchor')) setMore(false) })
+document.addEventListener('keydown', (event) => { if (event.key === 'Escape') setMore(false) })

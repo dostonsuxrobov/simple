@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Bookmark,
   ChevronLeft,
@@ -9,10 +9,12 @@ import {
   FolderOpen,
   Hand,
   Highlighter,
+  MoreHorizontal,
   MousePointer2,
   PanelLeftClose,
   PanelLeftOpen,
   Pencil,
+  PenLine,
   Printer,
   Redo2,
   Save,
@@ -41,9 +43,12 @@ interface ToolbarProps {
   bookmarked: boolean
   canUndo: boolean
   canRedo: boolean
+  /** A PDF is loaded: document actions are available. */
+  documentReady: boolean
   onToggleSidebar: () => void
   onOpen: () => void
   onSave: () => void
+  onSaveAs: () => void
   onExport: () => void
   onUndo: () => void
   onRedo: () => void
@@ -58,17 +63,48 @@ interface ToolbarProps {
   onImmersive: () => void
 }
 
+/** Tools for reading; every other tool changes the document. */
+const READING_TOOLS: ToolMode[] = ['hand', 'select']
+
+/**
+ * Reading shows only what reading needs: open, save, page, zoom, print. The
+ * editing and markup tools (and undo/redo) appear when Tools is on, or as soon
+ * as one of them is chosen from the keyboard; less common actions live under
+ * More. The tool buttons stay in the page while hidden, so shortcuts and
+ * automation that press them keep working.
+ */
 export function Toolbar(props: ToolbarProps) {
   const {
-    sidebarOpen, pageIndex, pageCount, zoom, zoomMode, tool, bookmarked, canUndo, canRedo,
-    onToggleSidebar, onOpen, onSave, onExport, onUndo, onRedo, onTool,
+    sidebarOpen, pageIndex, pageCount, zoom, zoomMode, tool, bookmarked, canUndo, canRedo, documentReady,
+    onToggleSidebar, onOpen, onSave, onSaveAs, onExport, onUndo, onRedo, onTool,
     onPage, onZoom, onFit, onPrint, onRecognizeText, onBookmark, onImmersive,
   } = props
   const [pageValue, setPageValue] = useState(String(pageIndex + 1))
   const [zoomValue, setZoomValue] = useState(String(Math.round(zoom * 100)))
+  const [toolsOpen, setToolsOpen] = useState(false)
+  const [moreOpen, setMoreOpen] = useState(false)
+  const moreRef = useRef<HTMLDivElement>(null)
+  // Enter and Escape decide what happens to the page field themselves; the blur they cause
+  // must not commit a second time (that applied a pending text edit twice).
+  const skipBlurCommit = useRef(false)
+  const showTools = toolsOpen || !READING_TOOLS.includes(tool)
 
   useEffect(() => setPageValue(String(pageIndex + 1)), [pageIndex])
   useEffect(() => setZoomValue(String(Math.round(zoom * 100))), [zoom])
+
+  useEffect(() => {
+    if (!moreOpen) return
+    const close = (event: MouseEvent) => { if (!moreRef.current?.contains(event.target as Node)) setMoreOpen(false) }
+    // Closing the menu is all this Escape does (it must not also leave the active tool).
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); setMoreOpen(false) } }
+    // pointerdown, in capture: the Hand tool cancels the mousedown that would follow.
+    window.addEventListener('pointerdown', close, true)
+    window.addEventListener('keydown', escape, true)
+    return () => {
+      window.removeEventListener('pointerdown', close, true)
+      window.removeEventListener('keydown', escape, true)
+    }
+  }, [moreOpen])
 
   function commitZoom() {
     const percent = Number(zoomValue.replace('%', '').trim())
@@ -83,24 +119,43 @@ export function Toolbar(props: ToolbarProps) {
   }
 
   function commitPage() {
-    const next = clamp((Number.parseInt(pageValue, 10) || 1) - 1, 0, Math.max(0, pageCount - 1))
+    const typed = Number.parseInt(pageValue, 10)
+    // Empty or 0 is not a page: keep the current one instead of jumping to page 1.
+    if (!Number.isFinite(typed) || typed < 1) { setPageValue(String(pageIndex + 1)); return }
+    const next = clamp(typed - 1, 0, Math.max(0, pageCount - 1))
     onPage(next)
     setPageValue(String(next + 1))
   }
 
+  function toggleTools() {
+    if (showTools) {
+      // Back to reading: the tools go away and so does the active one.
+      setToolsOpen(false)
+      if (!READING_TOOLS.includes(tool)) onTool('select')
+    } else {
+      setToolsOpen(true)
+    }
+  }
+
+  const more = (run: () => void) => () => { setMoreOpen(false); run() }
+
   return (
-    <div className="toolbar" role="toolbar" aria-label="PDF tools">
+    <div className={`toolbar${showTools ? ' has-tools' : ' is-reading'}`} role="toolbar" aria-label="PDF tools">
       <div className="toolbar-group toolbar-leading">
         <IconButton icon={sidebarOpen ? PanelLeftClose : PanelLeftOpen} label={sidebarOpen ? 'Close sidebar (F4)' : 'Open sidebar (F4)'} active={sidebarOpen} onClick={onToggleSidebar} />
         <IconButton icon={FolderOpen} label="Open (Ctrl+O)" onClick={onOpen} />
-        <Button icon={Save} variant="primary" className="save-button" onClick={onSave}>Save</Button>
-        <Button icon={Download} variant="secondary" className="export-as-button" title="Export As (Ctrl+Shift+E)" onClick={onExport}>Export As</Button>
-        <Separator />
-        <IconButton icon={Undo2} label="Undo (Ctrl+Z)" disabled={!canUndo} onClick={onUndo} />
-        <IconButton icon={Redo2} label="Redo (Ctrl+Y)" disabled={!canRedo} onClick={onRedo} />
+        <Button icon={Save} variant="primary" className="save-button" title="Save (Ctrl+S)" onClick={onSave}>Save</Button>
+        {/* Undo stays in reach while there is something to undo, also after the tools are hidden. */}
+        {(showTools || canUndo || canRedo) && (
+          <>
+            <Separator />
+            <IconButton icon={Undo2} label="Undo (Ctrl+Z)" disabled={!canUndo} onClick={onUndo} />
+            <IconButton icon={Redo2} label="Redo (Ctrl+Y)" disabled={!canRedo} onClick={onRedo} />
+          </>
+        )}
       </div>
 
-      <div className="toolbar-group tool-modes" aria-label="Editing modes">
+      <div className="toolbar-group tool-modes" aria-label="Editing modes" hidden={!showTools}>
         <IconButton icon={Hand} label="Hand tool (H)" active={tool === 'hand'} onClick={() => onTool('hand')} />
         <IconButton icon={MousePointer2} label="Select text (V)" active={tool === 'select'} onClick={() => onTool('select')} />
         <Button icon={TextCursorInput} variant={tool === 'edit' ? 'primary' : 'ghost'} className="edit-mode-button" aria-label="Edit text (E)" title="Edit text and images (E)" aria-pressed={tool === 'edit'} onClick={() => onTool('edit')}>Edit PDF</Button>
@@ -122,8 +177,13 @@ export function Toolbar(props: ToolbarProps) {
             inputMode="numeric"
             value={pageValue}
             onChange={(event) => setPageValue(event.target.value.replace(/\D/g, ''))}
-            onBlur={commitPage}
-            onKeyDown={(event) => event.key === 'Enter' && commitPage()}
+            onBlur={() => { if (skipBlurCommit.current) { skipBlurCommit.current = false; return } commitPage() }}
+            onKeyDown={(event) => {
+              // Enter goes to the page and hands the keyboard back (Page Up / Page Down work again).
+              if (event.key === 'Enter') { commitPage(); skipBlurCommit.current = true; event.currentTarget.blur() }
+              // Escape only gives the field back its page: no jump, and the window's own Escape does not run.
+              if (event.key === 'Escape') { event.preventDefault(); skipBlurCommit.current = true; setPageValue(String(pageIndex + 1)); event.currentTarget.blur() }
+            }}
           />
           <span>/ {pageCount}</span>
         </div>
@@ -146,10 +206,18 @@ export function Toolbar(props: ToolbarProps) {
       </div>
 
       <div className="toolbar-group toolbar-trailing">
-        <IconButton icon={Eye} label="Immersive reading (Esc to exit)" onClick={onImmersive} />
-        <IconButton icon={Bookmark} label={bookmarked ? 'Remove bookmark' : 'Bookmark this page'} active={bookmarked} onClick={onBookmark} />
-        <IconButton icon={ScanText} label="Recognize text (OCR)" onClick={onRecognizeText} />
-        <IconButton icon={Printer} label="Print (Ctrl+P)" onClick={onPrint} />
+        <Button icon={PenLine} variant={showTools ? 'primary' : 'ghost'} className="tools-toggle" aria-label={showTools ? 'Hide tools' : 'Show tools'} title="Edit, mark up and sign" aria-pressed={showTools} onClick={toggleTools}>Tools</Button>
+        <IconButton icon={Printer} label="Print (Ctrl+P)" disabled={!documentReady} onClick={onPrint} />
+        <div className="toolbar-more" ref={moreRef}>
+          <IconButton icon={MoreHorizontal} label="More" active={moreOpen} aria-haspopup="menu" aria-expanded={moreOpen} onClick={() => setMoreOpen((open) => !open)} />
+          <div className="toolbar-more-menu" role="menu" hidden={!moreOpen}>
+            <button type="button" role="menuitem" aria-label="Save As" disabled={!documentReady} onClick={more(onSaveAs)}><Save size={15} /><span>Save As…</span><kbd>Ctrl+Shift+S</kbd></button>
+            <button type="button" role="menuitem" className="export-as-button" aria-label="Export As" title="Export As (Ctrl+Shift+E)" disabled={!documentReady} onClick={more(onExport)}><Download size={15} /><span>Export As…</span><kbd>Ctrl+Shift+E</kbd></button>
+            <button type="button" role="menuitem" aria-label="Recognize text (OCR)" disabled={!documentReady} onClick={more(onRecognizeText)}><ScanText size={15} /><span>Recognize text (OCR)</span></button>
+            <button type="button" role="menuitem" aria-label={bookmarked ? 'Remove bookmark' : 'Bookmark this page'} disabled={!documentReady} onClick={more(onBookmark)}><Bookmark size={15} /><span>{bookmarked ? 'Remove bookmark' : 'Bookmark this page'}</span></button>
+            <button type="button" role="menuitem" aria-label="Immersive reading (Esc to exit)" onClick={more(onImmersive)}><Eye size={15} /><span>Immersive reading</span><kbd>Esc exits</kbd></button>
+          </div>
+        </div>
       </div>
     </div>
   )

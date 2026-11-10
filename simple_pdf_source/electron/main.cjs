@@ -13,6 +13,7 @@ const {
 const { registerSharedIo, bridgeArguments } = require('./simple-io/io-ipc.cjs')
 const { sweep } = require('./simple-io/io-core.cjs')
 const { safeWriteFile } = require('./simple-io/safe-write.cjs')
+const { showPrompt } = require('./simple-io/io-dialogs.cjs')
 const guard = require('./simple-io/document-guard.cjs')
 const stores = require('./simple-io/stores.cjs')
 const officeEngine = require('./simple-io/office-engine.cjs')
@@ -52,6 +53,7 @@ const { codedError, problem, unsavedChangesError } = require('./pdf-problems.cjs
 const { FontLibrary, loadFaceFile } = require('./font-fallback.cjs')
 const { applyFormValues, verifyFormValues } = require('./form-fill.cjs')
 const { createTextBackgroundCache } = require('./text-background-cache.cjs')
+const { changedOnDisk, createWindowDocuments } = require('./window-documents.cjs')
 
 // Text that cannot fit its box is reduced down to this size before it is
 // allowed to run past the box (it is never dropped).
@@ -64,6 +66,9 @@ let fontkitModule
 let pdfLibModule
 let dragExportDirectory = null
 const imageExportSessions = new Map()
+// Which window shows which PDF, and the file's size and modified time when
+// that window last read or wrote it (keyed by webContents id).
+const windowDocuments = createWindowDocuments({ fileKey: stores.fileKey })
 
 // Conversion/editing dependencies are intentionally loaded only when a user
 // invokes those features. Fontkit is expensive to initialise and is not
@@ -229,9 +234,26 @@ async function openablePath(filePath) {
   }
 }
 
-async function filePayload(filePath) {
+async function filePayload(filePath, ownerId = null) {
+  // Taken before the read: a change that lands in between is then noticed at
+  // save time instead of being missed.
+  let stat
+  try {
+    stat = await fs.stat(filePath)
+  } catch (error) {
+    // A stable code for the renderer: only a file that is really gone is
+    // dropped from Recent files (a locked or unreadable one stays listed).
+    // An unplugged drive or an offline share also reports "no such file": the file is only
+    // known to be gone when its folder can still be read.
+    const folderThere = await fs.stat(path.dirname(String(filePath))).then((info) => info.isDirectory(), () => false)
+    if ((error?.code === 'ENOENT' || error?.code === 'ENOTDIR') && folderThere) {
+      throw codedError('FILE_NOT_FOUND', `"${path.basename(String(filePath))}" could not be found. It may have been moved, renamed or deleted.`)
+    }
+    throw error
+  }
   if (!(await openablePath(filePath))) throw unsupportedFormatError(filePath)
   const original = await fs.readFile(filePath)
+  if (ownerId !== null) windowDocuments.noteStamp(ownerId, filePath, stat)
   // A PDF keeps the fs Buffer: constructing a Uint8Array from it used to
   // duplicate the complete file before Electron's unavoidable IPC copy.
   const result = await importAsPdf(original, path.basename(filePath), filePath)
@@ -1328,7 +1350,11 @@ function createWindow(openPath = null) {
   browserWindow.on('maximize', () => browserWindow.webContents.send('window:maximized', true))
   browserWindow.on('unmaximize', () => browserWindow.webContents.send('window:maximized', false))
   const rendererId = browserWindow.webContents.id
+  if (openPath) windowDocuments.expect(rendererId, openPath)
+  // A crashed page reloads to the home screen without saying so: it no longer shows its file.
+  browserWindow.webContents.on('render-process-gone', () => windowDocuments.forget(rendererId))
   browserWindow.on('closed', () => {
+    windowDocuments.forget(rendererId)
     for (const [id, session] of imageExportSessions) {
       if (session.ownerId !== rendererId) continue
       imageExportSessions.delete(id)
@@ -1336,6 +1362,36 @@ function createWindow(openPath = null) {
     }
   })
   return browserWindow
+}
+
+/** The window that already shows this file, if any (never `exceptId`). */
+function windowShowing(filePath, exceptId = null) {
+  const id = windowDocuments.findWindow(filePath, exceptId)
+  if (id === null) return null
+  return BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed() && candidate.webContents.id === id) || null
+}
+
+function focusWindow(browserWindow) {
+  if (browserWindow.isMinimized()) browserWindow.restore()
+  browserWindow.focus()
+}
+
+/** One window per file: a file that is already open is brought to the front instead of opened twice. */
+function openOrFocusWindow(filePath) {
+  const existing = windowShowing(filePath)
+  if (existing) focusWindow(existing)
+  else createWindow(filePath)
+}
+
+/**
+ * For a window that would open the file in place: when another window
+ * already shows it, that window comes to the front and nothing is opened here.
+ */
+function focusedElsewhere(event, filePath) {
+  const other = windowShowing(filePath, event.sender.id)
+  if (!other) return false
+  focusWindow(other)
+  return true
 }
 
 function callingWindow(event) {
@@ -1539,7 +1595,8 @@ function registerIpc() {
       filters: await documentDialogFilters(),
     })
     if (result.canceled || !result.filePaths[0]) return null
-    return filePayload(result.filePaths[0])
+    if (focusedElsewhere(event, result.filePaths[0])) return null
+    return filePayload(result.filePaths[0], event.sender.id)
   })
 
   ipcMain.handle('file:open-in-new-window', async (event, requestedPath = null) => {
@@ -1554,11 +1611,27 @@ function registerIpc() {
       selectedPath = result.filePaths[0]
     }
     if (!(await openablePath(selectedPath))) throw unsupportedFormatError(selectedPath)
-    createWindow(selectedPath)
+    openOrFocusWindow(selectedPath)
     return true
   })
 
-  ipcMain.handle('file:open-path', async (_event, filePath) => filePayload(filePath))
+  ipcMain.handle('file:open-path', async (event, filePath) => {
+    if (focusedElsewhere(event, filePath)) return null
+    try {
+      return await filePayload(filePath, event.sender.id)
+    } catch (error) {
+      // A window made for this file that could not open it no longer stands in for it.
+      windowDocuments.releasePending(event.sender.id)
+      throw error
+    }
+  })
+
+  // The page reports the file it shows (null on the home screen and for
+  // unsaved copies), so the record stays right after Back home, a cancelled
+  // password prompt or a file that replaced another in the same window.
+  ipcMain.on('file:current-document', (event, filePath) => {
+    windowDocuments.setCurrent(event.sender.id, typeof filePath === 'string' && filePath ? filePath : null)
+  })
 
   ipcMain.handle('file:open-bytes', async (_event, input) => {
     const buffer = toBytes(input.data)
@@ -1710,9 +1783,31 @@ function registerIpc() {
       targetPath = null
       keptSignedOriginal = true
     }
+    let saveAsInstead = false
+    const openedStamp = targetPath ? windowDocuments.stampFor(event.sender.id, targetPath) : null
+    if (openedStamp) {
+      // Another program, or another window, may have written this file since
+      // this window read or saved it. Never replace that silently. A file
+      // that is gone is simply written again.
+      const onDisk = await fs.stat(targetPath).catch(() => null)
+      if (changedOnDisk(openedStamp, onDisk)) {
+        // The shared prompt (Save As… / Replace / Cancel); it also takes the
+        // scripted answers of SIMPLE_QA_DIALOGS in test runs.
+        const answer = await showPrompt('saveFailed.CHANGED_ON_DISK', { name: path.basename(targetPath) }, { sender: event.sender })
+        if (answer === 'save-as') {
+          defaultPath = targetPath
+          targetPath = null
+          saveAsInstead = true
+        } else if (answer !== 'replace') {
+          // Same answer as a cancelled Save dialog: nothing is written and
+          // the document stays unsaved in the window.
+          return null
+        }
+      }
+    }
     if (!targetPath) {
       const result = await showSaveDialogFor(event, {
-        title: input.forceDialog || keptSignedOriginal ? 'Save PDF as' : 'Save PDF',
+        title: input.forceDialog || keptSignedOriginal || saveAsInstead ? 'Save PDF as' : 'Save PDF',
         defaultPath,
         filters: [{ name: 'PDF file', extensions: ['pdf'] }],
       })
@@ -1720,6 +1815,9 @@ function registerIpc() {
       targetPath = result.filePath.toLowerCase().endsWith('.pdf') ? result.filePath : `${result.filePath}.pdf`
     }
     await atomicWrite(targetPath, input.data)
+    // The window now shows this file as it was just written.
+    windowDocuments.noteStamp(event.sender.id, targetPath, await fs.stat(targetPath).catch(() => null))
+    windowDocuments.setCurrent(event.sender.id, targetPath)
     return { path: targetPath, name: path.basename(targetPath), ...(keptSignedOriginal ? { keptSignedOriginal } : {}) }
   })
 
@@ -1752,7 +1850,7 @@ if (!gotLock) {
   app.on('second-instance', (_event, argv) => {
     const incoming = supportedPaths(argv)
     if (incoming.length) {
-      for (const filePath of incoming) createWindow(filePath)
+      for (const filePath of incoming) openOrFocusWindow(filePath)
       return
     }
     const browserWindow = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
@@ -1771,7 +1869,7 @@ if (!gotLock) {
       guard,
       stores,
       officeEngine,
-      openInWindow: (filePath) => { createWindow(filePath); return true },
+      openInWindow: (filePath) => { openOrFocusWindow(filePath); return true },
     })
     // Finish or undo any save a crash interrupted before documents open.
     await sweep().catch((error) => console.error('[simple-io] sweep failed', error))

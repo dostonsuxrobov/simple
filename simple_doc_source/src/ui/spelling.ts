@@ -284,7 +284,7 @@ export function createSpelling(options: SpellingOptions): Spelling {
         checker!.addToDictionary(issue.word);
         void Promise.resolve(options.api?.addWord?.(issue.word)).catch((error) => {
           console.warn("The word could not be added to the dictionary", error);
-          options.notify("Simple Docs couldn't save that word to your dictionary.", "error");
+          options.notify("Simple couldn't save that word to your dictionary.", "error");
         });
         void run();
         options.focusEditor();

@@ -553,7 +553,7 @@ function registerIpc() {
     }
     if (!input.forceDialog && input.path && input.expectedHash) {
       const existing = await fs.readFile(target).catch(() => null)
-      if (!existing || sha256(existing) !== input.expectedHash) throw new Error('This file changed outside Simple Docs. Use Save as to keep both versions.')
+      if (!existing || sha256(existing) !== input.expectedHash) throw new Error('This file changed outside Simple. Use Save as to keep both versions.')
     }
     if (!input.forceDialog && input.path && input.protectOriginal) {
       const backupPath = path.join(path.dirname(target), `${path.basename(target, path.extname(target))}.before-simple-edit${path.extname(target)}`)
@@ -576,7 +576,7 @@ function registerIpc() {
   ipcMain.handle('file:save-beside-source', async (event, input) => {
     const context = documentContext(event.sender)
     const sourcePath = context.sourcePath
-    if (!sourcePath) throw new Error('Simple Docs does not know where the original document is. Use Save as to choose a location.')
+    if (!sourcePath) throw new Error('Simple does not know where the original document is. Use Save as to choose a location.')
     if (input?.sourcePath && !sameFilePath(input.sourcePath, sourcePath)) throw new Error('This window’s original document has changed. Use Save as to choose a location.')
     const repaired = await repairDocxPackage(validateDocxBytes(input?.data))
     const target = await writeBesideSource(sourcePath, repaired.bytes, atomicWrite)
@@ -711,6 +711,8 @@ else {
   app.on('second-instance', (_event, argv) => {
     const incoming = incomingDocumentPaths(argv)
     if (incoming.length) incoming.forEach((filePath) => createWindow(filePath))
+    // The start screen's New asks for a new empty window, not for the one already open.
+    else if (argv.includes('--simple-new')) createWindow()
     else {
       const window = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
       if (window) { if (window.isMinimized()) window.restore(); window.focus() }

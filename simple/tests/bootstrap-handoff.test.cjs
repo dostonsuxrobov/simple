@@ -32,6 +32,12 @@ if (!gotLock) app.quit()
 else {
   app.on('second-instance', (_event, argv, workingDirectory, additionalData) => log({ event: 'second-instance', argv: argv.slice(1), additionalData }))
   setTimeout(() => app.exit(0), Number(process.env.SIMPLE_E2E_HOLD_MS || 4000))
+  // The shared process only: a PDF is asked for while the process is already quitting
+  // (the real app's will-quit comes after the host decided to quit), the way a second
+  // instance's request would arrive.
+  if (process.env.SIMPLE_E2E_OPEN_WHILE_QUITTING && ${JSON.stringify(mode)} === 'calc') {
+    app.prependListener('will-quit', () => app.emit('second-instance', {}, [], process.cwd(), { simpleHost: { groups: [['pdf', [process.env.SIMPLE_E2E_OPEN_WHILE_QUITTING]]] } }))
+  }
 }
 `
 }
@@ -95,7 +101,9 @@ function harness(t) {
     const profile = path.join(root, `profile-${name}`)
     const logFile = path.join(root, `log-${name}.jsonl`)
     fs.mkdirSync(profile)
-    const env = { ...process.env, SIMPLE_E2E_LOG: logFile }
+    // These scenarios are about workspaces in processes of their own (what image and video
+    // always are); the shared process has its own scenario at the end.
+    const env = { ...process.env, SIMPLE_E2E_LOG: logFile, SIMPLE_SEPARATE_PROCESSES: '1' }
     for (const key of ['ELECTRON_RUN_AS_NODE', 'SIMPLE_USER_DATA_DIR', 'PORTABLE_EXECUTABLE_FILE']) delete env[key]
     const start = (args, options = {}) => {
       const child = spawn(require('electron'), [app, `--user-data-dir=${profile}`, ...args], {
@@ -193,5 +201,53 @@ test('Electron: files for a running workspace and for others all open, also when
     assert.match(message.detail, /Report\.pdf/)
     assert.ok(entries.some((entry) => entry.event === 'second-instance'), 'its own file still reached the running workspace')
     assert.equal(await Promise.race([second.exited, sleep(15_000).then(() => 'still running')]) !== 'still running', true, 'then the process ends')
+  })
+
+  await t.test('the shared process: text workspaces start inside the running process, image keeps its own', async () => {
+    const run = scenario('shared')
+    // The fake workspaces open no window: the host is told not to take that for a failed start.
+    const shared = { SIMPLE_SEPARATE_PROCESSES: '0', SIMPLE_HOST_START_TIMEOUT_MS: '300', SIMPLE_HOST_ALLOW_WINDOWLESS: '1' }
+    run.start(['--simple-mode=calc'], { env: { ...shared, SIMPLE_E2E_HOLD_MS: '15000' } })
+    await run.waitFor((entries) => running(entries, 'calc'), 'Spreadsheets to start')
+    const second = run.start(['Budget.xlsx', 'Report.pdf', 'Photo.png'], { cwd: files, env: { ...shared, SIMPLE_E2E_HOLD_MS: '6000' } })
+    const entries = await run.waitFor((log) => log.some((entry) => entry.event === 'second-instance') && running(log, 'pdf') && running(log, 'image'), 'the relay, the PDF workspace and the image workspace')
+    const calc = entries.find((entry) => entry.mode === 'calc' && entry.event === 'start')
+    const relay = entries.find((entry) => entry.event === 'second-instance')
+    assert.equal(relay.mode, 'calc')
+    assert.equal(relay.pid, calc.pid)
+    assert.deepEqual(relay.argv, [path.join(files, 'Budget.xlsx')], 'the running workspace gets only its own file, made absolute')
+    const pdf = entries.find((entry) => entry.mode === 'pdf' && entry.event === 'start')
+    assert.equal(pdf.pid, calc.pid, 'the PDF workspace starts in the process that is already running')
+    assert.deepEqual(pdf.argv, [path.join(files, 'Report.pdf')], 'and reads only its own file')
+    const image = entries.find((entry) => entry.mode === 'image' && entry.event === 'start' && entry.gotLock)
+    assert.notEqual(image.pid, calc.pid, 'the image workspace keeps a process of its own')
+    assert.ok(image.argv.includes('--simple-mode=image') && image.argv.includes(path.join(files, 'Photo.png')))
+    assert.equal(await Promise.race([second.exited, sleep(15_000).then(() => 'still running')]) !== 'still running', true, 'the second invocation ends')
+  })
+
+  await t.test('the shared process: a workspace that opens no window is ended and reported, and the process ends', async () => {
+    const run = scenario('windowless')
+    // Without the allowance above, a workspace with no window when the start time is up has failed.
+    const first = run.start(['--simple-mode=calc'], { env: { SIMPLE_SEPARATE_PROCESSES: '0', SIMPLE_HOST_START_TIMEOUT_MS: '300', SIMPLE_E2E_HOLD_MS: '30000' } })
+    const entries = await run.waitFor((log) => log.some((entry) => entry.event === 'message'), 'the message')
+    const message = entries.find((entry) => entry.event === 'message')
+    assert.equal(message.message, "Simple couldn't start Simple Spreadsheets.")
+    assert.match(message.detail, /did not start/)
+    assert.equal(await Promise.race([first.exited, sleep(15_000).then(() => 'still running')]) !== 'still running', true, 'the process does not stay alive without a window')
+  })
+
+  await t.test('the shared process: a file asked for while the process quits opens in a new instance', async () => {
+    const run = scenario('late-open')
+    const late = path.join(files, 'Late.pdf')
+    const first = run.start(['--simple-mode=calc'], {
+      env: { SIMPLE_SEPARATE_PROCESSES: '0', SIMPLE_HOST_START_TIMEOUT_MS: '300', SIMPLE_HOST_ALLOW_WINDOWLESS: '1', SIMPLE_E2E_HOLD_MS: '1500', SIMPLE_E2E_OPEN_WHILE_QUITTING: late },
+    })
+    const entries = await run.waitFor((log) => running(log, 'pdf'), 'the PDF workspace in a new instance')
+    const calc = entries.find((entry) => entry.mode === 'calc' && entry.event === 'start')
+    const pdf = entries.find((entry) => entry.mode === 'pdf' && entry.event === 'start')
+    assert.notEqual(pdf.pid, calc.pid, 'the quitting process starts no workspace')
+    assert.deepEqual(pdf.argv, [late], 'the new instance opens the file, in the workspace it was routed to')
+    assert.equal(entries.filter((entry) => entry.event === 'start').length, 2, 'one new instance, once')
+    await first.exited
   })
 })

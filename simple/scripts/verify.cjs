@@ -134,7 +134,7 @@ assert.deepEqual(new Set(associated), new Set(SUPPORTED_EXTENSIONS), 'Package as
 assert.ok(packageJson.build.fileAssociations.every((item) => item.icon === 'build/icon.ico'))
 
 const sourcePng = fs.readFileSync(path.join(ROOT, 'assets', 'icon-source.png'))
-assert.equal(crypto.createHash('sha256').update(sourcePng).digest('hex'), '9007a93c6cccd9e8b6abda5a8c889d54cdb61120d071aff63c9cc62483ec4ff9')
+assert.equal(crypto.createHash('sha256').update(sourcePng).digest('hex'), '707104acb93fc636015596523ad8b2ccbb93b5267dbf3ba0058463d40bf0d4dc')
 
 const sharedIco = fs.readFileSync(path.join(ROOT, 'build', 'icon.ico'))
 const sharedIcoHash = crypto.createHash('sha256').update(sharedIco).digest('hex')

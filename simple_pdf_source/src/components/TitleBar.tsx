@@ -16,7 +16,7 @@ export function TitleBar({ fileName, dirty, onClose }: TitleBarProps) {
   return (
     <header className="titlebar">
       <div className="titlebar-drag">
-        <span className="app-title">simple</span>
+        <img className="brand-mark" src="./brand-icon.png" alt="" />
         {fileName && (
           <>
             <span className="title-divider">/</span>

@@ -30,6 +30,18 @@ export function signedCopyName(file: Pick<OpenDocument, 'path' | 'name'>) {
   return `${source.replace(/\.pdf$/i, '')} (edited).pdf`
 }
 
+/**
+ * True when opening failed because the file is no longer there. The main
+ * process names that case FILE_NOT_FOUND, and Electron passes the code across
+ * IPC as the error name ("Error invoking remote method '…': FILE_NOT_FOUND: …").
+ * Any other failure (locked, unreadable, unsupported) says nothing about
+ * whether the file still exists.
+ */
+export function isMissingFileError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /(^|: )FILE_NOT_FOUND: /.test(message)
+}
+
 /** Problems that mean a save would not write exactly what the user made. */
 export function blockingProblems(output: { warnings: PdfSaveProblem[]; failures: PdfSaveProblem[] }) {
   return [...output.failures, ...output.warnings.filter((warning) => warning.dataLoss)]

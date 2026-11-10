@@ -439,7 +439,7 @@ export function isMissingFileError(error) {
 export function openErrorMessage(error, fallback = "This document could not be opened.") {
   if (isMissingFileError(error)) return "That file is no longer available. It may have been moved, renamed or deleted.";
   const message = cleanErrorMessage(error, fallback);
-  if (/\b(?:EBUSY|EPERM|EACCES)\b/.test(message)) return "Simple Docs can't read that file. Another program may be using it, or you may not have permission to open it.";
+  if (/\b(?:EBUSY|EPERM|EACCES)\b/.test(message)) return "Simple can't read that file. Another program may be using it, or you may not have permission to open it.";
   return message;
 }
 

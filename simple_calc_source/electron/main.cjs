@@ -341,8 +341,10 @@ function registerIpc() {
     if (bytes.byteLength > MAX_OPEN_BYTES) throw new Error('This workbook is larger than the 512 MB safety limit.')
     if (!supportedOrExtensionless(input.name)) throw new Error('This spreadsheet format is not supported.')
     const imported = await importWorkbookBytes(input.name, bytes)
-    // The dropped bytes are both the original (for an unchanged copy) and the merge base.
-    return rememberDocument(event, imported.payload, null, { bytes: imported.mergeBase || Buffer.from(bytes), size: bytes.length }, { mergeBase: imported.mergeBase })
+    // The dropped bytes are the original (for an unchanged copy). The merge base is not
+    // always the same thing: for an .ods read through the office engine it is a converted
+    // XLSX, which must never be written out under the .ods name.
+    return rememberDocument(event, imported.payload, null, { bytes: Buffer.from(bytes), size: bytes.length }, { mergeBase: imported.mergeBase })
   })
 
   // What this machine can write: without the local document engine, XLS/ODS saves of edited
@@ -522,6 +524,8 @@ else {
       incoming.forEach((filePath) => createWindow(filePath))
       return
     }
+    // The start screen's New asks for a new empty window, not for the one already open.
+    if (argv.includes('--simple-new')) { createWindow(); return }
     const browserWindow = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
     if (browserWindow) {
       if (browserWindow.isMinimized()) browserWindow.restore()

@@ -2368,6 +2368,7 @@ async function importWorkbookBytes(name, data, options = {}) {
 
   let imported
   let mergeBase = null
+  let compatibilityFallback = false
   try {
     if (sourceFormat === 'ods') {
       let converted = null
@@ -2393,7 +2394,10 @@ async function importWorkbookBytes(name, data, options = {}) {
         imported = await importWithExcelJS(buffer, sourceName, warnings)
         mergeBase = buffer
       } catch (excelError) {
-        warnings.push('The rich OOXML reader could not open this file; the compatibility reader was used instead, so some formatting may be simplified.')
+        // The compatibility reader sees no pictures, charts or tables, and there is no
+        // package to merge a save into: saving goes to a copy, never over the original.
+        warnings.push('The rich OOXML reader could not open this file; the compatibility reader was used instead, so pictures, charts and some formatting are not shown. Saving creates a copy and does not overwrite the original.')
+        compatibilityFallback = true
         try {
           imported = importWithSheetJS(buffer, sourceName, sourceFormat, warnings)
         } catch (sheetError) {
@@ -2425,8 +2429,8 @@ async function importWorkbookBytes(name, data, options = {}) {
   }
   const legacyWithoutEngine = ['xls', 'xlt', 'xla', 'ods'].includes(sourceFormat) && !officeEngine
   const payload = finalizePayload(sourceName, sourceFormat, imported, warnings, {
-    requiresSaveAs: mismatch || legacyWithoutEngine,
-    saveAsFormat: mismatch || legacyWithoutEngine ? (['csv', 'tsv'].includes(sourceFormat) ? sourceFormat : 'xlsx') : undefined,
+    requiresSaveAs: mismatch || legacyWithoutEngine || compatibilityFallback,
+    saveAsFormat: mismatch || legacyWithoutEngine || compatibilityFallback ?(['csv', 'tsv'].includes(sourceFormat) ? sourceFormat : 'xlsx') : undefined,
     officeEngine,
   })
   return { payload, mergeBase }

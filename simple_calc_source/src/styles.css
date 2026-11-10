@@ -769,6 +769,26 @@ textarea:focus-visible,
   background: var(--accent-soft);
 }
 
+/* Viewer first: the menu bar and formatting tools appear with Tools. */
+.workbook-app.is-viewer .spreadsheet-menu-bar { display: none; }
+.tools-toggle {
+  height: 31px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 4px 0 8px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: #3d403a;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.tools-toggle:hover { background: #f1f2ee; }
+.tools-toggle.is-on { border-color: #355542; color: #fff; background: #355542; }
+
 .tool-button:disabled {
   opacity: 0.3;
   cursor: default;
@@ -2867,9 +2887,10 @@ textarea:focus-visible,
     gap: 4px;
   }
 
+  /* No positional rule for toolbar groups here: the bar's own overflow handles a narrow
+     window, and "the second group" is now zoom (viewer) or undo/redo (tools). */
   .font-select,
   .size-select,
-  .command-group:nth-of-type(2),
   .format-badge {
     display: none;
   }

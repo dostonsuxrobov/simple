@@ -122,11 +122,12 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div class="app-shell">
     <header class="titlebar" role="banner">
       <div class="drag-region title-identity">
-        <span class="app-mark">${icons.file}</span>
-        <span class="app-name">Simple Docs</span>
+        <span class="app-mark"><img src="./brand-icon.png" alt=""></span>
+        <span class="app-name">simple</span>
         <span class="title-divider" aria-hidden="true"></span>
         <span class="document-title" id="document-title">Untitled document</span>
         <span class="save-state" id="save-state">Ready</span>
+        <button type="button" class="mode-chip" id="mode-chip" hidden></button>
       </div>
       <div class="command-search" id="command-search" role="search">
         <span class="command-search-icon" aria-hidden="true">${icons.search}</span>
@@ -144,7 +145,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button class="action-button" id="open-button" title="Open a document (Ctrl+O)">${icons.open}<span>Open</span></button>
         <button class="action-button primary-action" id="save-button" title="Save (Ctrl+S)">${icons.save}<span>Save</span></button>
         <div class="export-control">
-          <button class="action-button export-action" id="export-as-button" title="Open or create a document to export" aria-haspopup="menu" aria-expanded="false" aria-disabled="true" disabled>${icons.export}<span>Export As</span>${icons.chevron}</button>
+          <button class="action-button export-action" id="export-as-button" tabindex="-1" title="Open or create a document to export" aria-haspopup="menu" aria-expanded="false" aria-disabled="true" disabled>${icons.export}<span>Export As</span>${icons.chevron}</button>
           <div class="action-menu export-menu" id="export-menu" role="menu" hidden>
             <div class="menu-heading">Convert document to</div>
             <button role="menuitem" data-export-format="docx">${icons.file}<span><strong>Word document</strong><small>Editable .docx copy</small></span></button>
@@ -154,10 +155,12 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <button role="menuitem" data-export-format="txt">${icons.text}<span><strong>Plain text</strong><small>Readable text without formatting</small></span></button>
           </div>
         </div>
-        <button class="action-button icon-only" id="more-button" title="More document actions" aria-haspopup="menu" aria-expanded="false">${icons.chevron}</button>
+        <button class="action-button" id="tools-button" title="Formatting, layout, tables, review and command search" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.4 3.6a2 2 0 0 1 2.9 2.9L7.5 18.3l-4 1 1-4Z"/></svg><span>Tools</span></button>
+        <button class="action-button icon-only" id="print-button" title="Print (Ctrl+P)" aria-label="Print">${icons.print}</button>
+        <button class="action-button icon-only" id="more-button" title="More document actions" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
         <div class="action-menu" id="action-menu" role="menu" hidden>
+          <button role="menuitem" id="export-menu-item">${icons.export}<span><strong>Export As…</strong><small>Word, PDF, web page, Markdown or text</small></span></button>
           <button role="menuitem" id="save-as-button">${icons.saveAs}<span><strong>Save as</strong><small>F12 or Ctrl+Shift+S</small></span></button>
-          <button role="menuitem" id="print-button">${icons.print}<span><strong>Print</strong><small>Ctrl+P</small></span></button>
           <button role="menuitem" id="author-button" title="The name shown on your comments and suggestions">${icons.person}<span><strong>Author name</strong><small id="author-name-label">Author</small></span></button>
         </div>
       </nav>
@@ -175,7 +178,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <div id="original-layout-view" class="original-layout-view" hidden><p id="original-layout-loading">Preparing the document page view…</p><iframe id="original-layout-pdf" title="Document page view" hidden></iframe></div>
       <section class="welcome" id="welcome" aria-labelledby="welcome-title">
         <div class="welcome-card">
-          <div class="welcome-brand"><span class="welcome-mark">${icons.file}</span><div><h1 id="welcome-title">Simple Docs</h1><p>Write clearly. Keep your documents yours.</p></div></div>
+          <div class="welcome-brand"><span class="welcome-mark">${icons.file}</span><div><h1 id="welcome-title">simple</h1><p>Write clearly. Keep your documents yours.</p></div></div>
           <div class="start-actions">
             <button class="start-card primary-start" id="blank-document">
               <span class="start-icon">${icons.plus}</span>
@@ -199,10 +202,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       </section>
       <div class="loading-overlay" id="loading-overlay">
         <div class="loader-mark">${icons.file}</div>
-        <div class="loader-copy"><strong id="loader-title">Preparing Simple Docs</strong><span id="loader-detail">Loading the page layout engine…</span></div>
+        <div class="loader-copy"><strong id="loader-title">Preparing Simple</strong><span id="loader-detail">Loading the page layout engine…</span></div>
         <div class="progress-track"><span id="progress-bar"></span></div>
       </div>
-      <div class="drop-overlay" id="drop-overlay" hidden><div>${icons.open}<strong id="drop-overlay-title">Open in Simple Docs</strong><span id="drop-overlay-detail">Drop the document here</span></div></div>
+      <div class="drop-overlay" id="drop-overlay" hidden><div>${icons.open}<strong id="drop-overlay-title">Open in Simple</strong><span id="drop-overlay-detail">Drop the document here</span></div></div>
     </main>
     <div class="paste-options" id="paste-options" hidden>
       <button class="paste-options-button" id="paste-options-button" type="button" title="Paste options (Ctrl)" aria-label="Paste options" aria-haspopup="menu" aria-expanded="false" aria-controls="paste-options-menu">${icons.clipboard}${icons.chevron}</button>
@@ -333,12 +336,24 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const welcome = $("welcome");
 const editorHost = $("editor");
+
+// A viewer first: the ribbon, ruler, outline, command search and undo/redo
+// appear with Tools (styles.css hides them under body.viewer-mode). The
+// document stays editable either way.
+const toolsButton = $("tools-button");
+function setToolsShown(shown: boolean) {
+  document.body.classList.toggle("viewer-mode", !shown);
+  toolsButton.setAttribute("aria-pressed", String(shown));
+}
+setToolsShown(false);
+toolsButton.addEventListener("click", () => setToolsShown(document.body.classList.contains("viewer-mode")));
 const loadingOverlay = $("loading-overlay");
 const loaderTitle = $("loader-title");
 const loaderDetail = $("loader-detail");
 const progressBar = $("progress-bar");
 const titleLabel = $("document-title");
 const saveState = $("save-state");
+const modeChip = $<HTMLButtonElement>("mode-chip");
 const toast = $("toast");
 const actionMenu = $("action-menu");
 const moreButton = $("more-button");
@@ -565,15 +580,31 @@ function savedStateLabel() {
   return currentPath ? "Saved locally" : "Not saved yet";
 }
 
+/**
+ * Says in the title bar that typing is tracked (Suggesting) or ignored (Viewing): the
+ * mode box is in the ribbon, which is hidden while the tools are hidden.
+ */
+function refreshModeChip() {
+  const mode = handle && documentOpen ? handle.getMode() : "edit";
+  modeChip.hidden = mode === "edit";
+  if (mode === "edit") return;
+  modeChip.textContent = mode === "suggest" ? "Suggesting" : "Viewing";
+  modeChip.title = mode === "suggest"
+    ? "What you type is added as suggestions. Click to switch back to Editing."
+    : "The document can't be changed in Viewing. Click to switch back to Editing.";
+}
+modeChip.addEventListener("click", () => { handle?.setMode("edit"); });
+
 function setTitle() {
   titleLabel.textContent = documentName;
+  refreshModeChip();
   saveState.textContent = saving ? "Saving…" : dirty ? "Unsaved" : documentOpen ? savedStateLabel() : "Ready";
   saveState.title = !saving && !dirty && documentOpen && reviewNotSaved
-    ? `The saved file doesn't include ${describeReviewItems(reviewNotSaved)}. Simple Docs can't save comments and suggestions in this version yet.`
+    ? `The saved file doesn't include ${describeReviewItems(reviewNotSaved)}. Simple can't save comments and suggestions in this version yet.`
     : "";
   saveState.classList.toggle("is-dirty", dirty);
   saveState.classList.toggle("is-saving", saving);
-  const title = `${dirty ? "• " : ""}${documentName} — Simple Docs`;
+  const title = `${dirty ? "• " : ""}${documentName} — simple`;
   document.title = title;
   window.simpleDocs.setTitle(title);
   const exportDisabled = documentExportDisabled(documentOpen, saving);
@@ -644,7 +675,7 @@ async function editAuthorName() {
   const result = await openFormDialog({
     title: "Your name",
     icon: icons.person,
-    message: "Simple Docs shows this name on the comments and suggestions you add. It stays on this computer.",
+    message: "Simple shows this name on the comments and suggestions you add. It stays on this computer.",
     fields: [{ id: "name", label: "Name", value: authorDisplayName(author), maxLength: 80, placeholder: "Your name" }],
     submitLabel: "Save",
     validate: (values) => cleanAuthorName(values.name) ? null : { field: "name", message: "Type the name to show on your comments." },
@@ -1050,7 +1081,7 @@ function conversionNotice(payload: OpenPayload, textOnlyImport: boolean, importW
   if (warnings.length) return warnings.join(" ");
   if (textOnlyImport) return "Text-only import · This .doc file’s formatting, tables and images could not be read on this computer, so only its text was recovered. Saving creates a separate .docx file; the original stays unchanged.";
   if (payload.convertedFrom === "doc") return "Legacy Word document · Save keeps the .doc format. Save as or Export As creates a DOCX copy. Complex layouts may change after editing.";
-  if (payload.macros) return "This document contains macros. Simple Docs doesn’t run them, and saving leaves them out.";
+  if (payload.macros) return "This document contains macros. Simple doesn’t run them, and saving leaves them out.";
   return "";
 }
 
@@ -1058,13 +1089,13 @@ function fidelityNotice(items: FidelityItem[]) {
   if (!items.length) return "";
   const list = describeFidelityItems(items);
   return currentPath
-    ? `Simple Docs can't keep some content in this file: ${list}. Saving offers a copy, so the original stays intact.`
-    : `Simple Docs can't keep some content in this file: ${list}. It won't be in the saved copy.`;
+    ? `Simple can't keep some content in this file: ${list}. Saving offers a copy, so the original stays intact.`
+    : `Simple can't keep some content in this file: ${list}. It won't be in the saved copy.`;
 }
 
 /** Opens a payload in this window. Throws, with nothing changed, when the editor cannot read it. */
 async function loadPayload(payload: OpenPayload, options: { recoveryId?: string } = {}) {
-  if (!handle) throw new Error("Simple Docs is still starting. Try again in a moment.");
+  if (!handle) throw new Error("Simple is still starting. Try again in a moment.");
   const recovered = Boolean(options.recoveryId);
   const importFormat = recovered ? undefined : payload.importFormat;
   const template = !recovered && payload.template === true;
@@ -1084,13 +1115,13 @@ async function loadPayload(payload: OpenPayload, options: { recoveryId?: string 
       await handle.openDocx(toArrayBuffer(payload.data));
     }
   } catch (error) {
-    throw new Error(`Simple Docs couldn't read “${payload.name}”. ${sentence(cleanErrorMessage(error, "Its contents are damaged or use a layout the editor doesn't support."))}`);
+    throw new Error(`Simple couldn't read “${payload.name}”. ${sentence(cleanErrorMessage(error, "Its contents are damaged or use a layout the editor doesn't support."))}`);
   } finally {
     loadingDocument = false;
   }
   // An unpatched engine reports import failures in an alert and keeps the old
   // document; never bind the file to a model that is not its content.
-  if (handle.getDocument() === previousModel) throw new Error(`Simple Docs couldn't read “${payload.name}”. Its contents are damaged or use a layout the editor doesn't support.`);
+  if (handle.getDocument() === previousModel) throw new Error(`Simple couldn't read “${payload.name}”. Its contents are damaged or use a layout the editor doesn't support.`);
 
   const importedLegacyDocument = payload.convertedFrom === "doc";
   const textOnlyImport = importedLegacyDocument && payload.conversionMethod !== "layout";
@@ -1333,7 +1364,7 @@ async function saveDocument(forceDialog = false): Promise<boolean> {
         const original = fileName(plan.sourcePath);
         const choice = await askChoice({
           title: `Save as “${plan.name}”?`,
-          message: `Simple Docs can't write edits into “${original}”, so they go to a new file next to it. The original stays unchanged.`,
+          message: `Simple can't write edits into “${original}”, so they go to a new file next to it. The original stays unchanged.`,
           choices: [{ id: "cancel", label: "Cancel" }, { id: "choose", label: "Choose location…" }, { id: "save", label: "Save", primary: true }],
         });
         if (choice === "cancel") return false;
@@ -1352,7 +1383,7 @@ async function saveDocument(forceDialog = false): Promise<boolean> {
         const original = fileName(currentPath);
         const choice = await askChoice({
           title: "Keep the original file?",
-          message: `“${original}” has content Simple Docs can't keep: ${describeFidelityItems(items)}. Saving over it would remove that content.`,
+          message: `“${original}” has content Simple can't keep: ${describeFidelityItems(items)}. Saving over it would remove that content.`,
           note: `Save a copy keeps the original intact. Replace original keeps a backup of it next to the file.`,
           choices: [{ id: "cancel", label: "Cancel" }, { id: "replace", label: "Replace original" }, { id: "copy", label: "Save a copy", primary: true }],
         });
@@ -2113,6 +2144,14 @@ $("save-as-button").addEventListener("click", () => { toggleMenu(false); void sa
 $("print-button").addEventListener("click", () => { toggleMenu(false); void printDocument(); });
 moreButton.addEventListener("click", (event) => { event.stopPropagation(); toggleMenu(); });
 exportAsButton.addEventListener("click", (event) => { event.stopPropagation(); toggleExportMenu(); });
+// Export As is listed under More; it opens the same format menu in the same place.
+$("export-menu-item").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleMenu(false);
+  // Say why nothing opens (no document yet, or a save or print is still running).
+  if (exportAsButton.disabled) { notify(exportAsButton.title || "Open or create a document to export.", "error"); return; }
+  toggleExportMenu(true);
+});
 exportMenu.querySelectorAll<HTMLButtonElement>("[data-export-format]").forEach((button) => {
   button.addEventListener("click", () => {
     const format = button.dataset.exportFormat as DocumentExportFormat;
@@ -2194,7 +2233,8 @@ function handleShortcut(event: KeyboardEvent) {
     event.stopImmediatePropagation();
     if (binding.command === "save-as") void saveDocument(true);
     else if (binding.command === "close") requestClose();
-    else if (binding.command === "command-search") commandSearch.focus();
+    // The search box lives with the tools: show them first, whichever key asked for it.
+    else if (binding.command === "command-search") { setToolsShown(true); commandSearch.focus(); }
     return true;
   }
   const search = binding.command === "find" || binding.command === "replace";
@@ -2315,7 +2355,8 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     toggleMenu(false);
     toggleExportMenu(false);
-    exportAsButton.focus();
+    // Both menus open from More (the Export As button itself is not shown).
+    moreButton.focus();
     return;
   }
   if (event.key === "F11") {
@@ -2585,7 +2626,7 @@ function dispatchPaste(content: PasteContent): { applied: boolean; warnings: str
   } catch (error) {
     console.error("The paste could not be applied", error);
     syncDirty("paste");
-    notify("Simple Docs couldn't paste that here.", "error");
+    notify("Simple couldn't paste that here.", "error");
     return { applied: false, warnings: [] };
   }
   return { applied: built.warnings !== null && handle.getDocument() !== before, warnings: built.warnings ?? [] };
@@ -2762,7 +2803,7 @@ async function pasteFromSystemClipboard() {
     try {
       content.text = await navigator.clipboard.readText();
     } catch {
-      notify("Simple Docs couldn’t read the clipboard. Press Ctrl+V to paste.", "error");
+      notify("Simple couldn’t read the clipboard. Press Ctrl+V to paste.", "error");
       return;
     }
   }
@@ -2956,7 +2997,7 @@ window.addEventListener("dragenter", (event) => {
   dragDepth += 1;
   // Pictures and text dropped on an open document go where they are dropped.
   if (kind !== "document" && documentOpen) return;
-  $("drop-overlay-title").textContent = kind === "document" ? "Open in Simple Docs" : "Start a new document";
+  $("drop-overlay-title").textContent = kind === "document" ? "Open in Simple" : "Start a new document";
   $("drop-overlay-detail").textContent = kind === "document" ? "Drop the document here" : kind === "picture" ? "Drop the picture here" : "Drop the text here";
   $("drop-overlay").hidden = false;
 });
@@ -3016,7 +3057,7 @@ window.addEventListener("drop", (event) => {
   }
   const pictures = files.filter(isPictureFile);
   if (files.length && !pictures.length) {
-    notify(`Simple Docs can’t open “${files[0].name}”. It opens Word documents, OpenDocument text, Rich Text, web pages, Markdown and plain text.`);
+    notify(`Simple can’t open “${files[0].name}”. It opens Word documents, OpenDocument text, Rich Text, web pages, Markdown and plain text.`);
     return;
   }
   const point = { clientX: event.clientX, clientY: event.clientY };
@@ -3035,14 +3076,17 @@ window.addEventListener("drop", (event) => {
     pasteContent(content, "keep", { offerOptions: false });
   } catch (error) {
     console.error("The dropped content could not be added", error);
-    notify("Simple Docs couldn’t add the dropped content.", "error");
+    notify("Simple couldn’t add the dropped content.", "error");
   }
 });
 
 window.simpleDocs.onMaximized((maximized) => { $("maximize-button").innerHTML = maximized ? icons.restore : icons.maximize; });
 window.simpleDocs.onFullscreen((fullscreen) => {
+  const entering = fullscreen && !document.body.classList.contains("focus-mode");
   document.body.classList.toggle("focus-mode", fullscreen);
   $("focus-button").setAttribute("aria-pressed", String(fullscreen));
+  // Focus mode hides every control, so say how to leave it.
+  if (entering) notify("Focus mode. Press Esc or F11 to leave.");
 });
 window.simpleDocs.onCloseRequested(requestClose);
 
@@ -3137,7 +3181,7 @@ function dispatchModelOps(build: (doc: WordDocument, selection: DocSelection | n
     });
   } catch (error) {
     console.error("The change could not be applied", error);
-    notify("Simple Docs couldn't make that change.", "error");
+    notify("Simple couldn't make that change.", "error");
     return false;
   }
   return handle.getDocument() !== before;
@@ -3469,7 +3513,7 @@ async function applyFont(family: string, entry: FontEntry): Promise<boolean> {
   rememberRecentFont(localSettings(), family);
   if (!shown && !fontNotesShown.has(familyKey(family))) {
     fontNotesShown.add(familyKey(family));
-    notify(`“${family}” is applied and saved with the document. This window shows it with a similar font; new Simple Docs windows show the font itself.`);
+    notify(`“${family}” is applied and saved with the document. This window shows it with a similar font; new Simple windows show the font itself.`);
   }
   return true;
 }
@@ -3576,6 +3620,7 @@ async function initialize() {
   });
   editor.on("modeChanged", (event) => {
     refreshHistoryButtons();
+    refreshModeChip();
     noteSuggestingAuthor(event.mode);
     // Viewing hides the spelling marks; Editing and Suggesting show them again.
     spelling?.schedule(0);
@@ -3600,7 +3645,7 @@ async function initialize() {
       return;
     }
     if (request.kind === "confirm") {
-      const choice = await askChoice({ title: request.title || "Simple Docs", message: request.message, choices: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "OK", primary: true }] });
+      const choice = await askChoice({ title: request.title || "Simple", message: request.message, choices: [{ id: "cancel", label: "Cancel" }, { id: "ok", label: "OK", primary: true }] });
       return choice === "ok";
     }
     return commands ? commands.answerEnginePrompt(request) : null;
@@ -3624,6 +3669,6 @@ async function initialize() {
 
 void initialize().catch((error) => {
   console.error("Simple Docs failed to initialize", error);
-  loaderTitle.textContent = "Simple Docs could not start";
+  loaderTitle.textContent = "Simple could not start";
   loaderDetail.textContent = error instanceof Error ? error.message : "The page layout engine failed to load.";
 });

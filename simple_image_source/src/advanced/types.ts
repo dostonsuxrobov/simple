@@ -656,7 +656,8 @@ export interface AdvancedEditorHandle {
   /** Active-layer selection (or merged when merged = true) as a new canvas; caller releases. Null when empty. */
   copySelection(merged: boolean): Promise<HTMLCanvasElement | null>
   /** Places an image as a new layer centred in the view (paste, drop). */
-  placeImage(pixels: PixelBuffer, name: string): void
+  /** @returns false when the layer was refused (the document is at its layer or memory limit; the editor says so). */
+  placeImage(pixels: PixelBuffer, name: string): boolean
   /** PSD features that would be lost by overwriting the source file. */
   fidelityIssues(): readonly PsdFidelityIssue[]
   focus(): void

@@ -16,6 +16,7 @@ import {
   Layers,
   Maximize2,
   Minus,
+  MoreHorizontal,
   MousePointer2,
   PenLine,
   Pipette,
@@ -100,7 +101,13 @@ interface OpenPayloadExtras {
   notices?: string[]
   suggestedName?: string | null
   sourceToken?: string
+  /** The PDF this picture is page 1 of (null when it was dropped without a path). */
+  pdfSource?: string | null
+  /** The picture is a look at a PDF, not a file of its own. */
+  pdfPreview?: boolean
 }
+/** A PDF dropped on the Advanced editor adds at most this many pages as layers. */
+const PDF_LAYER_PAGES = 10
 /** Per-document facts, keyed by documentIdRef so a load elsewhere (WP1's PSD open) can never leave stale data. */
 interface DocumentMeta {
   documentId: number
@@ -291,6 +298,12 @@ function App() {
   const [exportMenu, setExportMenu] = useState(false)
   const [contextMenu, setContextMenu] = useState<ImageContextMenu | null>(null)
   const [simplePanel, setSimplePanel] = useState<SimplePanel>('details')
+  const [toolsOpen, setToolsOpen] = useState(false)
+  const [moreMenu, setMoreMenu] = useState(false)
+  /** The PDF behind the picture on screen, when it is a PDF preview. */
+  const [pdfSource, setPdfSource] = useState<string | null>(null)
+  const pdfSourceRef = useRef<string | null>(null)
+  useEffect(() => { pdfSourceRef.current = pdfSource }, [pdfSource])
   const [adjustTab, setAdjustTab] = useState<AdjustTab>('light')
   const [pendingAdjust, setPendingAdjust] = useState<PendingAdjust>(NEUTRAL_ADJUST)
   const [comparing, setComparing] = useState(false)
@@ -981,7 +994,7 @@ function App() {
   const loadPayloadNow = useCallback(async (payload: ImagePayload, request: number) => {
     if (request !== loadRequestRef.current) return
     // advanced-integration (WP1): layered Photoshop documents open in Advanced mode.
-    if (payload.format === 'psd') return openLayeredPayload(payload, request)
+    if (payload.format === 'psd') { setPdfSource(null); return openLayeredPayload(payload, request) }
     const extras = payload as ImagePayload & OpenPayloadExtras
     const blob = new Blob([payload.data as BlobPart], { type: payload.mime })
     const url = URL.createObjectURL(blob)
@@ -1054,8 +1067,15 @@ function App() {
         }).catch(() => {})
       }
       setDimensions({ width: canvas.width, height: canvas.height })
-      dirtyRef.current = false
-      setDirtyState(false)
+      setPdfSource(extras.pdfPreview && typeof extras.pdfSource === 'string' ? extras.pdfSource : null)
+      // A pasted or path-less dropped picture exists nowhere else yet: it is unsaved, and closing asks.
+      // (A PDF preview is only a look at a file that is already there.)
+      const unsaved = !payload.path && !extras.pdfPreview
+      // Never saved: no revision of it counts as the saved one, so undoing every edit (or a
+      // trip through Advanced) cannot turn it back into "Saved".
+      if (unsaved) savedRevisionRef.current = -1
+      dirtyRef.current = unsaved
+      setDirtyState(unsaved)
       setTool('view')
       setCropRect(null)
       undoRef.current = []
@@ -1103,12 +1123,37 @@ function App() {
     })
   }, [loadPayloadNow, notify, requestProceed])
 
+  // ---- PDFs in the image window ----
+  // A PDF dropped on the viewer is shown as a picture of its first page. (Next and Previous
+  // stay with images: the folder list never includes PDFs.) It is a look at the file, not an
+  // edit of it: Save offers a PNG copy, and "Open in PDF" goes to
+  // the real document.
+  const pdfPreviewPayload = useCallback(async (bytes: Uint8Array, name: string, filePath: string | null): Promise<ImagePayload> => {
+    const { renderPdfPages, pageToPng } = await import('./pdf-pages.ts')
+    const rendered = await renderPdfPages(bytes, 1)
+    const png = await pageToPng(rendered.pages[0])
+    const extras: OpenPayloadExtras = {
+      notices: [rendered.pageCount > 1 ? `PDF, page 1 of ${rendered.pageCount}, shown as a picture. Use Open in PDF (under More) for the whole document.` : 'PDF shown as a picture. Use Open in PDF (under More) to work on the document.'],
+      suggestedName: name.replace(/\.pdf$/i, '.png'),
+      pdfSource: filePath,
+      pdfPreview: true,
+    }
+    return { data: png, name, path: filePath, size: bytes.byteLength, format: 'png', mime: 'image/png', directSave: false, ...extras }
+  }, [])
+
   const openPath = useCallback(async (filePath: string) => {
     if (printDialogOpenRef.current) return
     const request = ++loadRequestRef.current
-    try { loadPayload(await window.simpleImage.openPath(filePath), request) }
+    try {
+      if (/\.pdf$/i.test(filePath)) {
+        const file = await window.simpleImage.readPdf(filePath)
+        loadPayload(await pdfPreviewPayload(file.data, file.name, file.path), request)
+        return
+      }
+      loadPayload(await window.simpleImage.openPath(filePath), request)
+    }
     catch (error) { if (request === loadRequestRef.current) notify(error instanceof Error ? error.message : 'The image could not be opened.', 'error') }
-  }, [loadPayload, notify])
+  }, [loadPayload, notify, pdfPreviewPayload])
 
   // The album cursor moves even when a file fails to open, so Next/Previous step past an
   // unreadable sibling instead of retrying it forever. A successful open re-syncs it.
@@ -1138,8 +1183,14 @@ function App() {
     const request = ++loadRequestRef.current
     try {
       const extension = file.name.split('.').pop()?.toLowerCase() || ''
-      if (!SUPPORTED.includes(extension)) throw new Error(`.${extension || '?'} images are not supported.`)
       const filePath = window.simpleImage.pathForFile(file)
+      if (extension === 'pdf') {
+        // With a path, Open in PDF can go to the real document.
+        if (filePath) { const file2 = await window.simpleImage.readPdf(filePath); loadPayload(await pdfPreviewPayload(file2.data, file2.name, file2.path), request) }
+        else loadPayload(await pdfPreviewPayload(new Uint8Array(await file.arrayBuffer()), file.name, null), request)
+        return
+      }
+      if (!SUPPORTED.includes(extension)) throw new Error(`.${extension || '?'} images are not supported.`)
       const payload = filePath
         ? await window.simpleImage.openPath(filePath)
         : await window.simpleImage.openBytes(file.name, await file.arrayBuffer())
@@ -1147,7 +1198,74 @@ function App() {
     } catch (error) {
       notify(error instanceof Error ? error.message : 'The dropped image could not be opened.', 'error')
     }
-  }, [loadPayload, notify])
+  }, [loadPayload, notify, pdfPreviewPayload])
+
+  /** Advanced mode: each dropped image (or PDF page) becomes a new layer above the active one (one undo step each). */
+  const placeDroppedFiles = useCallback(async (files: File[]) => {
+    const handle = advanced.handle
+    if (!handle || !files.length) return
+    let placed = 0
+    let failure = ''
+    let note = ''
+    /** The editor refused a layer and already said why: no success message on top of that. */
+    let refused = false
+    for (const file of files) {
+      const extension = file.name.split('.').pop()?.toLowerCase() || ''
+      let url = ''
+      try {
+        if (extension === 'pdf') {
+          // Each page becomes a layer (the first ten of a long document).
+          const { renderPdfPages } = await import('./pdf-pages.ts')
+          const stem = file.name.replace(/\.[^.]+$/, '') || 'PDF'
+          let added = 0
+          // One page at a time, placed as it is drawn; a refused layer (the document is full) ends the run.
+          const rendered = await renderPdfPages(new Uint8Array(await file.arrayBuffer()), PDF_LAYER_PAGES, (page, pageCount) => {
+            if (!handle.placeImage({ width: page.width, height: page.height, data: page.data }, pageCount > 1 ? `${stem} p${page.page}` : stem)) { refused = true; return false }
+            added += 1
+            return true
+          })
+          placed += added
+          if (!refused && rendered.pageCount > added) note = `Added the first ${added} of ${rendered.pageCount} pages of ${file.name} as layers.`
+          continue
+        }
+        if (extension === 'psd') throw new Error(`${file.name} is a layered document. Open it on its own instead.`)
+        if (!SUPPORTED.includes(extension)) throw new Error(`.${extension || '?'} images are not supported.`)
+        // Windows does not always report a type, and an SVG only decodes with one.
+        const source = file.type || extension !== 'svg' ? file : new Blob([await file.arrayBuffer()], { type: 'image/svg+xml' })
+        url = URL.createObjectURL(source)
+        const decoded = new Image()
+        decoded.decoding = 'async'
+        decoded.src = url
+        await decoded.decode()
+        const width = decoded.naturalWidth
+        const height = decoded.naturalHeight
+        if (!width || !height) throw new Error(`${file.name} has no drawable pixels.`)
+        if (width > MAX_CANVAS_DIMENSION || height > MAX_CANVAS_DIMENSION || width * height > MAX_CANVAS_PIXELS) {
+          throw new Error(`${file.name} is too large to add. The limit is 50 megapixels and 20,000 pixels per side.`)
+        }
+        const scratch = new OffscreenCanvas(width, height)
+        try {
+          const context = scratch.getContext('2d', { willReadFrequently: true })
+          if (!context) throw new Error(`${file.name} could not be read.`)
+          context.drawImage(decoded, 0, 0)
+          const pixels = context.getImageData(0, 0, width, height)
+          if (handle.placeImage({ width, height, data: pixels.data }, file.name.replace(/\.[^.]+$/, '') || 'Layer')) placed += 1
+          else refused = true
+        } finally {
+          scratch.width = 1
+          scratch.height = 1
+        }
+      } catch (error) {
+        failure = error instanceof Error && error.message && !/decod/i.test(error.message) ? error.message : `${file.name} could not be read as an image.`
+      } finally {
+        if (url) URL.revokeObjectURL(url)
+      }
+    }
+    if (failure) notify(failure, 'error')
+    else if (refused) { /* the editor's own message stands */ }
+    else if (note) notify(note)
+    else if (placed > 1) notify(`Added ${placed} layers`)
+  }, [advanced.handle, notify])
 
   /** A small modal with explicit choices; resolves with the chosen value or 'cancel'. */
   const askChoice = useCallback((title: string, detail: string, tone: ChoiceState['tone'], options: ChoiceOption[]) => new Promise<string>((resolve) => {
@@ -1219,7 +1337,7 @@ function App() {
         : saveFormat === 'psd'
           ? await advanced.encodePsd()
           : new Uint8Array(await (await advanced.withOutputCanvas((output) => canvasToBlob(output, saveFormat, quality))).arrayBuffer())
-      const input: SaveImageInput & { sourceToken?: string } = {
+      const input: SaveImageInput & { sourceToken?: string; sourcePath?: string } = {
         data,
         path: showDialog ? current.path : current.path,
         name: current.name,
@@ -1227,6 +1345,8 @@ function App() {
         forceDialog: showDialog,
       }
       if (meta.sourceToken) input.sourceToken = meta.sourceToken
+      // A picture of a PDF page is saved beside that PDF by default.
+      if (pdfSourceRef.current) input.sourcePath = pdfSourceRef.current
       const result = await window.simpleImage.saveImage(input) as (SavedImage & { warnings?: string[]; stillOfAnimation?: boolean }) | null
       if (!result) return false
       if (documentIdRef.current === documentId) {
@@ -1359,7 +1479,8 @@ function App() {
         const blob = await advanced.withOutputCanvas((output) => canvasToBlob(output, 'png'))
         const result = await window.simpleImage.convertToPdf({
           data: new Uint8Array(await blob.arrayBuffer()),
-          name: current.name,
+          // A picture of a PDF's first page must not offer to replace that PDF.
+          name: pdfSource ? current.name.replace(/\.pdf$/i, ' (page 1).pdf') : current.name,
         })
         if (result) notify(`Exported ${result.name}`)
         else notify('PDF export was canceled.')
@@ -1742,9 +1863,14 @@ function App() {
       event.stopPropagation()
       return
     }
+    // In Advanced a drop adds to the open document: every dropped image becomes a new layer.
+    if (advanced.mode === 'advanced') {
+      void placeDroppedFiles(Array.from(event.dataTransfer.files))
+      return
+    }
     const file = event.dataTransfer.files[0]
     if (file) void openDroppedFile(file)
-  }, [openDroppedFile])
+  }, [advanced.mode, openDroppedFile, placeDroppedFiles])
 
   const confirmDiscard = useCallback(async () => {
     const action = confirmState?.action
@@ -1848,7 +1974,7 @@ function App() {
     const closeMenus = (event: PointerEvent) => {
       const target = event.target as Node
       if (!saveGroupRef.current?.contains(target)) setSaveMenu(false)
-      if (!exportGroupRef.current?.contains(target)) setExportMenu(false)
+      if (!exportGroupRef.current?.contains(target)) { setExportMenu(false); setMoreMenu(false) }
     }
     document.addEventListener('pointerdown', closeMenus)
     return () => document.removeEventListener('pointerdown', closeMenus)
@@ -1978,9 +2104,10 @@ function App() {
       // advanced-integration (WP1): while Advanced (or one of its dialogs) is open, the editor owns every
       // key except the host file shortcuts Ctrl+O, Ctrl+S, Ctrl+Shift+S and Ctrl+P, which continue below.
       if (advanced.mode === 'advanced' || advanced.modalOpen) {
-        if (event.key === 'Escape' && (saveMenu || exportMenu)) {
+        if (event.key === 'Escape' && (saveMenu || exportMenu || moreMenu)) {
           setSaveMenu(false)
           setExportMenu(false)
+          setMoreMenu(false)
           return
         }
         if (advanced.handleHostKey(event)) return
@@ -2053,6 +2180,7 @@ function App() {
       if (event.key === 'Escape') {
         setSaveMenu(false)
         setExportMenu(false)
+        setMoreMenu(false)
         if (!typing) {
           if (leveling) setLeveling(false)
           else if (tool === 'crop') cancelCrop()
@@ -2072,7 +2200,7 @@ function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [advanced.handleHostKey, advanced.modalOpen, advanced.mode, album, applyCrop, cancelCrop, choiceState, chooseTool, closePrintDialog, commitStrokeSegment, confirmState, contextMenu, copyImageToClipboard, cropRect, exportMenu, exporting, fitImage, image, leveling, markup, navigation, nudgeCrop, openDialog, openPrintDialog, paintTool, pasteFromClipboard, printSnapshot, printing, redo, resizeOpen, saveImage, saveMenu, saving, simplePanel, stepAlbum, toggleInspector, tool, undo, working])
+  }, [advanced.handleHostKey, advanced.modalOpen, advanced.mode, album, applyCrop, cancelCrop, choiceState, chooseTool, closePrintDialog, commitStrokeSegment, confirmState, contextMenu, copyImageToClipboard, cropRect, exportMenu, exporting, fitImage, image, leveling, markup, navigation, nudgeCrop, openDialog, openPrintDialog, paintTool, pasteFromClipboard, printSnapshot, printing, redo, resizeOpen, saveImage, saveMenu, moreMenu, saving, simplePanel, stepAlbum, toggleInspector, tool, undo, working])
 
   const cropStyle = useMemo(() => cropRect && displaySize.width && displaySize.height ? {
     left: `${cropRect.x / displaySize.width * 100}%`,
@@ -2088,6 +2216,8 @@ function App() {
   void historyVersion
   const busy = Boolean(working)
   const toolsDisabled = !image || busy
+  // A viewer first: the editing row appears with Tools, or while one of its tools is in use.
+  const showTools = toolsOpen || tool !== 'view' || simplePanel === 'adjust'
   const straightening = tool === 'crop' && straighten !== 0
   const showRing = (tool === 'brush' || tool === 'eraser') && brushSize * zoom >= 4
   const stateLabel = saving ? 'Saving…' : working ? `${working.label}…` : cropAdjusted ? 'Crop not applied' : dirty || pendingSession ? 'Modified' : 'Saved'
@@ -2161,18 +2291,22 @@ function App() {
             )}
           </div>
           <div ref={exportGroupRef} className="export-group">
-            <button
-              className="export-button"
-              disabled={!image || Boolean(exporting) || printing || saving || busy}
-              title={advanced.mode === 'advanced' ? 'Export As (Alt+Shift+Ctrl+W)' : 'Export As (Ctrl+Shift+E)'}
-              aria-haspopup="menu"
-              aria-expanded={exportMenu}
-              onClick={() => { setSaveMenu(false); setExportMenu((value) => !value) }}
-            >
-              <FileDown />
-              <span>{exporting ? `Exporting ${exporting === 'jpeg' ? 'JPEG' : exporting.toUpperCase()}…` : 'Export As'}</span>
-              <ChevronDown className="button-chevron" />
-            </button>
+            {/* More: the same last button as in the other windows. Export As opens the format list in its place. */}
+            <button className="more-button" aria-label="More" title="More" aria-haspopup="menu" aria-expanded={moreMenu || exportMenu} onClick={() => { setSaveMenu(false); setExportMenu(false); setMoreMenu((value) => !value) }}><MoreHorizontal /></button>
+            <div className="save-menu more-menu" role="menu" aria-label="More" hidden={!moreMenu}>
+              <button
+                role="menuitem"
+                className="export-button"
+                disabled={!image || Boolean(exporting) || printing || saving || busy}
+                title={advanced.mode === 'advanced' ? 'Export As (Alt+Shift+Ctrl+W)' : 'Export As (Ctrl+Shift+E)'}
+                onClick={() => { setSaveMenu(false); setMoreMenu(false); setExportMenu((value) => !value) }}
+              ><FileDown /><span><strong>{exporting ? `Exporting ${exporting === 'jpeg' ? 'JPEG' : exporting.toUpperCase()}…` : 'Export As…'}</strong><small>PNG, JPEG, WebP, PDF and more</small></span></button>
+              {pdfSource && advanced.mode !== 'advanced' && (
+                <button role="menuitem" onClick={() => { setMoreMenu(false); void (window as unknown as { simpleIO?: { openInSimple(filePath: string): Promise<unknown> } }).simpleIO?.openInSimple(pdfSource).then((result) => { const outcome = result as { ok?: boolean; message?: string } | undefined; if (outcome && outcome.ok === false) notify(outcome.message || 'The PDF could not be opened. It may have been moved.', 'error') }, () => notify('The PDF could not be opened.', 'error')) }}><FileDown /><span><strong>Open in PDF</strong><small>The whole document, to read or edit</small></span></button>
+              )}
+              {/* The details panel belongs to the simple view; in Advanced it would open out of sight. */}
+              {advanced.mode !== 'advanced' && <button role="menuitem" disabled={!image} onClick={() => { setMoreMenu(false); toggleInspector() }}><FileImage /><span><strong>{inspectorOpen ? 'Hide image details' : 'Image details'}</strong><small>F4</small></span></button>}
+            </div>
             {exportMenu && image && (
               <div className="export-menu" role="menu" aria-label="Export image as">
                 <div className="menu-heading"><strong>Export a copy</strong><small>The open image and unsaved edits stay in place.</small></div>
@@ -2191,6 +2325,23 @@ function App() {
               </div>
             )}
           </div>
+          {advanced.mode !== 'advanced' && (
+            <button
+              className={`tools-toggle ${showTools ? 'is-on' : ''}`}
+              disabled={!image}
+              aria-pressed={showTools}
+              title="Crop, adjust, mark up and paint"
+              onClick={() => {
+                if (!showTools) { setToolsOpen(true); return }
+                // A crop that was set up is not thrown away by hiding the tools.
+                if (tool === 'crop' && cropAdjusted) { notify('Apply or cancel the crop first.'); return }
+                setToolsOpen(false)
+                // Adjust keeps what was set (pressing its own button again applies it too).
+                if (simplePanel === 'adjust') void openAdjust()
+                if (tool !== 'view') void chooseTool('view')
+              }}
+            ><PenLine /><span>Tools</span></button>
+          )}
           <button ref={printButtonRef} disabled={!image || printing || Boolean(exporting) || saving || busy} title="Print (Ctrl+P)" onClick={() => void openPrintDialog(printButtonRef.current)}><Printer /><span>{printing ? 'Preparing…' : 'Print'}</span></button>
         </div>
         <div className="window-actions">
@@ -2200,7 +2351,7 @@ function App() {
         </div>
       </header>
 
-      <section className="toolbar" data-print-background aria-label="Image tools" aria-hidden={printSnapshot ? true : undefined} hidden={advanced.mode === 'advanced'}>
+      <section className="toolbar" data-print-background aria-label="Image tools" aria-hidden={printSnapshot ? true : undefined} hidden={advanced.mode === 'advanced' || !showTools}>
         <div className="toolbar-row">
           <div className="tool-group">
             <button className={tool === 'view' ? 'active' : ''} disabled={toolsDisabled} onClick={() => void chooseTool('view')} title="View"><MousePointer2 /><span>View</span></button>
@@ -2238,7 +2389,7 @@ function App() {
               className={`advanced-button ${advanced.busy ? 'is-busy' : ''}`}
               title="Advanced editor: layers, selections, adjustment layers and Photoshop shortcuts"
               disabled={!image || saving || Boolean(exporting) || printing || advanced.busy || busy}
-              onClick={() => void advanced.enter()}
+              onClick={() => { setToolsOpen(true); void advanced.enter() }}
             ><Layers /><span>{advanced.busy ? 'Opening…' : 'Advanced'}</span></button>
           </div>
         </div>
@@ -2420,7 +2571,9 @@ function App() {
 
       {draggingFile && (
         <div className="drop-overlay" onDragLeave={(event) => { if (event.currentTarget === event.target) setDraggingFile(false) }}>
-          <div><ImagePlus /><strong>Drop to open</strong><span>Your current image stays safe until you confirm.</span></div>
+          {advanced.mode === 'advanced'
+            ? <div><ImagePlus /><strong>Drop to add as a layer</strong><span>Each image becomes a new layer in this document.</span></div>
+            : <div><ImagePlus /><strong>Drop to open</strong><span>Your current image stays safe until you confirm.</span></div>}
         </div>
       )}
       {contextMenu && image && (

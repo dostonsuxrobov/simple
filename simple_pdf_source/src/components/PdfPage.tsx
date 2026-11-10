@@ -438,6 +438,22 @@ export const PdfPage = memo(function PdfPage({
   const offerPressRef = useRef<{ x: number; y: number } | null>(null)
   const [cropDraft, setCropDraft] = useState<ViewerRect | null>(null)
   const [cropOrigin, setCropOrigin] = useState<{ x: number; y: number } | null>(null)
+  // A crop that was drawn but not applied ends with the Crop tool (or Escape): it must not
+  // stay on the page, dimmed and with a live Apply button, after the tool was left.
+  useEffect(() => {
+    if (tool !== 'crop') { setCropDraft(null); setCropOrigin(null) }
+    // The same for a half-drawn stroke, rectangle or artwork region when its tool is left mid-drag.
+    if (tool !== 'draw') setInkDraft((points) => (points.length ? [] : points))
+    if (tool !== 'rectangle') { setShapeDraft(null); setShapeOrigin(null) }
+    if (tool !== 'edit') { setRegionDraft(null); setRegionOrigin(null) }
+  }, [tool])
+  useEffect(() => {
+    if (!cropDraft) return
+    // In capture and handled: this Escape clears the rectangle and stays in Crop, to draw it again.
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.preventDefault(); setCropDraft(null); setCropOrigin(null) } }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [cropDraft])
   const [regionDraft, setRegionDraft] = useState<ViewerRect | null>(null)
   const [regionOrigin, setRegionOrigin] = useState<{ x: number; y: number } | null>(null)
   const [shapeDraft, setShapeDraft] = useState<ViewerRect | null>(null)

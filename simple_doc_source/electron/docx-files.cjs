@@ -245,7 +245,7 @@ const OPEN_DIALOG_FILTERS = Object.freeze([
   { name: 'All files', extensions: ['*'] },
 ].map((filter) => Object.freeze({ ...filter, extensions: Object.freeze(filter.extensions) })))
 
-const UNSUPPORTED_FILE_MESSAGE = 'Simple Docs can’t open this kind of file. It opens Word documents and templates, OpenDocument text, Rich Text, web pages, Markdown and plain text.'
+const UNSUPPORTED_FILE_MESSAGE = 'Simple can’t open this kind of file. It opens Word documents and templates, OpenDocument text, Rich Text, web pages, Markdown and plain text.'
 
 /** The format a file name declares (see OPEN_FORMATS), or null. */
 function openFormatForName(name) {

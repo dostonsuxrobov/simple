@@ -264,10 +264,11 @@ function readInitial(initial: AdvancedInitialContent): InitialDocument {
     }
     surface.write(0, top, stripe)
   })
-  // Photoshop: an opaque image opens as the locked Background; one with transparency as "Layer 0".
-  const layer = transparent
-    ? createRasterLayer({ name: 'Layer 0', surface })
-    : createRasterLayer({ name: 'Background', surface, isBackground: true })
+  // Every image opens as an ordinary layer, never as a locked Background: opacity, the
+  // eraser, Delete, Move and Transform all work on it straight away. (A Background made
+  // the eraser paint white and greyed out opacity, which read as broken transparency.)
+  // An opaque image is still named "Background", as a name only.
+  const layer = createRasterLayer({ name: transparent ? 'Layer 0' : 'Background', surface })
   return {
     width: canvas.width,
     height: canvas.height,
@@ -673,9 +674,7 @@ function createEditorSession(host: AdvancedHost, initial: InitialDocument, isSus
       const entry = copyPixels(store.getState(), merged)
       return entry ? bufferToCanvas(entry.pixels) : null
     },
-    placeImage: (pixels: PixelBuffer, name: string) => {
-      placePixelsAsLayer(context, pixels, name, 'center', 'Place')
-    },
+    placeImage: (pixels: PixelBuffer, name: string) => placePixelsAsLayer(context, pixels, name, 'center', 'Place') !== null,
     fidelityIssues: () => initial.issues,
     focus: () => surface.focus(),
     canEncodePsd: () => true,
@@ -1434,6 +1433,10 @@ function EditorShell({ session, host, suspended }: { readonly session: EditorSes
           <button type="button" className={`ae-icon-button ${dockOpen ? 'is-active' : ''}`} title="Panels" aria-label="Show panels" aria-pressed={dockOpen} disabled={suspended} onMouseDown={(event) => event.preventDefault()} onClick={() => setDockOpen((open) => !open)}><PanelRight aria-hidden="true" /></button>
         )}
         <span className="ae-rule" aria-hidden="true" />
+        {/* This editor has no File menu of its own: exporting the picture is offered right here. */}
+        <button type="button" className="ae-export" title="Export As: PNG, JPEG, WebP, PDF or PSD (Alt+Shift+Ctrl+W)" disabled={suspended} onMouseDown={(event) => event.preventDefault()} onClick={() => host.openExportMenu()}>
+          <span>Export</span>
+        </button>
         <button type="button" className="ae-simple" title="Back to Simple mode (layers are flattened; you are asked first when that would lose anything)" disabled={suspended} onMouseDown={(event) => event.preventDefault()} onClick={() => host.requestExit()}>
           <ArrowLeftToLine aria-hidden="true" /><span>Simple</span>
         </button>

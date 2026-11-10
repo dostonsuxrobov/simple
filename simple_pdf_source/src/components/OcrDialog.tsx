@@ -72,6 +72,8 @@ export function OcrDialog({
   const [language, setLanguage] = useState('eng')
   const [replaceExisting, setReplaceExisting] = useState(false)
   const [moreOpen, setMoreOpen] = useState(false)
+  // The only place "Do this automatically" (ticked in the Edit-mode offer) can be turned off again.
+  const [autoOnEdit, setAutoOnEdit] = useState(readAutoOcr)
   const canReleaseRef = useRef(canReleasePage)
   canReleaseRef.current = canReleasePage
   const running = Boolean(progress)
@@ -259,6 +261,14 @@ export function OcrDialog({
                 )}
               </div>
             )}
+            <label className="ocr-replace ocr-auto">
+              <input
+                type="checkbox"
+                checked={autoOnEdit}
+                onChange={(event) => { setAutoOnEdit(event.target.checked); writeAutoOcr(event.target.checked) }}
+              />
+              Recognize scanned pages automatically when I edit them
+            </label>
             {note && <p className="ocr-note">{note}</p>}
             {signatureDetected && (
               <p className="export-layout-note ocr-warning"><AlertTriangle size={13} aria-hidden="true" />Recognizing text changes the document and invalidates its digital signature.</p>

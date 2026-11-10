@@ -20,7 +20,8 @@ button { color: inherit; }
 .drag-region { -webkit-app-region: drag; }
 .title-identity { min-width: 270px; flex: 1 1 auto; display: flex; align-items: center; gap: 9px; padding: 0 10px 0 13px; overflow: hidden; }
 .app-mark, .welcome-mark, .loader-mark { display: grid; place-items: center; flex: none; }
-.app-mark { width: 24px; height: 24px; color: #111; }
+.app-mark { width: 20px; height: 20px; color: #111; }
+.app-mark img { width: 100%; height: 100%; object-fit: contain; }
 .app-mark svg, .welcome-mark svg, .loader-mark svg, .start-icon svg, .file-row-icon svg { width: 100%; height: 100%; }
 .app-name { font-size: 13px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
 .title-divider { width: 1px; height: 16px; background: #dedede; margin: 0 2px; }
@@ -28,6 +29,10 @@ button { color: inherit; }
 .save-state { flex: none; padding: 3px 7px; border-radius: 999px; background: #f3f3f3; color: #606060; font-size: 10px; font-weight: 600; }
 .save-state.is-dirty { background: #111; color: #fff; }
 .save-state.is-saving { color: #111; background: #e8e8e8; }
+/* Suggesting / Viewing, shown beside the save state; a click goes back to Editing. */
+.mode-chip { flex: none; padding: 3px 7px; border: 0; border-radius: 999px; background: #111; color: #fff; font-size: 10px; font-weight: 600; line-height: inherit; cursor: pointer; -webkit-app-region: no-drag; }
+.mode-chip:hover { background: #333; }
+.mode-chip:focus-visible { outline: 2px solid #111; outline-offset: 2px; }
 
 .file-actions { position: relative; display: flex; align-items: center; gap: 2px; padding: 0 8px; -webkit-app-region: no-drag; }
 .action-button, .window-actions button { height: 32px; border: 0; background: transparent; display: inline-flex; align-items: center; justify-content: center; gap: 6px; cursor: default; }
@@ -37,7 +42,10 @@ button { color: inherit; }
 .action-button:active { background: #e5e5e5; }
 .primary-action { background: #111; color: #fff; }
 .primary-action:hover { background: #292929; }
-.export-control { position: relative; }
+/* The Export As button itself is not shown (More lists it); its menu opens where More's does. */
+.export-control { position: absolute; right: 7px; top: 3px; width: 0; height: 0; }
+.export-control > .export-action { position: absolute; width: 1px; height: 1px; min-width: 0; padding: 0; border: 0; opacity: 0; overflow: hidden; pointer-events: none; }
+#tools-button svg { width: 15px; height: 15px; }
 .export-action { min-width: 92px; border: 1px solid #cfcfcf; background: #fff; }
 .export-action:hover { border-color: #a7a7a7; background: #f5f5f5; }
 .export-action:disabled { border-color: #dedede; background: #f7f7f7; color: #8a8a8a; opacity: .72; }
@@ -231,6 +239,17 @@ button { color: inherit; }
 .editor-host .cw-review-tab.active { color: #111 !important; border-bottom-color: #111 !important; }
 .editor-host .cw-btn.cw-btn-primary { background: #111 !important; border-color: #111 !important; }
 
+/* Viewer first: the editing chrome appears with Tools. */
+body.viewer-mode .command-search,
+body.viewer-mode .history-actions,
+body.viewer-mode .file-actions .action-divider,
+body.viewer-mode #new-button { display: none; }
+body.viewer-mode .editor-host .cw-toolbar,
+body.viewer-mode .editor-host .cw-ruler-row,
+body.viewer-mode .editor-host .cw-outline { display: none !important; }
+#tools-button[aria-pressed="true"] { background: #111; color: #fff; }
+#tools-button[aria-pressed="true"]:hover { background: #2b2b2b; }
+
 body.focus-mode .titlebar { display: none; }
 body.focus-mode .editor-host .cw-toolbar,
 body.focus-mode .editor-host .cw-ruler-row,
@@ -247,7 +266,8 @@ body.focus-mode .editor-host .cw-review { display: none !important; }
 }
 
 @media (max-width: 760px) {
-  .app-name, .title-divider, .save-state { display: none; }
+  /* The save state and the mode chip stay: the document title shortens instead. */
+  .app-name, .title-divider { display: none; }
   .start-actions { grid-template-columns: 1fr; }
   .welcome-card { width: calc(100% - 28px); padding-top: 30px; }
   .print-backdrop { padding: 8px; }

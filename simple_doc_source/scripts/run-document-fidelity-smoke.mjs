@@ -124,7 +124,7 @@ try {
     await writeFile(documentPath, externalBytes);
     await evaluate(`document.querySelector('#toast').textContent = ''`);
     await key('s', 'KeyS', 83);
-    await waitFor(`document.querySelector('#toast').textContent.includes('changed outside Simple Docs')`);
+    await waitFor(`document.querySelector('#toast').textContent.includes('changed outside Simple.')`);
     assert.deepEqual(await readFile(documentPath), externalBytes, 'external changes must never be overwritten');
     editSaveVerified = true;
   }

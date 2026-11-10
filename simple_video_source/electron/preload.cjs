@@ -13,6 +13,7 @@ ipcRenderer.on('file:open-external', (_event, filePath) => {
 contextBridge.exposeInMainWorld('simpleVideo', {
   openFile: () => ipcRenderer.invoke('file:open-dialog'),
   openPath: (filePath) => ipcRenderer.invoke('file:open-path', filePath),
+  isReadable: (filePath) => ipcRenderer.invoke('file:is-readable', filePath),
   openInNewWindow: (filePath) => ipcRenderer.invoke('file:open-in-new-window', filePath),
   newWindow: () => ipcRenderer.invoke('app:new-window'),
   listRecents: () => ipcRenderer.invoke('recent:list'),

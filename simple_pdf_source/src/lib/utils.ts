@@ -7,7 +7,8 @@ export function clamp(value: number, min: number, max: number) {
 }
 
 export function errorMessage(error: unknown) {
-  if (error instanceof Error) return error.message
+  // What main threw arrives wrapped ("Error invoking remote method 'x': CODE: message"): show the message.
+  if (error instanceof Error) return error.message.replace(/^Error invoking remote method '[^']*': (?:[A-Za-z]*Error: )?/, '').replace(/^[A-Z][A-Z_]{2,}: /, '') || 'Something went wrong.'
   return String(error || 'Something went wrong.')
 }
 

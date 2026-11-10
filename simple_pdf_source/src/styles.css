@@ -89,6 +89,8 @@ textarea:focus-visible {
   letter-spacing: -0.01em;
 }
 
+.titlebar .brand-mark { width: 18px; height: 18px; margin-right: 7px; object-fit: contain; }
+
 .title-divider {
   color: var(--border-strong);
 }
@@ -350,6 +352,51 @@ textarea:focus-visible {
   font-size: 11px;
 }
 .tool-modes .edit-mode-button { height: 30px; padding: 0 9px; font-size: 12px; gap: 5px; }
+
+/* Reading shows open, save, page, zoom and print; the tools appear with Tools. */
+.toolbar [hidden] { display: none !important; }
+/* The hint bar lies over the bottom edge instead of taking height from the page: showing
+   and hiding it with a tool must not re-fit (re-zoom) a page that is in Fit page. */
+.document-app { position: relative; }
+.document-app > .statusbar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 40; }
+.toolbar.is-reading { grid-template-columns: auto minmax(0, 1fr) auto; }
+.toolbar .tools-toggle { height: 30px; padding: 0 10px; font-size: 12px; gap: 5px; }
+.toolbar-more { position: relative; display: flex; }
+.toolbar-more-menu {
+  width: 232px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 80;
+  padding: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 12px 28px rgba(9, 9, 11, 0.16);
+}
+.toolbar-more-menu > button {
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 8px;
+  border: 0;
+  border-radius: 6px;
+  color: #27272a;
+  background: transparent;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.toolbar-more-menu > button:hover:not(:disabled) { background: #f4f4f5; }
+.toolbar-more-menu > button:disabled { opacity: .4; cursor: default; }
+.toolbar-more-menu kbd { color: var(--muted-light); font: inherit; font-size: 10.5px; }
 
 .text-fit-feedback {
   position: absolute;
@@ -2295,7 +2342,8 @@ textarea:focus-visible {
 .busy-overlay {
   position: fixed;
   inset: 38px 0 0;
-  z-index: 500;
+  /* Above the print and sign dialogs (550): "Printing…" and "Saving…" must be seen over them. */
+  z-index: 600;
   display: grid;
   place-items: center;
   background: rgba(250, 250, 250, 0.35);
@@ -2314,6 +2362,22 @@ textarea:focus-visible {
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.15);
   font-size: 11.5px;
   font-weight: 590;
+}
+
+.busy-cancel {
+  height: 24px;
+  margin-left: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  color: inherit;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.busy-cancel:hover {
+  background: #f4f4f5;
 }
 
 .spin {
@@ -2548,6 +2612,12 @@ textarea:focus-visible {
 
 .print-dialog-footer .button-ghost {
   margin-right: auto;
+}
+
+.print-dialog-status {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .print-layout-dialog {
@@ -3073,6 +3143,10 @@ textarea:focus-visible {
   margin: 7px 0 0 17px;
   color: #27272a;
   font-size: 10.5px;
+}
+
+.ocr-replace.ocr-auto {
+  margin: 0;
 }
 
 .ocr-replace input,
@@ -3685,6 +3759,14 @@ textarea:focus-visible {
     grid-template-rows: 42px 36px;
     gap: 0 8px;
     padding-bottom: 6px;
+  }
+
+  /* Reading has no second row of tools: keep the bar one row high. */
+  .toolbar.is-reading {
+    height: 50px;
+    flex-basis: 50px;
+    grid-template-rows: 42px;
+    padding-bottom: 0;
   }
 
   .tool-modes {

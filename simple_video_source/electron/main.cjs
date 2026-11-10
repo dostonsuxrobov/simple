@@ -88,7 +88,7 @@ async function addRecent(filePath) {
 
 async function checkedVideo(filePath) {
   if (typeof filePath !== 'string' || !isSupportedVideoPath(filePath)) {
-    throw new Error('Simple Video does not support this file type.')
+    throw new Error('Simple does not support this file type.')
   }
   const resolved = path.resolve(filePath)
   const stat = await fs.stat(resolved)
@@ -328,6 +328,11 @@ function registerIpc() {
   })
 
   ipcMain.handle('file:open-path', (_event, filePath) => videoPayload(filePath))
+  // Only a question (is the file still readable?); opening it is file:open-path.
+  ipcMain.handle('file:is-readable', async (_event, filePath) => {
+    if (typeof filePath !== 'string' || !filePath) return false
+    try { await fs.access(filePath, require('node:fs').constants.R_OK); return (await fs.stat(filePath)).isFile() } catch { return false }
+  })
   ipcMain.handle('file:open-in-new-window', async (_event, filePath) => {
     if (filePath) await videoPayload(filePath)
     createWindow(filePath || null)
@@ -434,7 +439,7 @@ function registerIpc() {
 
   ipcMain.on('window:set-title', (event, title) => {
     const window = callingWindow(event)
-    if (window) window.setTitle(String(title || 'simple video').slice(0, 256))
+    if (window) window.setTitle(String(title || 'simple').slice(0, 256))
   })
   ipcMain.on('window:minimize', (event) => callingWindow(event)?.minimize())
   ipcMain.on('window:toggle-maximize', (event) => {

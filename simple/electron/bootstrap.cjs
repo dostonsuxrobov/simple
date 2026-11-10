@@ -33,11 +33,29 @@ const routed = routeCommandLine(process.argv)
 const grouped = routed.groups
 const mode = routed.mode
 
-// Each internal mode keeps its own lock and state directory. That lets every
-// workspace coexist while retaining its own lifecycle and IPC registrations,
-// with no duplicate handlers in a shared process.
-app.setPath('userData', path.join(stateRoot, mode))
+// The launcher and the text workspaces share one process (see host.cjs): every
+// process tree costs about 105 MB before a document opens, so three of them
+// open cost that three times over. Workspaces that need the GPU (below) keep a
+// process of their own, as does everything with SIMPLE_SEPARATE_PROCESSES=1
+// and the self-test.
+const GPU_MODES = new Set(['image', 'video'])
+const selfTestRun = process.argv.includes('--simple-self-test')
+const separate = process.env.SIMPLE_SEPARATE_PROCESSES === '1' || selfTestRun
+const isHosted = (name) => !separate && !GPU_MODES.has(name)
+const hosted = isHosted(mode)
+
+// A process of its own keeps its own lock and state directory. The shared
+// process has one lock ("host"); its workspaces keep their state folders
+// (<state>/<mode>) through the host.
+app.setPath('userData', path.join(stateRoot, hosted ? 'host' : mode))
 app.setName('simple')
+
+// Every workspace is its own process tree, and Chromium's GPU process costs
+// about 100 MB in each (measured: 104 MB with it, 20 MB without). Text, grids
+// and pages draw just as well in software, so only the workspaces that push
+// pixels (image compositing, video decoding) keep it. SIMPLE_FORCE_GPU=1
+// turns it back on everywhere.
+if (!GPU_MODES.has(mode) && process.env.SIMPLE_FORCE_GPU !== '1') app.disableHardwareAcceleration()
 
 if (selfTest) {
   // Every workspace bundle, shared I/O module and converter must load from
@@ -79,8 +97,21 @@ if (selfTest) {
     launch: launchDetached,
     label: (name) => formats.data.workspaces?.[name]?.label || name,
   })
+  // The start screen lists what was opened, whichever workspace opens it.
+  if (grouped.size) {
+    require('./recent-files.cjs').recordRecent(stateRoot, [...grouped].flatMap(([name, pathsForMode]) => pathsForMode.map((filePath) => ({ path: path.resolve(filePath), mode: name }))))
+  }
+  // What this invocation opens in the shared process: every hosted workspace
+  // with files, or just this process's own workspace when there are none.
+  const hostGroups = []
+  if (hosted) {
+    for (const [name, pathsForMode] of grouped) {
+      if (isHosted(name)) hostGroups.push([name, pathsForMode.map((filePath) => path.resolve(filePath))])
+    }
+    if (!hostGroups.some(([name]) => name === mode)) hostGroups.unshift([mode, []])
+  }
   for (const [otherMode, pathsForMode] of grouped) {
-    if (otherMode === mode) continue
+    if (otherMode === mode || (hosted && isHosted(otherMode))) continue
     void handOff.start(otherMode, pathsForMode.map((filePath) => path.resolve(filePath)))
   }
   // Remove the unpacked runtimes of earlier builds (see runtime-cache.cjs), well
@@ -91,7 +122,50 @@ if (selfTest) {
     })
   }
 
-  if (mode === 'launcher') {
+  if (hosted) {
+    // The first instance becomes the shared process; a later one only passes
+    // on what it was asked to open (already routed, as absolute paths) and ends.
+    // --simple-new (the start screen's New): a new empty window, not the workspace's open one.
+    const fresh = process.argv.includes('--simple-new')
+    if (!app.requestSingleInstanceLock({ simpleHost: { groups: hostGroups, fresh } })) {
+      app.quit()
+    } else {
+      const { createHost } = require('./host.cjs')
+      const host = createHost({
+        appRoot: path.join(__dirname, '..'),
+        stateRoot,
+        // A workspace that could not start is said in a message (the start screen already
+        // reported the file as opened), and the host waits for it before the process may end.
+        onOpenFailure: async (name, pathsForMode, error) => {
+          process.stderr.write(`Could not open ${pathsForMode.length} file(s) in ${name}: ${error && error.message}\n`)
+          // A file that did not open is not a recent file.
+          for (const filePath of pathsForMode) require('./recent-files.cjs').forgetRecent(stateRoot, filePath)
+          const label = formats.data.workspaces?.[name]?.label || name
+          await app.whenReady()
+          await electron.dialog.showMessageBox({
+            type: 'warning', title: 'simple', buttons: ['OK'], noLink: true,
+            message: pathsForMode.length ? `Simple couldn't open ${pathsForMode.length === 1 ? path.basename(pathsForMode[0]) : `${pathsForMode.length} files`}.` : `Simple couldn't start ${label}.`,
+            detail: `${label} did not start. Try again; if it keeps happening, start Simple again.`,
+          })
+        },
+      })
+      host.install()
+      const openGroups = (groups, workingDirectory, flags = []) => {
+        for (const [name, pathsForMode] of groups) host.open(name, pathsForMode, workingDirectory, flags).catch(() => {})
+      }
+      app.on('second-instance', (_event, _argv, workingDirectory, additionalData) => {
+        const sent = additionalData && typeof additionalData === 'object' && additionalData.simpleHost ? additionalData.simpleHost.groups : null
+        const groups = Array.isArray(sent)
+          ? sent.filter((group) => Array.isArray(group) && isHosted(group[0]) && (group[0] === 'launcher' || MODES.includes(group[0])) && Array.isArray(group[1]))
+            .map(([name, pathsForMode]) => [name, pathsForMode.filter((item) => typeof item === 'string' && path.isAbsolute(item))])
+          : []
+        const flags = additionalData && typeof additionalData === 'object' && additionalData.simpleHost && additionalData.simpleHost.fresh === true ? ['--simple-new'] : []
+        openGroups(groups.length ? groups : [['launcher', []]], typeof workingDirectory === 'string' && workingDirectory ? workingDirectory : undefined, flags)
+      })
+      app.whenReady().then(() => app.setAppUserModelId(APP_USER_MODEL_ID))
+      openGroups(hostGroups, undefined, fresh ? ['--simple-new'] : [])
+    }
+  } else if (mode === 'launcher') {
     require('../launcher/main.cjs')
   } else {
     const moduleMain = path.join(__dirname, '..', 'modules', mode, 'electron', 'main.cjs')

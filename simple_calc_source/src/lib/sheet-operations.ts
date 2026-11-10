@@ -1255,22 +1255,25 @@ function selectionAfterOperation(
   selection: GridSelection,
   operation: SheetStructureOperation,
 ): GridSelection {
-  const bounds = normalizedBounds(selection)
+  // Across the other axis the selection keeps its own anchor and focus. The grid scrolls
+  // to the focus, and a whole row or column is selected with its focus at the near edge
+  // (column A, row 1): rebuilding it from the bounds put the focus on the last column or
+  // the last row, so deleting a row or column threw the view to the far end of the sheet.
   if (operation.axis === 'row') {
     const start = operation.index
     const end = operation.kind === 'insert' ? start + operation.count - 1 : start
     const row = Math.min(start, MAX_SHEET_ROWS - 1)
     return {
-      anchor: { row, col: bounds.left },
-      focus: { row: Math.min(end, MAX_SHEET_ROWS - 1), col: bounds.right },
+      anchor: { row, col: selection.anchor.col },
+      focus: { row: Math.min(end, MAX_SHEET_ROWS - 1), col: selection.focus.col },
     }
   }
   const start = operation.index
   const end = operation.kind === 'insert' ? start + operation.count - 1 : start
   const col = Math.min(start, MAX_SHEET_COLUMNS - 1)
   return {
-    anchor: { row: bounds.top, col },
-    focus: { row: bounds.bottom, col: Math.min(end, MAX_SHEET_COLUMNS - 1) },
+    anchor: { row: selection.anchor.row, col },
+    focus: { row: selection.focus.row, col: Math.min(end, MAX_SHEET_COLUMNS - 1) },
   }
 }
 

@@ -71,3 +71,17 @@ test('only failures and changed values block a save; notes are summarised in one
   assert.equal(summarizeProblems([failure, truncated, failure]), `${failure.message} (+1 more)`)
   assert.equal(summarizeProblems([]), '')
 })
+
+test('only a file that is gone counts as missing (it alone leaves Recent files)', async () => {
+  const { isMissingFileError } = await helpers
+  const { codedError } = require('../electron/pdf-problems.cjs')
+  // Electron hands the renderer "Error invoking remote method '<channel>': <String(error)>".
+  const acrossIpc = (error) => new Error(`Error invoking remote method 'file:open-path': ${String(error)}`)
+  assert.equal(isMissingFileError(acrossIpc(codedError('FILE_NOT_FOUND', '"a.pdf" could not be found.'))), true)
+  assert.equal(isMissingFileError(codedError('FILE_NOT_FOUND', 'gone').toString()), true)
+  const locked = Object.assign(new Error("EBUSY: resource busy or locked, open 'C:\a.pdf'"), { code: 'EBUSY' })
+  assert.equal(isMissingFileError(acrossIpc(locked)), false)
+  assert.equal(isMissingFileError(acrossIpc(codedError('UNSUPPORTED_FORMAT', 'Simple can\'t open "FILE_NOT_FOUND: notes.xyz" as a PDF.'))), false)
+  assert.equal(isMissingFileError(new Error('Something went wrong.')), false)
+  assert.equal(isMissingFileError(null), false)
+})
